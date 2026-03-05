@@ -1,5 +1,6 @@
 import torch
 
+from wbridge.utils.data import WeightData
 
 class DirectSender:
     def __init__(
@@ -15,7 +16,11 @@ class DirectSender:
         pass
     
 class GPUDirectSender(DirectSender):
-    pass
+    def send(
+        self,
+        params: WeightData,
+    ):
+        print("Sending weights to GPU: ", params)
     
 class CPUDirectSender(DirectSender):
     pass
