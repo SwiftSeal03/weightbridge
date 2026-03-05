@@ -1,0 +1,20 @@
+[build-system]
+requires = ["setuptools>=61.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "weightbridge"
+version = "0.1.0"
+description = "WeightBridge"
+readme = "README.md"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+]
+
+[project.optional-dependencies]
+dev = []
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["wbridge*"]

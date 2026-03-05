@@ -1,0 +1,24 @@
+import torch
+
+from wbridge.backend.direct_sender import CPUDirectSender, GPUDirectSender
+
+
+class WeightSender:
+    def __init__(
+        self,
+        transfer_mode: str,
+        receiver_urls: list[str],
+    ):
+        self.transfer_mode = transfer_mode
+        if transfer_mode == "gpu_direct":
+            self.sender = GPUDirectSender(receiver_urls)
+        elif transfer_mode == "cpu_direct":
+            self.sender = CPUDirectSender(receiver_urls)
+        else:
+            raise ValueError(f"Invalid transfer mode: {transfer_mode}")
+    
+    def send(
+        self,
+        params: dict[str, torch.Tensor],
+    ):
+        self.sender.send(params)
