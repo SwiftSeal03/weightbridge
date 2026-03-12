@@ -1,6 +1,6 @@
 """WeightBridge - weight transfer between distributed training nodes."""
 
-from wbridge.frontend import WeightReceiver, WeightSender
+from wbridge.frontend import WeightReceiver, WeightSender, WeightReceiverController
 from wbridge.utils.data import WeightData
 
-__all__ = ["WeightReceiver", "WeightSender", "WeightData"]
+__all__ = ["WeightReceiver", "WeightSender", "WeightData", "WeightReceiverController"]

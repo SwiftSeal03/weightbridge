@@ -10,6 +10,8 @@ readme = "README.md"
 requires-python = ">=3.10"
 dependencies = [
     "torch",
+    "pyzmq",
+    "fastapi",
 ]
 
 [project.optional-dependencies]
