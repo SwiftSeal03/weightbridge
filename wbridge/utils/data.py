@@ -2,35 +2,43 @@ import json
 
 import torch
 
+
 class WeightData:
     """
-    A unified representation of weight data for all backends.
+    A unified representation of weight metadata for receivers.
     The format is:
     {
         "name": {
             "metadata": {
-                "shard": [(l, r, w), ...],
+                "shard": [[(l, r, w), ...], [(l, r, w), ...], ...],
                 "dtype": torch.dtype,
             },
-            "data": torch.Tensor,
+            "data": torch.Tensor | None,  # optional, receivers only need metadata
         },
         ...
     }
-    
-    where [l, r) is the range of the local shard index on the dimension, w is the total width of the dimension.
-    Data is a optionally flattened 1D tensor of shape \prod_{i=0}^{n-1} (r_i - l_i), where n is the number of dimensions.
+
+    where [l, r) is the range of the local shard index on the dimension, w is the total width.
+    Receivers only need metadata (shard + dtype); data is optional for senders.
     """
+
     def __init__(self, state_dict: dict[str, dict[str, ...]]):
         self.state_dict = state_dict
         self.sanity_check(self.state_dict)
-    
+
     def __getitem__(self, key: str) -> dict[str, ...]:
         return self.state_dict[key]
-    
+
+    def to_metadata_dict(self) -> dict[str, dict]:
+        """JSON-serializable metadata only (shard + dtype string)."""
+        return {
+            k: {"shard": v["metadata"]["shard"], "dtype": str(v["metadata"]["dtype"])}
+            for k, v in self.state_dict.items()
+        }
+
     def __str__(self) -> str:
-        metadata_dict = {k: {"shard": v["metadata"]["shard"], "dtype": str(v["metadata"]["dtype"])} for k, v in self.state_dict.items()}
-        return json.dumps(metadata_dict, indent=4)
-    
+        return json.dumps(self.to_metadata_dict(), indent=4)
+
     def sanity_check(self, state_dict: dict[str, dict[str, ...]]) -> None:
         for name, value in state_dict.items():
             meta = value["metadata"]
@@ -38,7 +46,6 @@ class WeightData:
             numel = 1
             for l, r, w in meta["shard"]:
                 assert 0 <= l < r <= w, f"Invalid shard: {l, r, w} for {name}"
-                # assert w % (r - l) == 0 and l % (r - l) == 0, f"Invalid shard: {l, r, w} for {name}"
                 numel *= r - l
             if (t := value.get("data")) is not None:
                 nbytes = numel * dtype.itemsize

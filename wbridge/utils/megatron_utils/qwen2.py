@@ -8,7 +8,7 @@ import re
 import torch
 
 from megatron.core import mpu
-from wbridge import WeightData
+from wbridge.utils.data import WeightData
 
 def convert_split_qwen2_to_hf(args, name, param):
     if name == "module.module.embedding.word_embeddings.weight":
@@ -80,7 +80,7 @@ def convert_split_qwen2_to_hf(args, name, param):
     raise ValueError(f"Unknown parameter name: {name}")
 
 
-def convert_qwen2_to_wb(args, named_tensors: list[tuple[str, torch.nn.Parameter]]) -> WeightData:
+def convert_qwen2_to_wb(args, named_tensors: list[tuple[str, torch.nn.Parameter]], metadata_only: bool = False) -> WeightData:
     """Convert Qwen2/Qwen3 Megatron param to HF-style (name, param) list for WeightBridge."""
     state_dict = {}
     tprk = mpu.get_tensor_model_parallel_rank()
@@ -92,11 +92,11 @@ def convert_qwen2_to_wb(args, named_tensors: list[tuple[str, torch.nn.Parameter]
         for hf_name, hf_param in converted:
             t = hf_param.data
             shard = [
-                (0, d, d) if i != part_dim else 
-                (tprk * d, (tprk + 1) * d, d * tpws) 
+                (0, d, d) if i != part_dim else
+                (tprk * d, (tprk + 1) * d, d * tpws)
                 for i, d in enumerate(hf_param.shape)
             ]
-            
+
             # Remove paddings for embed_token and lm_head
             if "embed_token" in hf_name or "lm_head" in hf_name:
                 l, r, w = shard[0]
@@ -105,13 +105,11 @@ def convert_qwen2_to_wb(args, named_tensors: list[tuple[str, torch.nn.Parameter]
                 r = min(vocab_size, r)
                 w = min(vocab_size, w)
                 shard[0] = (l, r, w)
-                t = t[:r - l]
-            
-            state_dict[hf_name] = {
-                "metadata": {
-                    "shard": shard,
-                    "dtype": hf_param.dtype,
-                },
-                "data": t.view(torch.uint8).view(-1),
-            }
+                if not metadata_only:
+                    t = t[:r - l]
+
+            entry = {"metadata": {"shard": shard, "dtype": hf_param.dtype}}
+            if not metadata_only:
+                entry["data"] = t.view(torch.uint8).view(-1)
+            state_dict[hf_name] = entry
     return WeightData(state_dict)
