@@ -19,14 +19,6 @@ class WeightSender:
         else:
             raise ValueError(f"Invalid transfer mode: {transfer_mode}")
     
-    def get_metadata(self) -> dict[str, dict[str, ...]]:
-        metadatas = requests.get(f"{self.receiver_urls[0]}/wbridge/metadata").json()
-        return metadatas
-    
-    def send(
-        self,
-        params: dict[str, torch.Tensor],
-    ):
-        metadatas = self.get_metadata()
-        print(metadatas)
-        # self.sender.send(params)
+        
+    def send(self, params: dict[str, torch.Tensor]):
+        self.sender.send(params)

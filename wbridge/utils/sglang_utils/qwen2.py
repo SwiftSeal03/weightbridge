@@ -112,7 +112,6 @@ def _add_to_state_dict(
 
 
 def convert_split_qwen2_to_hf(config: Qwen2Config, name: str, param: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
-    logger.info(f"#DEBUG: convert_split_qwen2_to_hf: name={name}, param.shape={param.shape}")
     if name == "model.embed_tokens.weight":
         return [("model.embed_tokens.weight", param, 0)]
     if name == "lm_head.weight":
@@ -176,7 +175,6 @@ def convert_sglang_qwen2_to_wb(
     out_state_dict: Dict[str, Dict] = {}
 
     for name, param in state_dict.items():
-        logger.info(f"#DEBUG: convert_sglang_qwen2_to_wb: name={name}, param.shape={param.shape}")
         if not isinstance(param, torch.Tensor):
             continue
 

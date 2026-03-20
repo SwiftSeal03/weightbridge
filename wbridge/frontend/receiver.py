@@ -8,14 +8,25 @@ import torch
 import zmq
 from fastapi import FastAPI, APIRouter
 from fastapi.responses import JSONResponse
+from pydantic import BaseModel
 
 from wbridge.utils.data import WeightData
+from wbridge.utils.distributed import init_custom_process_group
 
 logger = logging.getLogger(__name__)
 
 # Message types for controller <-> receiver communication
 METADATA_REQUEST = "metadata_request"
 READY_REQUEST = "ready_request"
+CONNECT_REQUEST = "connect_request"
+
+
+class ConnectRequest(BaseModel):
+    master_address: str
+    master_port: int
+    base_rank: int
+    world_size: int
+    group_name: str
 
 
 class WeightReceiver:
@@ -81,11 +92,26 @@ class WeightReceiver:
         while True:
             socks = dict(poller.poll())
             if controller_socket in socks:
-                # Metadata request from controller
                 msg = controller_socket.recv_string()
                 if msg == METADATA_REQUEST:
                     response = json.dumps({"rank": self.rank, "metadata": self.metadata})
                     controller_socket.send_string(response)
+                else:
+                    data = json.loads(msg)
+                    if data.get("type") == CONNECT_REQUEST:
+                        # Acknowledge before blocking on group formation
+                        controller_socket.send_string(json.dumps({"status": "ack"}))
+                        self.group = init_custom_process_group(
+                            backend="nccl",
+                            init_method=f"tcp://{data['master_address']}:{data['master_port']}",
+                            world_size=data["world_size"],
+                            rank=data["rank"],
+                            group_name=data["group_name"],
+                        )
+                        logger.info(
+                            "Receiver worker %d joined group %s as rank %d (world_size=%d)",
+                            self.rank, data["group_name"], data["rank"], data["world_size"],
+                        )
             if scheduler_socket in socks:
                 # Ready check from scheduler
                 msg = scheduler_socket.recv_string()
@@ -105,7 +131,6 @@ class WeightReceiverController:
     def __init__(self, app: FastAPI, worker_num: int = 0):
         # Create IPC name like PortArgs.init_new
         self._ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        self._worker_num = worker_num
         self._receiver_identities: dict = {}  # identity bytes -> rank
 
         self._context = zmq.Context()
@@ -133,14 +158,14 @@ class WeightReceiverController:
     def set_worker_num(self, worker_num: int) -> None:
         """Set the expected number of receiver workers. Called after schedulers are launched."""
         self._worker_num = worker_num
+        self._receiver_identities = [b"worker-%d" % rank for rank in range(worker_num)]
 
     def _query_receivers_metadata(self) -> List[dict]:
         """Query all connected receivers via ROUTER/DEALER.
         Collects until worker_num responses received or timeout.
         Returns list of {rank, metadata} from each receiver.
         """
-        worker_identities = [b"worker-%d" % rank for rank in range(self._worker_num)]
-        for identity in worker_identities:
+        for identity in self._receiver_identities:
             self._router_socket.send_multipart([identity, METADATA_REQUEST.encode(encoding="utf-8")])
 
         results = []
@@ -156,7 +181,31 @@ class WeightReceiverController:
         results = self._query_receivers_metadata()
         return JSONResponse(content=results)
 
-    async def connect(self):
+    async def connect(self, request: ConnectRequest):
+        """Forward connection info to each worker, wait for acks, then return.
+
+        Each worker is assigned rank ``request.base_rank + worker_index``.
+        Workers acknowledge immediately (before blocking on group formation),
+        so this endpoint returns as soon as all workers have the info.
+        """
+        for idx, identity in enumerate(self._receiver_identities):
+            connect_msg = json.dumps({
+                "type": CONNECT_REQUEST,
+                "master_address": request.master_address,
+                "master_port": request.master_port,
+                "rank": request.base_rank + idx,
+                "world_size": request.world_size,
+                "group_name": request.group_name,
+            })
+            self._router_socket.send_multipart(
+                [identity, connect_msg.encode("utf-8")]
+            )
+
+        acks = 0
+        while acks < self._worker_num:
+            self._router_socket.recv_multipart()
+            acks += 1
+
         return JSONResponse(content={"status": "success"})
 
     async def receive_weights(self):
