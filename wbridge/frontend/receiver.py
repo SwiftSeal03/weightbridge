@@ -5,6 +5,7 @@ import tempfile
 from typing import List, Optional
 
 import torch
+import torch.distributed as dist
 import zmq
 from fastapi import FastAPI, APIRouter
 from fastapi.responses import JSONResponse
@@ -27,6 +28,8 @@ class ConnectRequest(BaseModel):
     base_rank: int
     world_size: int
     group_name: str
+    sender_world_size: int
+    backend: str  # "nccl" (gpu) or "gloo" (cpu)
 
 
 class WeightReceiver:
@@ -101,16 +104,38 @@ class WeightReceiver:
                     if data.get("type") == CONNECT_REQUEST:
                         # Acknowledge before blocking on group formation
                         controller_socket.send_string(json.dumps({"status": "ack"}))
+                        backend = data["backend"]
                         self.group = init_custom_process_group(
-                            backend="nccl",
+                            backend=backend,
                             init_method=f"tcp://{data['master_address']}:{data['master_port']}",
                             world_size=data["world_size"],
                             rank=data["rank"],
                             group_name=data["group_name"],
                         )
+                        # Receive overlap metadata from each sender
+                        device = "cuda" if backend == "nccl" else "cpu"
+                        self.overlaps: dict[int, WeightData] = {}
+                        for sender_rank in range(data["sender_world_size"]):
+                            size_t = torch.zeros(1, dtype=torch.long, device=device)
+                            dist.recv(size_t, src=sender_rank, group=self.group)
+                            data_t = torch.zeros(
+                                size_t.item(), dtype=torch.uint8, device=device
+                            )
+                            dist.recv(data_t, src=sender_rank, group=self.group)
+                            overlap_dict = json.loads(
+                                data_t.cpu().numpy().tobytes().decode("utf-8")
+                            )
+                            self.overlaps[sender_rank] = WeightData.from_metadata_dict(
+                                overlap_dict
+                            )
                         logger.info(
-                            "Receiver worker %d joined group %s as rank %d (world_size=%d)",
-                            self.rank, data["group_name"], data["rank"], data["world_size"],
+                            "Receiver worker %d joined group %s as rank %d "
+                            "(world_size=%d, overlaps from %d senders)",
+                            self.rank, data["group_name"], data["rank"],
+                            data["world_size"], len(self.overlaps),
+                        )
+                        logger.info(
+                            "overlaps: %s", json.dumps([d.to_metadata_dict() for d in self.overlaps.values()], indent=4),
                         )
             if scheduler_socket in socks:
                 # Ready check from scheduler
@@ -196,6 +221,8 @@ class WeightReceiverController:
                 "rank": request.base_rank + idx,
                 "world_size": request.world_size,
                 "group_name": request.group_name,
+                "sender_world_size": request.sender_world_size,
+                "backend": request.backend,
             })
             self._router_socket.send_multipart(
                 [identity, connect_msg.encode("utf-8")]

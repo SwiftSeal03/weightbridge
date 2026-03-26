@@ -1,5 +1,4 @@
 import json
-from math import prod
 
 import torch
 
@@ -52,6 +51,19 @@ class WeightData:
             for k, v in self.state_dict.items()
         }
 
+    @classmethod
+    def from_metadata_dict(cls, metadata_dict: dict[str, dict]) -> "WeightData":
+        """Reconstruct a metadata-only WeightData from the JSON-serializable
+        form produced by ``to_metadata_dict``."""
+        state_dict = {}
+        for name, meta in metadata_dict.items():
+            dtype_str = meta["dtype"]
+            dtype = getattr(torch, dtype_str.removeprefix("torch."))
+            state_dict[name] = {
+                "metadata": {"shard": meta["shard"], "dtype": dtype},
+            }
+        return cls(state_dict)
+
     def __str__(self) -> str:
         return json.dumps(self.to_metadata_dict(), indent=4)
 
@@ -77,13 +89,12 @@ class WeightData:
 
     @staticmethod
     def compute_overlap(sender: "WeightData", receiver: "WeightData") -> "WeightData":
-        """Return a new WeightData containing only the shard regions where
-        *sender* and *receiver* overlap, with tensor data sliced from *sender*.
+        """Return a new WeightData whose entries describe the shard regions
+        where *sender* and *receiver* overlap (metadata only, no tensor data).
 
-        ``sender`` entries must carry a ``"data"`` field; ``receiver`` entries
-        need only metadata.  Both sides may use the single-shard or
-        multi-shard format; every sender shard is paired against every
-        receiver shard and all non-empty overlaps are collected.
+        Both sides may use the single-shard or multi-shard format; every
+        sender shard is paired against every receiver shard and all non-empty
+        overlaps are collected.
         """
         result: dict[str, dict] = {}
 
@@ -100,22 +111,9 @@ class WeightData:
             s_shards = _normalize_shards(s_entry["metadata"]["shard"])
             r_shards = _normalize_shards(r_entry["metadata"]["shard"])
 
-            s_data = s_entry["data"]
-            s_byte_ends: list[int] = []
-            offset = 0
-            for s_shard in s_shards:
-                offset += prod(r - l for l, r, _ in s_shard) * dtype.itemsize
-                s_byte_ends.append(offset)
-
             overlap_shards: list[list[tuple[int, int, int]]] = []
-            overlap_data_parts: list[torch.Tensor] = []
 
-            byte_start = 0
-            for si, s_shard in enumerate(s_shards):
-                byte_end = s_byte_ends[si]
-                s_shard_data = s_data[byte_start:byte_end]
-                byte_start = byte_end
-
+            for s_shard in s_shards:
                 for r_shard in r_shards:
                     alignment = _check_shard_compatibility(s_shard, r_shard)
                     if alignment is None:
@@ -125,7 +123,6 @@ class WeightData:
                     aligned_s, aligned_r = alignment
 
                     overlap_dims: list[tuple[int, int, int]] = []
-                    sender_slices: list[slice] = []
                     has_overlap = True
 
                     for (ls, rs, ws), (lr, rr, _) in zip(aligned_s, aligned_r):
@@ -135,37 +132,21 @@ class WeightData:
                             has_overlap = False
                             break
                         overlap_dims.append((lo, hi, ws))
-                        sender_slices.append(slice(lo - ls, hi - ls))
 
                     if not has_overlap:
                         continue
 
-                    sender_shape = tuple(r - l for l, r, _ in aligned_s)
-                    tensor = s_shard_data.view(dtype).reshape(sender_shape)
-                    sliced = (
-                        tensor[tuple(sender_slices)]
-                        .contiguous()
-                        .view(torch.uint8)
-                        .flatten()
-                    )
-
                     overlap_shards.append(overlap_dims)
-                    overlap_data_parts.append(sliced)
 
             if not overlap_shards:
                 continue
 
-            if len(overlap_data_parts) == 1:
-                combined_data = overlap_data_parts[0]
-            else:
-                combined_data = torch.cat(overlap_data_parts)
             out_shard = (
                 overlap_shards[0] if len(overlap_shards) == 1 else overlap_shards
             )
 
             result[name] = {
                 "metadata": {"shard": out_shard, "dtype": dtype},
-                "data": combined_data,
             }
 
         return WeightData(result)
