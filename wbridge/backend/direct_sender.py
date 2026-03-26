@@ -149,7 +149,6 @@ class GPUDirectSender(DirectSender):
         if not self.connected:
             self.connect(params)
             self.connected = True
-        self.sender.send(params)
 
 
 class CPUDirectSender(DirectSender):
