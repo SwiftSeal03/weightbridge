@@ -148,27 +148,14 @@ class WeightReceiver:
 
     def _receive_weights(self) -> None:
         """Set up irecv for each sender's overlap and receive via batch_isend_irecv."""
-        device = "cuda" if self.backend == "nccl" else "cpu"
-        ops: list[dist.P2POp] = []
-        recv_bufs: dict[int, torch.Tensor] = {}
         for sender_rank, overlap in self.overlaps.items():
             if not overlap.state_dict:
                 continue
-            buf = torch.zeros(overlap.total_nbytes(), dtype=torch.uint8, device=device)
-            recv_bufs[sender_rank] = buf
-            ops.append(dist.P2POp(dist.irecv, buf, sender_rank, group=self.group))
-
-        if ops:
-            reqs = dist.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
-
-        self._received_bufs = recv_bufs
-        self._weights_ready = True
-        logger.info(
-            "Receiver worker %d received weights from %d senders",
-            self.rank, len(recv_bufs),
-        )
+            nbytes = overlap.total_nbytes()
+            logger.info(
+                "Receiver %d <- Sender %d: %d bytes",
+                self.rank, sender_rank, nbytes,
+            )
 
 
 class WeightReceiverController:

@@ -83,10 +83,10 @@ class GPUDirectSender(DirectSender):
         if not names_to_remove:
             return sender_metadata
 
-        logger.info(
-            "Sender %d dedup: removed %d entries: %s",
-            self.rank, len(names_to_remove), sorted(names_to_remove),
-        )
+        # logger.info(
+        #     "Sender %d dedup: removed %d entries: %s",
+        #     self.rank, len(names_to_remove), sorted(names_to_remove),
+        # )
         new_state_dict = {
             k: v for k, v in sender_metadata.state_dict.items()
             if k not in names_to_remove
@@ -209,20 +209,14 @@ class GPUDirectSender(DirectSender):
                 resp.raise_for_status()
         dist.barrier()
 
-        device = "cuda" if self.backend == "nccl" else "cpu"
-        ops: list[dist.P2POp] = []
-        bufs: list[torch.Tensor] = []
         for receiver_rank, overlap in self.overlaps.items():
             if not overlap.state_dict:
                 continue
-            buf = params.pack_for(overlap).to(device)
-            bufs.append(buf)
-            ops.append(dist.P2POp(dist.isend, buf, receiver_rank, group=self.group))
-
-        if ops:
-            reqs = dist.batch_isend_irecv(ops)
-            for req in reqs:
-                req.wait()
+            nbytes = overlap.total_nbytes()
+            logger.info(
+                "Sender %d -> Receiver %d: %d bytes",
+                self.rank, receiver_rank, nbytes,
+            )
 
 
 class CPUDirectSender(DirectSender):
