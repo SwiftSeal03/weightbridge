@@ -67,6 +67,18 @@ class WeightData:
     def __str__(self) -> str:
         return json.dumps(self.to_metadata_dict(), indent=4)
 
+    def total_nbytes(self) -> int:
+        """Total byte size of the data described by all shard entries."""
+        total = 0
+        for entry in self.state_dict.values():
+            dtype = entry["metadata"]["dtype"]
+            for shard in _normalize_shards(entry["metadata"]["shard"]):
+                numel = 1
+                for l, r, w in shard:
+                    numel *= r - l
+                total += numel * dtype.itemsize
+        return total
+
     def sanity_check(self, state_dict: dict[str, dict[str, ...]]) -> None:
         for name, value in state_dict.items():
             meta = value["metadata"]
@@ -150,6 +162,70 @@ class WeightData:
             }
 
         return WeightData(result)
+
+    def pack_for(self, overlap: "WeightData") -> torch.Tensor:
+        """Extract data from *self* matching *overlap* regions into a flat byte tensor.
+
+        Iterates over overlap entries in state_dict order.  For each one,
+        locates the containing sender sub-shard (handling dimensional
+        alignment via ``_check_shard_compatibility``), reshapes the sender
+        data to the aligned shape, slices out the overlap region, and
+        appends the bytes.  Returns the concatenation as a 1-D ``uint8``
+        tensor.
+        """
+        chunks: list[torch.Tensor] = []
+        for name, o_entry in overlap.state_dict.items():
+            s_entry = self.state_dict[name]
+            s_data = s_entry["data"]
+            dtype = s_entry["metadata"]["dtype"]
+            s_shards = _normalize_shards(s_entry["metadata"]["shard"])
+            o_shards = _normalize_shards(o_entry["metadata"]["shard"])
+
+            byte_end = 0
+            s_byte_ranges: list[tuple[int, int]] = []
+            for s_shard in s_shards:
+                numel = 1
+                for l, r, w in s_shard:
+                    numel *= r - l
+                start = byte_end
+                byte_end += numel * dtype.itemsize
+                s_byte_ranges.append((start, byte_end))
+
+            for o_shard in o_shards:
+                found = False
+                for s_idx, s_shard in enumerate(s_shards):
+                    alignment = _check_shard_compatibility(s_shard, o_shard)
+                    if alignment is None:
+                        continue
+                    aligned_s, aligned_o = alignment
+                    if not all(
+                        ls <= lo and ro <= rs
+                        for (ls, rs, _), (lo, ro, _) in zip(aligned_s, aligned_o)
+                    ):
+                        continue
+
+                    beg, end = s_byte_ranges[s_idx]
+                    aligned_shape = [rs - ls for ls, rs, _ in aligned_s]
+                    typed = s_data[beg:end].view(dtype).reshape(aligned_shape)
+                    slices = tuple(
+                        slice(lo - ls, ro - ls)
+                        for (ls, rs, _), (lo, ro, _) in zip(aligned_s, aligned_o)
+                    )
+                    chunks.append(
+                        typed[slices].contiguous().reshape(-1).view(torch.uint8)
+                    )
+                    found = True
+                    break
+
+                if not found:
+                    raise ValueError(
+                        f"Cannot extract overlap for '{name}': "
+                        f"no compatible sender shard"
+                    )
+
+        if not chunks:
+            return torch.empty(0, dtype=torch.uint8)
+        return torch.cat(chunks)
 
 
 _SENTINEL = object()

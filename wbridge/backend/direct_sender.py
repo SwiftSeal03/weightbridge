@@ -28,7 +28,7 @@ class DirectSender:
 
     def send(
         self,
-        params: dict[str, torch.Tensor],
+        params: WeightData,
     ):
         pass
 
@@ -195,8 +195,34 @@ class GPUDirectSender(DirectSender):
         params: WeightData,
     ):
         if not self.connected:
+            self._sender_metadata = params.to_metadata_dict()
             self.connect(params)
             self.connected = True
+        else:
+            current = params.to_metadata_dict()
+            if current != self._sender_metadata:
+                raise ValueError("Params metadata changed between send calls")
+
+        if self.rank == 0:
+            for url in self.receiver_urls:
+                resp = requests.post(f"{url}/wbridge/receive")
+                resp.raise_for_status()
+        dist.barrier()
+
+        device = "cuda" if self.backend == "nccl" else "cpu"
+        ops: list[dist.P2POp] = []
+        bufs: list[torch.Tensor] = []
+        for receiver_rank, overlap in self.overlaps.items():
+            if not overlap.state_dict:
+                continue
+            buf = params.pack_for(overlap).to(device)
+            bufs.append(buf)
+            ops.append(dist.P2POp(dist.isend, buf, receiver_rank, group=self.group))
+
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
 
 
 class CPUDirectSender(DirectSender):

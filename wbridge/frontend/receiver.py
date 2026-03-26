@@ -20,6 +20,7 @@ logger = logging.getLogger(__name__)
 METADATA_REQUEST = "metadata_request"
 READY_REQUEST = "ready_request"
 CONNECT_REQUEST = "connect_request"
+RECEIVE_REQUEST = "receive_request"
 
 
 class ConnectRequest(BaseModel):
@@ -102,9 +103,9 @@ class WeightReceiver:
                 else:
                     data = json.loads(msg)
                     if data.get("type") == CONNECT_REQUEST:
-                        # Acknowledge before blocking on group formation
                         controller_socket.send_string(json.dumps({"status": "ack"}))
                         backend = data["backend"]
+                        self.backend = backend
                         self.group = init_custom_process_group(
                             backend=backend,
                             init_method=f"tcp://{data['master_address']}:{data['master_port']}",
@@ -134,15 +135,40 @@ class WeightReceiver:
                             self.rank, data["group_name"], data["rank"],
                             data["world_size"], len(self.overlaps),
                         )
-                        # logger.info(
-                        #     "overlaps: %s", json.dumps([d.to_metadata_dict() for d in self.overlaps.values()], indent=4),
-                        # )
+                    elif data.get("type") == RECEIVE_REQUEST:
+                        controller_socket.send_string(json.dumps({"status": "ack"}))
+                        self._receive_weights()
             if scheduler_socket in socks:
                 # Ready check from scheduler
                 msg = scheduler_socket.recv_string()
                 if msg == READY_REQUEST:
-                    # For now just return False
-                    scheduler_socket.send_string(json.dumps({"ready": False}))
+                    ready = getattr(self, "_weights_ready", False)
+                    scheduler_socket.send_string(json.dumps({"ready": ready}))
+
+
+    def _receive_weights(self) -> None:
+        """Set up irecv for each sender's overlap and receive via batch_isend_irecv."""
+        device = "cuda" if self.backend == "nccl" else "cpu"
+        ops: list[dist.P2POp] = []
+        recv_bufs: dict[int, torch.Tensor] = {}
+        for sender_rank, overlap in self.overlaps.items():
+            if not overlap.state_dict:
+                continue
+            buf = torch.zeros(overlap.total_nbytes(), dtype=torch.uint8, device=device)
+            recv_bufs[sender_rank] = buf
+            ops.append(dist.P2POp(dist.irecv, buf, sender_rank, group=self.group))
+
+        if ops:
+            reqs = dist.batch_isend_irecv(ops)
+            for req in reqs:
+                req.wait()
+
+        self._received_bufs = recv_bufs
+        self._weights_ready = True
+        logger.info(
+            "Receiver worker %d received weights from %d senders",
+            self.rank, len(recv_bufs),
+        )
 
 
 class WeightReceiverController:
@@ -236,4 +262,16 @@ class WeightReceiverController:
         return JSONResponse(content={"status": "success"})
 
     async def receive_weights(self):
+        """Signal all workers to start irecv, wait for acks, then return."""
+        for identity in self._receiver_identities:
+            receive_msg = json.dumps({"type": RECEIVE_REQUEST})
+            self._router_socket.send_multipart(
+                [identity, receive_msg.encode("utf-8")]
+            )
+
+        acks = 0
+        while acks < self._worker_num:
+            self._router_socket.recv_multipart()
+            acks += 1
+
         return JSONResponse(content={"status": "success"})
