@@ -47,7 +47,55 @@ class GPUDirectSender(DirectSender):
 
     backend = "nccl"
 
+    def _dedup_sender_metadata(self, sender_metadata: WeightData) -> WeightData:
+        """All-gather metadata across senders and deduplicate identical shards.
+
+        For each named tensor present on multiple senders, the intersection of
+        their shard specs must be either empty (the common case) or exactly
+        equal.  When equal, only the lowest-rank sender keeps the entry;
+        higher-rank senders drop it.  Any partial overlap raises an error.
+        """
+        if self.world_size == 1:
+            return sender_metadata
+
+        meta_dict = sender_metadata.to_metadata_dict()
+        all_meta_dicts: list[dict | None] = [None] * self.world_size
+        dist.all_gather_object(all_meta_dicts, meta_dict)
+
+        names_to_remove: set[str] = set()
+        for peer_rank, peer_dict in enumerate(all_meta_dicts):
+            if peer_rank == self.rank:
+                continue
+            peer_wd = WeightData.from_metadata_dict(peer_dict)
+            overlap = WeightData.compute_overlap(sender_metadata, peer_wd)
+
+            for name in overlap.state_dict:
+                if meta_dict[name]["shard"] == peer_dict[name]["shard"]:
+                    if self.rank > peer_rank:
+                        names_to_remove.add(name)
+                else:
+                    raise ValueError(
+                        f"Partial shard overlap for '{name}' between sender "
+                        f"rank {self.rank} and rank {peer_rank}. Senders must "
+                        f"have identical or non-overlapping shards."
+                    )
+
+        if not names_to_remove:
+            return sender_metadata
+
+        logger.info(
+            "Sender %d dedup: removed %d entries: %s",
+            self.rank, len(names_to_remove), sorted(names_to_remove),
+        )
+        new_state_dict = {
+            k: v for k, v in sender_metadata.state_dict.items()
+            if k not in names_to_remove
+        }
+        return WeightData(new_state_dict)
+
     def connect(self, sender_metadata: WeightData) -> None:
+        sender_metadata = self._dedup_sender_metadata(sender_metadata)
+
         group_name = "wbridge"
 
         if self.rank == 0:

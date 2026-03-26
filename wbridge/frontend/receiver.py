@@ -134,9 +134,9 @@ class WeightReceiver:
                             self.rank, data["group_name"], data["rank"],
                             data["world_size"], len(self.overlaps),
                         )
-                        logger.info(
-                            "overlaps: %s", json.dumps([d.to_metadata_dict() for d in self.overlaps.values()], indent=4),
-                        )
+                        # logger.info(
+                        #     "overlaps: %s", json.dumps([d.to_metadata_dict() for d in self.overlaps.values()], indent=4),
+                        # )
             if scheduler_socket in socks:
                 # Ready check from scheduler
                 msg = scheduler_socket.recv_string()
