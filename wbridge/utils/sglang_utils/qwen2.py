@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from wbridge.utils.data import WeightData
+from wbridge.utils.data import WeightData, dtype_to_str
 
 import logging
 logger = logging.getLogger(__name__)
@@ -87,14 +87,14 @@ def _make_shard(
     return shard
 
 
-def _add_to_state_dict(
-    state_dict: Dict,
+def _add_to_meta_dict(
+    meta_dict: Dict,
     name: str,
     t: torch.Tensor,
     shard: List[Tuple[int, int, int]],
     vocab_size: Optional[int] = None,
 ) -> None:
-    """Add a tensor to the output state_dict with WeightData format."""
+    """Add shard metadata for *name* to *meta_dict* (WeightData format)."""
     if vocab_size is not None and ("embed_tokens" in name or "lm_head" in name):
         l, r, w = shard[0]
         if l >= vocab_size:
@@ -103,12 +103,7 @@ def _add_to_state_dict(
         w = min(vocab_size, w)
         shard = [(l, r, w)] + shard[1:]
 
-    state_dict[name] = {
-        "metadata": {
-            "shard": shard,
-            "dtype": t.dtype,
-        },
-    }
+    meta_dict[name] = {"shard": shard, "dtype": dtype_to_str(t.dtype)}
 
 
 def convert_split_qwen2_to_hf(config: Qwen2Config, name: str, param: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
@@ -172,7 +167,7 @@ def convert_sglang_qwen2_to_wb(
     """
     Convert SGLang Qwen2/Qwen3 state_dict to WeightData.
     """
-    out_state_dict: Dict[str, Dict] = {}
+    out_meta_dict: Dict[str, Dict] = {}
 
     for name, param in state_dict.items():
         if not isinstance(param, torch.Tensor):
@@ -190,6 +185,6 @@ def convert_sglang_qwen2_to_wb(
             if any(attn_proj in hf_name for attn_proj in ["q_proj", "k_proj", "v_proj", "o_proj"]):
                 tp_rank, tp_size = config.attn_tp_rank, config.attn_tp_size
             shard = _make_shard(hf_param.data, partition_dim, tp_rank, tp_size)
-            _add_to_state_dict(out_state_dict, hf_name, hf_param.data, shard, config.vocab_size)
+            _add_to_meta_dict(out_meta_dict, hf_name, hf_param.data, shard, config.vocab_size)
 
-    return WeightData(out_state_dict)
+    return WeightData(out_meta_dict)

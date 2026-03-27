@@ -1,3 +1,5 @@
+import torch
+
 from wbridge.backend.direct_sender import CPUDirectSender, GPUDirectSender
 from wbridge.utils.data import WeightData
 
@@ -17,5 +19,8 @@ class WeightSender:
         else:
             raise ValueError(f"Invalid transfer mode: {transfer_mode}")
 
-    def send(self, params: WeightData):
-        self.sender.send(params)
+    def connect(self, sender_metadata: WeightData) -> None:
+        self.sender.connect(sender_metadata)
+
+    def send(self, state_dict: dict[str, torch.Tensor]) -> None:
+        self.sender.send(state_dict)

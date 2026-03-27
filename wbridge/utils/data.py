@@ -3,6 +3,19 @@ import json
 import torch
 
 
+def dtype_str_to_torch(s: str) -> torch.dtype:
+    """Map a dtype string (e.g. ``\"float32\"``, ``\"torch.float32\"``) to ``torch.dtype``."""
+    s = s.strip()
+    if s.startswith("torch."):
+        s = s.removeprefix("torch.")
+    return getattr(torch, s)
+
+
+def dtype_to_str(dtype: torch.dtype) -> str:
+    """Canonical short string for a ``torch.dtype`` (e.g. ``\"float32\"``)."""
+    return str(dtype).split(".")[-1]
+
+
 def _normalize_shards(
     shard: list[tuple[int, int, int]] | list[list[tuple[int, int, int]]],
 ) -> list[list[tuple[int, int, int]]]:
@@ -20,84 +33,58 @@ def _normalize_shards(
 
 class WeightData:
     """
-    A unified representation of weight metadata for receivers.
-    The format is:
-    {
-        "name": {
-            "metadata": {
-                "shard": [(l, r, w), ...] | [[(l, r, w), ...], [(l, r, w), ...], ...],
-                "dtype": torch.dtype,
+    Shard metadata for weight transfer (no tensor storage).
+
+    Format::
+
+        {
+            "name": {
+                "shard": [(l, r, w), ...] | [[...], ...],
+                "dtype": str,  # e.g. ``\"float32\"``
             },
-            "data": torch.Tensor | None,  # optional, receivers only need metadata
-        },
-        ...
-    }
-
-    where [l, r) is the range of the local shard index on the dimension, w is the total width.
-    Receivers only need metadata (shard + dtype); data is optional for senders.
-    """
-
-    def __init__(self, state_dict: dict[str, dict[str, ...]]):
-        self.state_dict = state_dict
-        self.sanity_check(self.state_dict)
-
-    def __getitem__(self, key: str) -> dict[str, ...]:
-        return self.state_dict[key]
-
-    def to_metadata_dict(self) -> dict[str, dict]:
-        """JSON-serializable metadata only (shard + dtype string)."""
-        return {
-            k: {"shard": v["metadata"]["shard"], "dtype": str(v["metadata"]["dtype"])}
-            for k, v in self.state_dict.items()
+            ...
         }
 
-    @classmethod
-    def from_metadata_dict(cls, metadata_dict: dict[str, dict]) -> "WeightData":
-        """Reconstruct a metadata-only WeightData from the JSON-serializable
-        form produced by ``to_metadata_dict``."""
-        state_dict = {}
-        for name, meta in metadata_dict.items():
-            dtype_str = meta["dtype"]
-            dtype = getattr(torch, dtype_str.removeprefix("torch."))
-            state_dict[name] = {
-                "metadata": {"shard": meta["shard"], "dtype": dtype},
-            }
-        return cls(state_dict)
+    Tensor values are passed separately as ``dict[str, torch.Tensor]`` to
+    :meth:`pack_for` when sending.
+    """
+
+    def __init__(self, meta_dict: dict[str, dict[str, ...]]):
+        self.meta_dict = meta_dict
+        self.sanity_check(self.meta_dict)
+
+    def __getitem__(self, key: str) -> dict[str, ...]:
+        return self.meta_dict[key]
 
     def __str__(self) -> str:
-        return json.dumps(self.to_metadata_dict(), indent=4)
+        return json.dumps(self.meta_dict, default=str, indent=4)
 
     def total_nbytes(self) -> int:
         """Total byte size of the data described by all shard entries."""
         total = 0
-        for entry in self.state_dict.values():
-            dtype = entry["metadata"]["dtype"]
-            for shard in _normalize_shards(entry["metadata"]["shard"]):
+        for entry in self.meta_dict.values():
+            dtype = dtype_str_to_torch(entry["dtype"])
+            for shard in _normalize_shards(entry["shard"]):
                 numel = 1
                 for l, r, w in shard:
                     numel *= r - l
                 total += numel * dtype.itemsize
         return total
 
-    def sanity_check(self, state_dict: dict[str, dict[str, ...]]) -> None:
-        for name, value in state_dict.items():
-            meta = value["metadata"]
-            dtype = meta["dtype"]
-            shards = _normalize_shards(meta["shard"])
+    def sanity_check(self, meta_dict: dict[str, dict[str, ...]]) -> None:
+        for name, value in meta_dict.items():
+            assert isinstance(value["dtype"], str), (
+                f"{name}: dtype must be str, got {type(value['dtype'])}"
+            )
+            dtype_str_to_torch(value["dtype"])  # validate
+            shards = _normalize_shards(value["shard"])
             assert len(shards) > 0, f"Empty shard list for {name}"
-            total_numel = 0
             for shard in shards:
                 assert len(shard) > 0, f"Empty shard in list for {name}"
                 numel = 1
                 for l, r, w in shard:
                     assert 0 <= l < r <= w, f"Invalid shard: {l, r, w} for {name}"
                     numel *= r - l
-                total_numel += numel
-            if (t := value.get("data")) is not None:
-                nbytes = total_numel * dtype.itemsize
-                assert t.dtype == torch.uint8, f"Invalid dtype: {t.dtype} for {name}"
-                assert t.nbytes == nbytes, f"Invalid nbytes: {t.nbytes} for {name}, expected {nbytes}"
-                assert len(t.shape) == 1, f"Invalid shape: {t.shape} for {name}"
 
     @staticmethod
     def compute_overlap(sender: "WeightData", receiver: "WeightData") -> "WeightData":
@@ -110,18 +97,16 @@ class WeightData:
         """
         result: dict[str, dict] = {}
 
-        for name, s_entry in sender.state_dict.items():
-            if name not in receiver.state_dict:
+        for name, s_entry in sender.meta_dict.items():
+            if name not in receiver.meta_dict:
                 continue
 
             r_entry = receiver[name]
-            dtype = s_entry["metadata"]["dtype"]
-            assert dtype == r_entry["metadata"]["dtype"], (
-                f"Dtype mismatch for {name}: {dtype} vs {r_entry['metadata']['dtype']}"
-            )
+            dtype = s_entry["dtype"]
+            assert dtype == r_entry["dtype"], f"Dtype mismatch for {name}: {dtype} vs {r_entry['dtype']}"
 
-            s_shards = _normalize_shards(s_entry["metadata"]["shard"])
-            r_shards = _normalize_shards(r_entry["metadata"]["shard"])
+            s_shards = _normalize_shards(s_entry["shard"])
+            r_shards = _normalize_shards(r_entry["shard"])
 
             overlap_shards: list[list[tuple[int, int, int]]] = []
 
@@ -157,29 +142,33 @@ class WeightData:
                 overlap_shards[0] if len(overlap_shards) == 1 else overlap_shards
             )
 
-            result[name] = {
-                "metadata": {"shard": out_shard, "dtype": dtype},
-            }
+            result[name] = {"shard": out_shard, "dtype": dtype}
 
         return WeightData(result)
 
-    def pack_for(self, overlap: "WeightData") -> torch.Tensor:
-        """Extract data from *self* matching *overlap* regions into a flat byte tensor.
+    @staticmethod
+    def pack_for(
+        sender_metadata: "WeightData",
+        tensors: dict[str, torch.Tensor],
+        overlap: "WeightData",
+    ) -> torch.Tensor:
+        """Pack local *tensors* (matching *sender_metadata* shards) into overlap order.
 
-        Iterates over overlap entries in state_dict order.  For each one,
+        Iterates over overlap entries in meta_dict order.  For each one,
         locates the containing sender sub-shard (handling dimensional
-        alignment via ``_check_shard_compatibility``), reshapes the sender
-        data to the aligned shape, slices out the overlap region, and
-        appends the bytes.  Returns the concatenation as a 1-D ``uint8``
-        tensor.
+        alignment via ``_check_shard_compatibility``), slices the overlap
+        region, and appends bytes.  Returns a 1-D ``uint8`` tensor.
         """
         chunks: list[torch.Tensor] = []
-        for name, o_entry in overlap.state_dict.items():
-            s_entry = self.state_dict[name]
-            s_data = s_entry["data"]
-            dtype = s_entry["metadata"]["dtype"]
-            s_shards = _normalize_shards(s_entry["metadata"]["shard"])
-            o_shards = _normalize_shards(o_entry["metadata"]["shard"])
+        for name, o_entry in overlap.meta_dict.items():
+            assert name in tensors, f"Missing tensor {name} for overlap entry"
+            s_entry = sender_metadata.meta_dict[name]
+            tensor = tensors[name]
+            torch_dtype = dtype_str_to_torch(s_entry["dtype"])
+            assert tensor.dtype == torch_dtype, f"Tensor dtype mismatch for {name}: {tensor.dtype} vs {torch_dtype}"
+            s_data = tensor.contiguous().reshape(-1).view(torch.uint8)
+            s_shards = _normalize_shards(s_entry["shard"])
+            o_shards = _normalize_shards(o_entry["shard"])
 
             byte_end = 0
             s_byte_ranges: list[tuple[int, int]] = []
@@ -188,7 +177,7 @@ class WeightData:
                 for l, r, w in s_shard:
                     numel *= r - l
                 start = byte_end
-                byte_end += numel * dtype.itemsize
+                byte_end += numel * torch_dtype.itemsize
                 s_byte_ranges.append((start, byte_end))
 
             for o_shard in o_shards:
@@ -206,7 +195,7 @@ class WeightData:
 
                     beg, end = s_byte_ranges[s_idx]
                     aligned_shape = [rs - ls for ls, rs, _ in aligned_s]
-                    typed = s_data[beg:end].view(dtype).reshape(aligned_shape)
+                    typed = s_data[beg:end].view(torch_dtype).reshape(aligned_shape)
                     slices = tuple(
                         slice(lo - ls, ro - ls)
                         for (ls, rs, _), (lo, ro, _) in zip(aligned_s, aligned_o)
@@ -226,6 +215,39 @@ class WeightData:
         if not chunks:
             return torch.empty(0, dtype=torch.uint8)
         return torch.cat(chunks)
+
+    def tensors_from_flat(self, flat: torch.Tensor) -> dict[str, torch.Tensor]:
+        """Rebuild tensors from flat ``uint8`` in the same chunk order as ``pack_for`` produces.
+
+        *overlap* metadata must match the packed layout (same shard iteration order).
+        """
+        offset = 0
+        out: dict[str, torch.Tensor] = {}
+        for name, o_entry in self.meta_dict.items():
+            torch_dtype = dtype_str_to_torch(o_entry["dtype"])
+            o_shards = _normalize_shards(o_entry["shard"])
+            parts: list[torch.Tensor] = []
+            for o_shard in o_shards:
+                numel = 1
+                shape_dims: list[int] = []
+                for l, r, w in o_shard:
+                    dim = r - l
+                    numel *= dim
+                    shape_dims.append(dim)
+                nbytes = numel * torch_dtype.itemsize
+                end = offset + nbytes
+                raw = flat[offset:end]
+                chunk = raw.view(torch_dtype).reshape(shape_dims)
+                parts.append(chunk)
+                offset = end
+            if len(parts) == 1:
+                out[name] = parts[0]
+            else:
+                out[name] = torch.cat(parts, dim=0)
+        assert offset == flat.numel(), (
+            f"flat size mismatch: consumed {offset}, tensor has {flat.numel()}"
+        )
+        return out
 
 
 _SENTINEL = object()

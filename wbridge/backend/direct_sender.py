@@ -1,6 +1,6 @@
 import json
-import socket
 import logging
+import socket
 
 import requests
 import torch
@@ -26,11 +26,11 @@ class DirectSender:
     ):
         self.receiver_urls = receiver_urls
 
-    def send(
-        self,
-        params: WeightData,
-    ):
-        pass
+    def connect(self, sender_metadata: WeightData) -> None:
+        raise NotImplementedError
+
+    def send(self, state_dict: dict[str, torch.Tensor]) -> None:
+        raise NotImplementedError
 
 
 class GPUDirectSender(DirectSender):
@@ -44,6 +44,7 @@ class GPUDirectSender(DirectSender):
         self.world_size = dist.get_world_size()
         self.group: dist.ProcessGroup | None = None
         self.overlaps: dict[int, WeightData] = {}
+        self._sender_metadata: WeightData | None = None
 
     backend = "nccl"
 
@@ -58,7 +59,7 @@ class GPUDirectSender(DirectSender):
         if self.world_size == 1:
             return sender_metadata
 
-        meta_dict = sender_metadata.to_metadata_dict()
+        meta_dict = dict(sender_metadata.meta_dict)
         all_meta_dicts: list[dict | None] = [None] * self.world_size
         dist.all_gather_object(all_meta_dicts, meta_dict)
 
@@ -66,10 +67,10 @@ class GPUDirectSender(DirectSender):
         for peer_rank, peer_dict in enumerate(all_meta_dicts):
             if peer_rank == self.rank:
                 continue
-            peer_wd = WeightData.from_metadata_dict(peer_dict)
+            peer_wd = WeightData(peer_dict)
             overlap = WeightData.compute_overlap(sender_metadata, peer_wd)
 
-            for name in overlap.state_dict:
+            for name in overlap.meta_dict:
                 if meta_dict[name]["shard"] == peer_dict[name]["shard"]:
                     if self.rank > peer_rank:
                         names_to_remove.add(name)
@@ -83,18 +84,15 @@ class GPUDirectSender(DirectSender):
         if not names_to_remove:
             return sender_metadata
 
-        # logger.info(
-        #     "Sender %d dedup: removed %d entries: %s",
-        #     self.rank, len(names_to_remove), sorted(names_to_remove),
-        # )
-        new_state_dict = {
-            k: v for k, v in sender_metadata.state_dict.items()
+        new_meta_dict = {
+            k: v for k, v in sender_metadata.meta_dict.items()
             if k not in names_to_remove
         }
-        return WeightData(new_state_dict)
+        return WeightData(new_meta_dict)
 
     def connect(self, sender_metadata: WeightData) -> None:
         sender_metadata = self._dedup_sender_metadata(sender_metadata)
+        self._sender_metadata = sender_metadata
 
         group_name = "wbridge"
 
@@ -167,11 +165,11 @@ class GPUDirectSender(DirectSender):
         # point-to-point send/recv pairs are matched without deadlock.
         device = "cuda" if self.backend == "nccl" else "cpu"
         for receiver_rank, receiver_meta_dict in all_receiver_workers:
-            receiver_wd = WeightData.from_metadata_dict(receiver_meta_dict)
+            receiver_wd = WeightData(receiver_meta_dict)
             overlap = WeightData.compute_overlap(sender_metadata, receiver_wd)
             self.overlaps[receiver_rank] = overlap
 
-            overlap_bytes = json.dumps(overlap.to_metadata_dict()).encode("utf-8")
+            overlap_bytes = json.dumps(overlap.meta_dict, default=str).encode("utf-8")
             size_t = torch.tensor(
                 [len(overlap_bytes)], dtype=torch.long, device=device
             )
@@ -189,34 +187,36 @@ class GPUDirectSender(DirectSender):
             total_world_size,
             len(all_receiver_workers),
         )
+        self.connected = True
 
-    def send(
-        self,
-        params: WeightData,
-    ):
-        if not self.connected:
-            self._sender_metadata = params.to_metadata_dict()
-            self.connect(params)
-            self.connected = True
-        else:
-            current = params.to_metadata_dict()
-            if current != self._sender_metadata:
-                raise ValueError("Params metadata changed between send calls")
-
+    def send(self, state_dict: dict[str, torch.Tensor]) -> None:
+        if not self.connected or self._sender_metadata is None:
+            raise RuntimeError("GPUDirectSender.send requires connect() first")
         if self.rank == 0:
             for url in self.receiver_urls:
                 resp = requests.post(f"{url}/wbridge/receive")
                 resp.raise_for_status()
-        dist.barrier()
 
+        device = "cuda" if self.backend == "nccl" else "cpu"
+        handles: list = []
         for receiver_rank, overlap in self.overlaps.items():
-            if not overlap.state_dict:
+            if not overlap.meta_dict:
                 continue
-            nbytes = overlap.total_nbytes()
+            packed = WeightData.pack_for(
+                self._sender_metadata, state_dict, overlap
+            )
+            if packed.device.type != device:
+                packed = packed.to(device)
+            nbytes = packed.numel()
             logger.info(
                 "Sender %d -> Receiver %d: %d bytes",
                 self.rank, receiver_rank, nbytes,
             )
+            handles.append(
+                dist.isend(packed, dst=receiver_rank, group=self.group)
+            )
+        for h in handles:
+            h.wait()
 
 
 class CPUDirectSender(DirectSender):

@@ -1,8 +1,11 @@
+import base64
+import io
 import json
 import logging
 import threading
 import tempfile
-from typing import List, Optional
+from enum import Enum
+from typing import Any, List
 
 import torch
 import torch.distributed as dist
@@ -18,9 +21,18 @@ logger = logging.getLogger(__name__)
 
 # Message types for controller <-> receiver communication
 METADATA_REQUEST = "metadata_request"
-READY_REQUEST = "ready_request"
 CONNECT_REQUEST = "connect_request"
 RECEIVE_REQUEST = "receive_request"
+# Scheduler (REQ) -> receiver (REP); replaces the old ready check
+UPDATE_REQUEST = "update_request"
+
+
+class ReceiverState(str, Enum):
+    """Receiver lifecycle for controller vs scheduler handoff."""
+
+    DISCONNECTED = "disconnected"
+    CONNECTED = "connected"
+    AWAITING_SCHEDULER_UPDATE = "awaiting_scheduler_update"
 
 
 class ConnectRequest(BaseModel):
@@ -43,7 +55,8 @@ class WeightReceiver:
         self.controller_ipc_name = controller_ipc_name
         self.scheduler_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
         self.rank = rank
-        self.metadata = metadata.to_metadata_dict()
+        self.metadata = dict(metadata.meta_dict)
+        self._state = ReceiverState.DISCONNECTED
         self.receiver_thread = threading.Thread(
             target=self._receiver_process_entry
         )
@@ -55,24 +68,117 @@ class WeightReceiver:
             self.process.terminate()
             self.process.join()
 
-    def is_weights_ready(self) -> bool:
-        """Check if new weights are ready via REQ/REP. For now returns False."""
+    def request_update(self) -> dict[str, Any]:
+        """Scheduler REQ/REP: trigger weight receive when state is AWAITING_SCHEDULER_UPDATE."""
         context = zmq.Context()
         socket = context.socket(zmq.REQ)
-        socket.setsockopt(zmq.RCVTIMEO, 1000)
-        socket.setsockopt(zmq.SNDTIMEO, 1000)
+        socket.setsockopt(zmq.RCVTIMEO, 600_000)
+        socket.setsockopt(zmq.SNDTIMEO, 600_000)
         try:
             socket.connect(self.scheduler_ipc_name)
-            socket.send_string(READY_REQUEST)
-            response = json.loads(socket.recv_string())
-            return response.get("ready", False)
+            socket.send_string(UPDATE_REQUEST)
+            return json.loads(socket.recv_string())
         except Exception as e:
-            logger.warning("WeightReceiver ready check failed: %s", e)
-            return False
+            logger.warning("WeightReceiver request_update failed: %s", e)
+            return {"success": False}
         finally:
             socket.close()
             context.term()
-            
+
+    @staticmethod
+    def _serialize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, Any]:
+        buf = io.BytesIO()
+        torch.save(state_dict, buf)
+        return {
+            "state_dict_torch_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
+        }
+
+    def _handle_metadata_request(self, controller_socket: zmq.Socket) -> None:
+        response = json.dumps({"rank": self.rank, "metadata": self.metadata})
+        controller_socket.send_string(response)
+
+    def _handle_connect_request(
+        self, controller_socket: zmq.Socket, data: dict[str, Any]
+    ) -> None:
+        """
+        Handle connect request from controller. This sets up the process group and the device.
+        It also destroys the previous process group if it exists.
+        """
+        if self._state == ReceiverState.AWAITING_SCHEDULER_UPDATE:
+            controller_socket.send_string(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "detail": "cannot connect while awaiting scheduler update",
+                    }
+                )
+            )
+            return
+        controller_socket.send_string(json.dumps({"status": "ack"}))
+        if getattr(self, "group", None) is not None:
+            dist.destroy_process_group(self.group)
+        backend = data["backend"]
+        self.backend = backend
+        self.group = init_custom_process_group(
+            backend=backend,
+            init_method=f"tcp://{data['master_address']}:{data['master_port']}",
+            world_size=data["world_size"],
+            rank=data["rank"],
+            group_name=data["group_name"],
+        )
+        self.device = "cuda" if backend == "nccl" else "cpu"
+        self.overlaps: dict[int, WeightData] = {}
+        for sender_rank in range(data["sender_world_size"]):
+            size_t = torch.zeros(1, dtype=torch.long, device=self.device)
+            dist.recv(size_t, src=sender_rank, group=self.group)
+            data_t = torch.zeros(
+                size_t.item(), dtype=torch.uint8, device=self.device
+            )
+            dist.recv(data_t, src=sender_rank, group=self.group)
+            overlap_dict = json.loads(
+                data_t.cpu().numpy().tobytes().decode("utf-8")
+            )
+            self.overlaps[sender_rank] = WeightData(overlap_dict)
+        logger.info(
+            "Receiver worker %d joined group %s as rank %d "
+            "(world_size=%d, overlaps from %d senders)",
+            self.rank, data["group_name"], data["rank"],
+            data["world_size"], len(self.overlaps),
+        )
+        self._state = ReceiverState.CONNECTED
+
+    def _handle_receive_request(self, controller_socket: zmq.Socket) -> None:
+        if self._state != ReceiverState.CONNECTED:
+            controller_socket.send_string(
+                json.dumps(
+                    {
+                        "status": "error",
+                        "detail": "receive requires CONNECTED state",
+                    }
+                )
+            )
+            return
+        controller_socket.send_string(json.dumps({"status": "ack"}))
+        self._state = ReceiverState.AWAITING_SCHEDULER_UPDATE
+
+    def _handle_scheduler_update(
+        self, scheduler_socket: zmq.Socket, msg: str
+    ) -> None:
+        if msg != UPDATE_REQUEST:
+            scheduler_socket.send_string(
+                json.dumps({"success": False, "message": "unknown message"})
+            )
+            return
+        if self._state != ReceiverState.AWAITING_SCHEDULER_UPDATE:
+            scheduler_socket.send_string(json.dumps({"success": False}))
+            return
+        state_dict = self._receive_weights()
+        self._state = ReceiverState.CONNECTED
+        payload = self._serialize_state_dict(state_dict)
+        scheduler_socket.send_string(
+            json.dumps({"success": True, **payload})
+        )
+
     def _receiver_process_entry(
         self
     ):
@@ -88,7 +194,7 @@ class WeightReceiver:
         controller_socket.connect(self.controller_ipc_name)
         poller.register(controller_socket, zmq.POLLIN)
 
-        # REP: bind for scheduler's REQ (ready check)
+        # REP: bind for scheduler's REQ (update -> recv weights)
         scheduler_socket = context.socket(zmq.REP)
         scheduler_socket.bind(self.scheduler_ipc_name)
         poller.register(scheduler_socket, zmq.POLLIN)
@@ -97,65 +203,56 @@ class WeightReceiver:
             socks = dict(poller.poll())
             if controller_socket in socks:
                 msg = controller_socket.recv_string()
-                if msg == METADATA_REQUEST:
-                    response = json.dumps({"rank": self.rank, "metadata": self.metadata})
-                    controller_socket.send_string(response)
+                data = json.loads(msg)
+                req_type = data.get("type")
+                if req_type == METADATA_REQUEST:
+                    self._handle_metadata_request(controller_socket)
+                elif req_type == CONNECT_REQUEST:
+                    self._handle_connect_request(controller_socket, data)
+                elif req_type == RECEIVE_REQUEST:
+                    self._handle_receive_request(controller_socket)
                 else:
-                    data = json.loads(msg)
-                    if data.get("type") == CONNECT_REQUEST:
-                        controller_socket.send_string(json.dumps({"status": "ack"}))
-                        backend = data["backend"]
-                        self.backend = backend
-                        self.group = init_custom_process_group(
-                            backend=backend,
-                            init_method=f"tcp://{data['master_address']}:{data['master_port']}",
-                            world_size=data["world_size"],
-                            rank=data["rank"],
-                            group_name=data["group_name"],
-                        )
-                        # Receive overlap metadata from each sender
-                        device = "cuda" if backend == "nccl" else "cpu"
-                        self.overlaps: dict[int, WeightData] = {}
-                        for sender_rank in range(data["sender_world_size"]):
-                            size_t = torch.zeros(1, dtype=torch.long, device=device)
-                            dist.recv(size_t, src=sender_rank, group=self.group)
-                            data_t = torch.zeros(
-                                size_t.item(), dtype=torch.uint8, device=device
-                            )
-                            dist.recv(data_t, src=sender_rank, group=self.group)
-                            overlap_dict = json.loads(
-                                data_t.cpu().numpy().tobytes().decode("utf-8")
-                            )
-                            self.overlaps[sender_rank] = WeightData.from_metadata_dict(
-                                overlap_dict
-                            )
-                        logger.info(
-                            "Receiver worker %d joined group %s as rank %d "
-                            "(world_size=%d, overlaps from %d senders)",
-                            self.rank, data["group_name"], data["rank"],
-                            data["world_size"], len(self.overlaps),
-                        )
-                    elif data.get("type") == RECEIVE_REQUEST:
-                        controller_socket.send_string(json.dumps({"status": "ack"}))
-                        self._receive_weights()
+                    raise ValueError(f"Unknown message from controller: {msg}")
             if scheduler_socket in socks:
-                # Ready check from scheduler
                 msg = scheduler_socket.recv_string()
-                if msg == READY_REQUEST:
-                    ready = getattr(self, "_weights_ready", False)
-                    scheduler_socket.send_string(json.dumps({"ready": ready}))
+                self._handle_scheduler_update(scheduler_socket, msg)
 
-
-    def _receive_weights(self) -> None:
-        """Set up irecv for each sender's overlap and receive via batch_isend_irecv."""
+    def _receive_weights(self) -> dict[str, torch.Tensor]:
+        """irecv overlap bytes from each sender, unpack to tensors (same order as sender ``pack_for``)."""
+        ops = []
+        buffers: list[tuple[int, torch.Tensor, WeightData]] = []
+        device = "cuda" if self.backend == "nccl" else "cpu"
         for sender_rank, overlap in self.overlaps.items():
-            if not overlap.state_dict:
+            if not overlap.meta_dict:
                 continue
             nbytes = overlap.total_nbytes()
+            tensor = torch.zeros(nbytes, dtype=torch.uint8, device=device)
             logger.info(
                 "Receiver %d <- Sender %d: %d bytes",
                 self.rank, sender_rank, nbytes,
             )
+            buffers.append((sender_rank, tensor, overlap))
+            ops.append(
+                dist.P2POp(
+                    op=torch.distributed.irecv,
+                    tensor=tensor,
+                    peer=sender_rank,
+                    group=self.group,
+                )
+            )
+        dist.batch_isend_irecv(ops)
+        for op in ops:
+            op.wait()
+        merged: dict[str, torch.Tensor] = {}
+        for sender_rank, tensor, overlap in buffers:
+            partial = overlap.tensors_from_flat(tensor)
+            for name, t in partial.items():
+                if name in merged:
+                    raise ValueError(
+                        f"duplicate tensor name {name!r} from sender {sender_rank}"
+                    )
+                merged[name] = t
+        return merged
 
 
 class WeightReceiverController:
@@ -199,12 +296,13 @@ class WeightReceiverController:
         self._receiver_identities = [b"worker-%d" % rank for rank in range(worker_num)]
 
     def _query_receivers_metadata(self) -> List[dict]:
-        """Query all connected receivers via ROUTER/DEALER.
+        """Query all connected receivers via ROUTER/DEALER (``{"type": "metadata_request"}``).
         Collects until worker_num responses received or timeout.
-        Returns list of {rank, metadata} from each receiver.
+        Each item includes ``rank`` and ``metadata`` (per worker JSON from the receiver).
         """
+        metadata_msg = json.dumps({"type": METADATA_REQUEST}).encode("utf-8")
         for identity in self._receiver_identities:
-            self._router_socket.send_multipart([identity, METADATA_REQUEST.encode(encoding="utf-8")])
+            self._router_socket.send_multipart([identity, metadata_msg])
 
         results = []
         while len(results) < self._worker_num:
@@ -249,7 +347,7 @@ class WeightReceiverController:
         return JSONResponse(content={"status": "success"})
 
     async def receive_weights(self):
-        """Signal all workers to start irecv, wait for acks, then return."""
+        """Signal workers to enter ``AWAITING_SCHEDULER_UPDATE`` (HTTP ack only). Actual recv runs on scheduler ``update``."""
         for identity in self._receiver_identities:
             receive_msg = json.dumps({"type": RECEIVE_REQUEST})
             self._router_socket.send_multipart(

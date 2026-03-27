@@ -8,7 +8,7 @@ import re
 import torch
 
 from megatron.core import mpu
-from wbridge.utils.data import WeightData
+from wbridge.utils.data import WeightData, dtype_to_str
 
 def convert_split_qwen2_to_hf(args, name, param):
     if name == "module.module.embedding.word_embeddings.weight":
@@ -80,9 +80,12 @@ def convert_split_qwen2_to_hf(args, name, param):
     raise ValueError(f"Unknown parameter name: {name}")
 
 
-def convert_qwen2_to_wb(args, named_tensors: list[tuple[str, torch.nn.Parameter]], metadata_only: bool = False) -> WeightData:
-    """Convert Qwen2/Qwen3 Megatron param to HF-style (name, param) list for WeightBridge."""
-    state_dict = {}
+def convert_qwen2_to_wb_and_tensors(
+    args, named_tensors: list[tuple[str, torch.nn.Parameter]]
+) -> tuple[WeightData, dict[str, torch.Tensor]]:
+    """HF-style metadata (``WeightData``) and matching local tensor shards for send."""
+    meta_dict: dict[str, dict] = {}
+    tensors: dict[str, torch.Tensor] = {}
     tprk = mpu.get_tensor_model_parallel_rank()
     tpws = mpu.get_tensor_model_parallel_world_size()
     vocab_size = args.vocab_size
@@ -97,7 +100,6 @@ def convert_qwen2_to_wb(args, named_tensors: list[tuple[str, torch.nn.Parameter]
                 for i, d in enumerate(hf_param.shape)
             ]
 
-            # Remove paddings for embed_token and lm_head
             if "embed_token" in hf_name or "lm_head" in hf_name:
                 l, r, w = shard[0]
                 if l >= vocab_size:
@@ -105,11 +107,25 @@ def convert_qwen2_to_wb(args, named_tensors: list[tuple[str, torch.nn.Parameter]
                 r = min(vocab_size, r)
                 w = min(vocab_size, w)
                 shard[0] = (l, r, w)
-                if not metadata_only:
-                    t = t[:r - l]
+                t = t[:r - l]
 
-            entry = {"metadata": {"shard": shard, "dtype": hf_param.dtype}}
-            if not metadata_only:
-                entry["data"] = t.view(torch.uint8).view(-1)
-            state_dict[hf_name] = entry
-    return WeightData(state_dict)
+            meta_dict[hf_name] = {"shard": shard, "dtype": dtype_to_str(hf_param.dtype)}
+            tensors[hf_name] = t
+
+    return WeightData(meta_dict), tensors
+
+
+def convert_qwen2_to_wb(
+    args, named_tensors: list[tuple[str, torch.nn.Parameter]]
+) -> WeightData:
+    """Metadata-only :class:`~wbridge.utils.data.WeightData` for ``connect``."""
+    meta, _ = convert_qwen2_to_wb_and_tensors(args, named_tensors)
+    return meta
+
+
+def convert_qwen2_to_tensors(
+    args, named_tensors: list[tuple[str, torch.nn.Parameter]]
+) -> dict[str, torch.Tensor]:
+    """Local tensor dict for :meth:`~wbridge.frontend.sender.WeightSender.send`."""
+    _, tensors = convert_qwen2_to_wb_and_tensors(args, named_tensors)
+    return tensors
