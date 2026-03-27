@@ -12,11 +12,11 @@ from wbridge.utils.distributed import init_custom_process_group
 logger = logging.getLogger(__name__)
 
 
-def _get_local_ip() -> str:
+def _get_local_ip_and_port() -> tuple[str, int]:
     """Return the IP address of the interface used for outbound traffic."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
+        return s.getsockname()[0], s.getsockname()[1]
 
 
 class DirectSender:
@@ -25,28 +25,14 @@ class DirectSender:
         receiver_urls: list[str],
     ):
         self.receiver_urls = receiver_urls
-
-    def connect(self, sender_metadata: WeightData) -> None:
-        raise NotImplementedError
-
-    def send(self, state_dict: dict[str, torch.Tensor]) -> None:
-        raise NotImplementedError
-
-
-class GPUDirectSender(DirectSender):
-    def __init__(
-        self,
-        receiver_urls: list[str],
-    ):
-        super().__init__(receiver_urls)
         self.rank = dist.get_rank()
         self.connected = False
         self.world_size = dist.get_world_size()
         self.group: dist.ProcessGroup | None = None
         self.overlaps: dict[int, WeightData] = {}
         self._sender_metadata: WeightData | None = None
-
-    backend = "nccl"
+        self.backend = None
+        self.device = None
 
     def _dedup_sender_metadata(self, sender_metadata: WeightData) -> WeightData:
         """All-gather metadata across senders and deduplicate identical shards.
@@ -90,6 +76,7 @@ class GPUDirectSender(DirectSender):
         }
         return WeightData(new_meta_dict)
 
+
     def connect(self, sender_metadata: WeightData) -> None:
         sender_metadata = self._dedup_sender_metadata(sender_metadata)
         self._sender_metadata = sender_metadata
@@ -97,11 +84,8 @@ class GPUDirectSender(DirectSender):
         group_name = "wbridge"
 
         if self.rank == 0:
-            master_address = _get_local_ip()
-            with socket.socket() as sock:
-                sock.bind(("", 0))
-                master_port = sock.getsockname()[1]
-
+            master_address, master_port = _get_local_ip_and_port()
+            
             # Query receiver metadata and build per-worker list
             all_receiver_workers: list[tuple[int, dict]] = []
             receiver_worker_counts: list[int] = []
@@ -111,10 +95,9 @@ class GPUDirectSender(DirectSender):
                 resp.raise_for_status()
                 workers = sorted(resp.json(), key=lambda w: w["rank"])
                 receiver_worker_counts.append(len(workers))
-                for worker in workers:
-                    all_receiver_workers.append(
-                        (base_rank + worker["rank"], worker["metadata"])
-                    )
+                all_receiver_workers.extend([(
+                    base_rank + worker["rank"], worker["metadata"]
+                ) for worker in workers])
                 base_rank += len(workers)
 
             total_world_size = self.world_size + sum(receiver_worker_counts)
@@ -163,21 +146,25 @@ class GPUDirectSender(DirectSender):
         # Compute overlap with each receiver and send it via the process group.
         # Receivers iterate over sender ranks in the same order, so the
         # point-to-point send/recv pairs are matched without deadlock.
-        device = "cuda" if self.backend == "nccl" else "cpu"
+        handles: list = []
         for receiver_rank, receiver_meta_dict in all_receiver_workers:
             receiver_wd = WeightData(receiver_meta_dict)
             overlap = WeightData.compute_overlap(sender_metadata, receiver_wd)
+            if not overlap:
+                continue
             self.overlaps[receiver_rank] = overlap
 
             overlap_bytes = json.dumps(overlap.meta_dict, default=str).encode("utf-8")
             size_t = torch.tensor(
-                [len(overlap_bytes)], dtype=torch.long, device=device
+                [len(overlap_bytes)], dtype=torch.long, device=self.device
             )
             data_t = torch.frombuffer(
                 bytearray(overlap_bytes), dtype=torch.uint8
-            ).to(device)
-            dist.send(size_t, dst=receiver_rank, group=self.group)
-            dist.send(data_t, dst=receiver_rank, group=self.group)
+            ).to(self.device)
+            handles.append(dist.isend(size_t, dst=receiver_rank, group=self.group))
+            handles.append(dist.isend(data_t, dst=receiver_rank, group=self.group))
+        for h in handles:
+            h.wait()
 
         logger.info(
             "Sender %d connected (group=%s, backend=%s, world_size=%d, receiver_workers=%d)",
@@ -190,6 +177,19 @@ class GPUDirectSender(DirectSender):
         self.connected = True
 
     def send(self, state_dict: dict[str, torch.Tensor]) -> None:
+        raise NotImplementedError
+
+
+class GPUDirectSender(DirectSender):
+    def __init__(
+        self,
+        receiver_urls: list[str],
+    ):
+        super().__init__(receiver_urls)
+        self.device = "cuda"
+        self.backend = "nccl"
+
+    def send(self, state_dict: dict[str, torch.Tensor]) -> None:
         if not self.connected or self._sender_metadata is None:
             raise RuntimeError("GPUDirectSender.send requires connect() first")
         if self.rank == 0:
@@ -197,27 +197,23 @@ class GPUDirectSender(DirectSender):
                 resp = requests.post(f"{url}/wbridge/receive")
                 resp.raise_for_status()
 
-        device = "cuda" if self.backend == "nccl" else "cpu"
-        handles: list = []
-        for receiver_rank, overlap in self.overlaps.items():
-            if not overlap.meta_dict:
-                continue
-            packed = WeightData.pack_for(
-                self._sender_metadata, state_dict, overlap
-            )
-            if packed.device.type != device:
-                packed = packed.to(device)
-            nbytes = packed.numel()
-            logger.info(
-                "Sender %d -> Receiver %d: %d bytes",
-                self.rank, receiver_rank, nbytes,
-            )
-            handles.append(
-                dist.isend(packed, dst=receiver_rank, group=self.group)
-            )
+        chunks = self._sender_metadata(state_dict)[self.overlaps]
+        handles = [
+            dist.isend(chunk, dst=receiver_rank, group=self.group)
+            for receiver_rank, chunk in chunks.items()
+        ]
         for h in handles:
             h.wait()
 
 
 class CPUDirectSender(DirectSender):
-    backend = "gloo"
+    def __init__(
+        self,
+        receiver_urls: list[str],
+    ):
+        super().__init__(receiver_urls)
+        self.device = "cpu"
+        self.backend = "gloo"
+
+    def send(self, state_dict: dict[str, torch.Tensor]) -> None:
+        pass # TODO: Implement CPUDirectSender.send

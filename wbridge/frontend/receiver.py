@@ -51,11 +51,13 @@ class WeightReceiver:
         controller_ipc_name: str,
         rank: int,
         metadata: WeightData,
+        state_dict: dict[str, torch.Tensor],
     ):
         self.controller_ipc_name = controller_ipc_name
         self.scheduler_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
         self.rank = rank
         self.metadata = dict(metadata.meta_dict)
+        self.state_dict = state_dict
         self._state = ReceiverState.DISCONNECTED
         self.receiver_thread = threading.Thread(
             target=self._receiver_process_entry
@@ -117,28 +119,34 @@ class WeightReceiver:
         controller_socket.send_string(json.dumps({"status": "ack"}))
         if getattr(self, "group", None) is not None:
             dist.destroy_process_group(self.group)
-        backend = data["backend"]
-        self.backend = backend
+            
+        # Initialize the process group
+        self.backend = data["backend"]
+        self.device = "cuda" if self.backend == "nccl" else "cpu"
         self.group = init_custom_process_group(
-            backend=backend,
+            backend=self.backend,
             init_method=f"tcp://{data['master_address']}:{data['master_port']}",
             world_size=data["world_size"],
             rank=data["rank"],
             group_name=data["group_name"],
         )
-        self.device = "cuda" if backend == "nccl" else "cpu"
+        
+        # Receive the overlap metadata from the sender
         self.overlaps: dict[int, WeightData] = {}
+        handles: list = []
         for sender_rank in range(data["sender_world_size"]):
             size_t = torch.zeros(1, dtype=torch.long, device=self.device)
-            dist.recv(size_t, src=sender_rank, group=self.group)
+            handles.append(dist.irecv(size_t, src=sender_rank, group=self.group))
             data_t = torch.zeros(
                 size_t.item(), dtype=torch.uint8, device=self.device
             )
-            dist.recv(data_t, src=sender_rank, group=self.group)
+            handles.append(dist.irecv(data_t, src=sender_rank, group=self.group))
             overlap_dict = json.loads(
                 data_t.cpu().numpy().tobytes().decode("utf-8")
             )
             self.overlaps[sender_rank] = WeightData(overlap_dict)
+        for h in handles:
+            h.wait()
         logger.info(
             "Receiver worker %d joined group %s as rank %d "
             "(world_size=%d, overlaps from %d senders)",
@@ -172,7 +180,7 @@ class WeightReceiver:
         if self._state != ReceiverState.AWAITING_SCHEDULER_UPDATE:
             scheduler_socket.send_string(json.dumps({"success": False}))
             return
-        state_dict = self._receive_weights()
+        state_dict = self._receive_weights(state_dict)
         self._state = ReceiverState.CONNECTED
         payload = self._serialize_state_dict(state_dict)
         scheduler_socket.send_string(
@@ -222,37 +230,18 @@ class WeightReceiver:
         ops = []
         buffers: list[tuple[int, torch.Tensor, WeightData]] = []
         device = "cuda" if self.backend == "nccl" else "cpu"
-        for sender_rank, overlap in self.overlaps.items():
-            if not overlap.meta_dict:
-                continue
-            nbytes = overlap.total_nbytes()
-            tensor = torch.zeros(nbytes, dtype=torch.uint8, device=device)
-            logger.info(
-                "Receiver %d <- Sender %d: %d bytes",
-                self.rank, sender_rank, nbytes,
-            )
-            buffers.append((sender_rank, tensor, overlap))
-            ops.append(
-                dist.P2POp(
-                    op=torch.distributed.irecv,
-                    tensor=tensor,
-                    peer=sender_rank,
-                    group=self.group,
-                )
-            )
-        dist.batch_isend_irecv(ops)
-        for op in ops:
-            op.wait()
-        merged: dict[str, torch.Tensor] = {}
-        for sender_rank, tensor, overlap in buffers:
-            partial = overlap.tensors_from_flat(tensor)
-            for name, t in partial.items():
-                if name in merged:
-                    raise ValueError(
-                        f"duplicate tensor name {name!r} from sender {sender_rank}"
-                    )
-                merged[name] = t
-        return merged
+        chunks = {
+            sender_rank: torch.zeros(overlap.total_nbytes(), dtype=torch.uint8, device=device)
+            for sender_rank, overlap in self.overlaps.items()
+        }
+        handles = [
+            dist.irecv(chunk, src=sender_rank, group=self.group)
+            for sender_rank, chunk in chunks.items()
+        ]
+        for h in handles:
+            h.wait()
+        
+        self.metadata(self.state_dict)[self.overlaps] = chunks
 
 
 class WeightReceiverController:
