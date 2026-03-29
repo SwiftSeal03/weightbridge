@@ -1,5 +1,7 @@
 from datetime import timedelta
 from typing import Any
+import socket
+import os
 
 import torch
 from torch.distributed.distributed_c10d import (
@@ -10,6 +12,17 @@ from torch.distributed.distributed_c10d import (
     default_pg_timeout,
     rendezvous,
 )
+
+
+def get_local_ip() -> str:
+    """Return the local IP address and a new port."""
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
+        s.connect(("8.8.8.8", 80))
+        return s.getsockname()[0]
+    
+    
+def get_full_group_port() -> int:
+    return 60000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
 
 
 def init_custom_process_group(

@@ -7,16 +7,9 @@ import torch
 import torch.distributed as dist
 
 from wbridge.utils.data import WeightData
-from wbridge.utils.distributed import init_custom_process_group
+from wbridge.utils.distributed import init_custom_process_group, get_local_ip, get_full_group_port
 
 logger = logging.getLogger(__name__)
-
-
-def _get_local_ip_and_port() -> tuple[str, int]:
-    """Return the IP address of the interface used for outbound traffic."""
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0], s.getsockname()[1]
 
 
 class DirectSender:
@@ -24,10 +17,11 @@ class DirectSender:
         self,
         receiver_urls: list[str],
     ):
-        self.receiver_urls = receiver_urls
         self.rank = dist.get_rank()
-        self.connected = False
         self.world_size = dist.get_world_size()
+        self.receiver_urls = receiver_urls
+        
+        self.connected = False
         self.group: dist.ProcessGroup | None = None
         self.overlaps: dict[int, WeightData] = {}
         self._sender_metadata: WeightData | None = None
@@ -83,9 +77,7 @@ class DirectSender:
 
         group_name = "wbridge"
 
-        if self.rank == 0:
-            master_address, master_port = _get_local_ip_and_port()
-            
+        if self.rank == 0:            
             # Query receiver metadata and build per-worker list
             all_receiver_workers: list[tuple[int, dict]] = []
             receiver_worker_counts: list[int] = []
@@ -104,6 +96,7 @@ class DirectSender:
 
             # Tell each receiver to join, assigning ranks starting after all senders
             base_rank = self.world_size
+            master_address, master_port = get_local_ip(), get_full_group_port()
             for url, count in zip(self.receiver_urls, receiver_worker_counts):
                 resp = requests.post(
                     f"{url}/wbridge/connect",
@@ -183,9 +176,10 @@ class DirectSender:
 class GPUDirectSender(DirectSender):
     def __init__(
         self,
-        receiver_urls: list[str],
+        *args,
+        **kwargs,
     ):
-        super().__init__(receiver_urls)
+        super().__init__(*args, **kwargs)
         self.device = "cuda"
         self.backend = "nccl"
 

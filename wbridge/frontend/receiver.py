@@ -63,6 +63,10 @@ class WeightReceiver:
             target=self._receiver_process_entry
         )
         self.receiver_thread.start()
+        
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(self.scheduler_ipc_name)
 
     def stop(self):
         """Stop the receiver process."""
@@ -72,20 +76,8 @@ class WeightReceiver:
 
     def request_update(self) -> dict[str, Any]:
         """Scheduler REQ/REP: trigger weight receive when state is AWAITING_SCHEDULER_UPDATE."""
-        context = zmq.Context()
-        socket = context.socket(zmq.REQ)
-        socket.setsockopt(zmq.RCVTIMEO, 600_000)
-        socket.setsockopt(zmq.SNDTIMEO, 600_000)
-        try:
-            socket.connect(self.scheduler_ipc_name)
-            socket.send_string(UPDATE_REQUEST)
-            return json.loads(socket.recv_string())
-        except Exception as e:
-            logger.warning("WeightReceiver request_update failed: %s", e)
-            return {"success": False}
-        finally:
-            socket.close()
-            context.term()
+        self.socket.send_string(UPDATE_REQUEST)
+        return json.loads(self.socket.recv_string())["success"]
 
     @staticmethod
     def _serialize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, Any]:
@@ -108,12 +100,7 @@ class WeightReceiver:
         """
         if self._state == ReceiverState.AWAITING_SCHEDULER_UPDATE:
             controller_socket.send_string(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "detail": "cannot connect while awaiting scheduler update",
-                    }
-                )
+                json.dumps({"status": "error", "detail": "cannot connect while awaiting scheduler update"})
             )
             return
         controller_socket.send_string(json.dumps({"status": "ack"}))
@@ -158,12 +145,7 @@ class WeightReceiver:
     def _handle_receive_request(self, controller_socket: zmq.Socket) -> None:
         if self._state != ReceiverState.CONNECTED:
             controller_socket.send_string(
-                json.dumps(
-                    {
-                        "status": "error",
-                        "detail": "receive requires CONNECTED state",
-                    }
-                )
+                json.dumps({"status": "error", "detail": "requires CONNECTED state"})
             )
             return
         controller_socket.send_string(json.dumps({"status": "ack"}))
@@ -178,14 +160,13 @@ class WeightReceiver:
             )
             return
         if self._state != ReceiverState.AWAITING_SCHEDULER_UPDATE:
-            scheduler_socket.send_string(json.dumps({"success": False}))
+            scheduler_socket.send_string(
+                json.dumps({"success": False, "message": "no pending weights"})
+            )
             return
-        state_dict = self._receive_weights(state_dict)
+        self._receive_weights()
         self._state = ReceiverState.CONNECTED
-        payload = self._serialize_state_dict(state_dict)
-        scheduler_socket.send_string(
-            json.dumps({"success": True, **payload})
-        )
+        scheduler_socket.send_string(json.dumps({"success": True}))
 
     def _receiver_process_entry(
         self
@@ -225,13 +206,10 @@ class WeightReceiver:
                 msg = scheduler_socket.recv_string()
                 self._handle_scheduler_update(scheduler_socket, msg)
 
-    def _receive_weights(self) -> dict[str, torch.Tensor]:
+    def _receive_weights(self) -> None:
         """irecv overlap bytes from each sender, unpack to tensors (same order as sender ``pack_for``)."""
-        ops = []
-        buffers: list[tuple[int, torch.Tensor, WeightData]] = []
-        device = "cuda" if self.backend == "nccl" else "cpu"
         chunks = {
-            sender_rank: torch.zeros(overlap.total_nbytes(), dtype=torch.uint8, device=device)
+            sender_rank: torch.zeros(overlap.total_nbytes(), dtype=torch.uint8, device=self.device)
             for sender_rank, overlap in self.overlaps.items()
         }
         handles = [
@@ -284,27 +262,27 @@ class WeightReceiverController:
         self._worker_num = worker_num
         self._receiver_identities = [b"worker-%d" % rank for rank in range(worker_num)]
 
-    def _query_receivers_metadata(self) -> List[dict]:
+
+    def _gather_responses(self) -> bool:
+        responses = []
+        for _ in range(self._worker_num):
+            msg_bytes = self._router_socket.recv_multipart()[1]
+            responses.append(json.loads(msg_bytes.decode("utf-8")))
+        return responses
+        
+        
+    async def metadata(self):
         """Query all connected receivers via ROUTER/DEALER (``{"type": "metadata_request"}``).
         Collects until worker_num responses received or timeout.
         Each item includes ``rank`` and ``metadata`` (per worker JSON from the receiver).
         """
-        metadata_msg = json.dumps({"type": METADATA_REQUEST}).encode("utf-8")
+        metadata_msg_bytes = json.dumps({"type": METADATA_REQUEST}).encode("utf-8")
         for identity in self._receiver_identities:
-            self._router_socket.send_multipart([identity, metadata_msg])
+            self._router_socket.send_multipart([identity, metadata_msg_bytes])
 
-        results = []
-        while len(results) < self._worker_num:
-            parts = self._router_socket.recv_multipart()
-            assert len(parts) >= 2, "Invalid response from receiver"
-            resp = json.loads(parts[1].decode("utf-8"))
-            results.append(resp)
+        results = self._gather_responses()
         return sorted(results, key=lambda r: r.get("rank", -1))
 
-    async def metadata(self):
-        """Return metadata from all receivers (rank + weight shard metadata per receiver)."""
-        results = self._query_receivers_metadata()
-        return JSONResponse(content=results)
 
     async def connect(self, request: ConnectRequest):
         """Forward connection info to each worker, wait for acks, then return.
@@ -314,7 +292,7 @@ class WeightReceiverController:
         so this endpoint returns as soon as all workers have the info.
         """
         for idx, identity in enumerate(self._receiver_identities):
-            connect_msg = json.dumps({
+            connect_msg_bytes = json.dumps({
                 "type": CONNECT_REQUEST,
                 "master_address": request.master_address,
                 "master_port": request.master_port,
@@ -323,29 +301,20 @@ class WeightReceiverController:
                 "group_name": request.group_name,
                 "sender_world_size": request.sender_world_size,
                 "backend": request.backend,
-            })
-            self._router_socket.send_multipart(
-                [identity, connect_msg.encode("utf-8")]
-            )
+            }).encode("utf-8")
+            self._router_socket.send_multipart([identity, connect_msg_bytes])
 
-        acks = 0
-        while acks < self._worker_num:
-            self._router_socket.recv_multipart()
-            acks += 1
+        success = all(resp["status"] == "ack" for resp in self._gather_responses())
+        return JSONResponse(content={"status": "success" if success else "error"})
 
-        return JSONResponse(content={"status": "success"})
 
     async def receive_weights(self):
-        """Signal workers to enter ``AWAITING_SCHEDULER_UPDATE`` (HTTP ack only). Actual recv runs on scheduler ``update``."""
+        """Signal workers to enter ``AWAITING_SCHEDULER_UPDATE`` (HTTP ack only). 
+        Actual recv runs on scheduler ``update`` call.
+        """
         for identity in self._receiver_identities:
-            receive_msg = json.dumps({"type": RECEIVE_REQUEST})
-            self._router_socket.send_multipart(
-                [identity, receive_msg.encode("utf-8")]
-            )
+            receive_msg_bytes = json.dumps({"type": RECEIVE_REQUEST}).encode("utf-8")
+            self._router_socket.send_multipart([identity, receive_msg_bytes])
 
-        acks = 0
-        while acks < self._worker_num:
-            self._router_socket.recv_multipart()
-            acks += 1
-
-        return JSONResponse(content={"status": "success"})
+        success = all(resp["status"] == "ack" for resp in self._gather_responses())
+        return JSONResponse(content={"status": "success" if success else "error"})

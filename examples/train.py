@@ -1,4 +1,4 @@
-"""Minimal WeightBridge example with Ray placement groups.
+"""Minimal WeightBridge example: Ray placement groups + GPU-direct transfer.
 
 Uses Ray to place the trainer (2 sender workers) and rollout engine
 (2 receiver workers) on separate nodes, each requiring 2 GPUs.
@@ -16,14 +16,18 @@ Architecture::
     │   ├── receiver_worker 0  (child process, WeightReceiver)
     │   └── receiver_worker 1  (child process, WeightReceiver)
     │
-    └── TrainerWorker × 2  (Ray actors on trainer node)
-        ├── torch.distributed (gloo, for default-group barriers)
-        └── WeightSender → send()
+    └── TrainerWorker × NUM_SENDER_WORKERS  (Ray actors on trainer bundles)
+        └── torch.distributed (NCCL) + WeightSender.connect / .send
+            (GPUDirectSender → NCCL isend to receivers)
 
-Tensors (float32, shape [4, 8]):
-    1. uneven_weight — row-sharded unevenly: worker 0 → [0,3), worker 1 → [3,4)
-    2. col_weight    — column-sharded:       worker 0 → cols [0,4), worker 1 → cols [4,8)
-    3. dup_weight    — duplicated on both workers
+Tensors (``float32``, shape ``[ROWS, COLS]`` = ``[4, 8]``):
+
+    1. ``uneven_weight`` — row-sharded unevenly: rank 0 → rows ``[0, 1)``,
+       rank 1 → rows ``[1, 4)``.
+    2. ``col_weight`` — column-sharded: rank 0 → cols ``[0, 4)``, rank 1 →
+       cols ``[4, 8)``.
+    3. ``dup_weight`` — full tensor duplicated on both sender ranks (deduped in
+       ``DirectSender._dedup_sender_metadata``).
 
 Usage::
 
@@ -35,7 +39,6 @@ Usage::
 import logging
 import multiprocessing as mp
 import os
-import socket
 import threading
 import time
 
@@ -47,7 +50,8 @@ from fastapi import FastAPI
 from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
-from wbridge import WeightData, WeightReceiver, WeightReceiverController, WeightSender
+from wbridge.utils.distributed import get_local_ip
+from wbridge import WeightData, WeightReceiver, WeightReceiverController, WeightSender, dtype_str_to_torch
 
 logger = logging.getLogger("example")
 
@@ -59,18 +63,6 @@ ROWS, COLS = 4, 8
 
 
 # ── Helpers ────────────────────────────────────────────────────────
-
-
-def _get_host_ip() -> str:
-    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
-        s.connect(("8.8.8.8", 80))
-        return s.getsockname()[0]
-
-
-def _find_free_port() -> int:
-    with socket.socket() as s:
-        s.bind(("", 0))
-        return s.getsockname()[1]
 
 
 def _build_sender_metadata(rank: int) -> WeightData:
@@ -108,21 +100,6 @@ def _build_sender_metadata(rank: int) -> WeightData:
     return WeightData(meta_dict)
 
 
-def _sender_local_tensors(rank: int, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Local tensor shards for ``send`` (same layout as metadata)."""
-    if rank == 0:
-        return {
-            "uneven_weight": tensors["uneven_weight"][:3].contiguous(),
-            "col_weight": tensors["col_weight"][:, : COLS // 2].contiguous(),
-            "dup_weight": tensors["dup_weight"].contiguous(),
-        }
-    return {
-        "uneven_weight": tensors["uneven_weight"][3:].contiguous(),
-        "col_weight": tensors["col_weight"][:, COLS // 2 :].contiguous(),
-        "dup_weight": tensors["dup_weight"].contiguous(),
-    }
-
-
 def _build_receiver_metadata(rank: int) -> WeightData:
     """Build metadata-only WeightData for a receiver worker."""
     mid = ROWS // 2
@@ -137,6 +114,21 @@ def _build_receiver_metadata(rank: int) -> WeightData:
     return WeightData(meta_dict)
 
 
+def _build_local_tensors(rank: int, meta: WeightData, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    """Create tensor shards from either provided tensors or zeros"""
+    local_tensors = {}
+    for name, meta_entry in meta.items():
+        slices = [
+            slice(start, end)
+            for start, end, _ in meta_entry["shard"]
+        ]
+        if name in tensors:
+            local_tensors[name] = tensors[name][slices].contiguous()
+        else:
+            local_tensors[name] = torch.zeros(meta_entry["shard"], dtype=dtype_str_to_torch(meta_entry["dtype"]))
+    return local_tensors
+
+
 # ── Placement group ───────────────────────────────────────────────
 
 
@@ -146,7 +138,7 @@ class _InfoActor:
 
     def get_ip_and_gpu_id(self):
         gpu_ids = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-        return _get_host_ip(), gpu_ids.split(",")[0]
+        return get_local_ip(), gpu_ids.split(",")[0]
 
 
 def create_placement_group():
@@ -158,7 +150,7 @@ def create_placement_group():
     """
     total = NUM_SENDER_WORKERS + NUM_RECEIVER_WORKERS
     bundles = [{"GPU": 1, "CPU": 1} for _ in range(total)]
-    pg = placement_group(bundles, strategy="PACK")
+    pg = placement_group(bundles, strategy="PACK")  
     ray.get(pg.ready())
 
     probes = [
@@ -180,8 +172,8 @@ def create_placement_group():
             "  rank %d → bundle %d  (node %s, gpu %s)", rank, bundle_idx, ip, gpu
         )
 
-    trainer_bundles = [ordered[i] for i in range(NUM_SENDER_WORKERS)]
-    rollout_bundles = [ordered[i] for i in range(NUM_SENDER_WORKERS, total)]
+    trainer_bundles = ordered[:NUM_SENDER_WORKERS]
+    rollout_bundles = ordered[NUM_SENDER_WORKERS:]
     return pg, trainer_bundles, rollout_bundles
 
 
@@ -191,11 +183,20 @@ def create_placement_group():
 def _receiver_worker(ipc_name: str, rank: int):
     """Child process entry — creates a WeightReceiver and blocks."""
     metadata = _build_receiver_metadata(rank)
-    WeightReceiver(controller_ipc_name=ipc_name, rank=rank, metadata=metadata)
+    state_dict = _build_local_tensors(rank, metadata, {})
+    receiver = WeightReceiver(
+        controller_ipc_name=ipc_name,
+        rank=rank,
+        metadata=metadata,
+        state_dict=state_dict
+    )
     while True:
-        time.sleep(60)
+        if receiver.request_update()["success"]:
+            break
+        time.sleep(1)
 
 
+@ray.remote
 class RolloutEngine:
     """Ray actor that hosts the receiver-side HTTP server and spawns
     receiver worker child processes (analogous to SGLang schedulers)."""
@@ -213,15 +214,13 @@ class RolloutEngine:
             p.start()
         self.controller.set_worker_num(NUM_RECEIVER_WORKERS)
 
-        port = _find_free_port()
-        config = uvicorn.Config(app, host="0.0.0.0", port=port, log_level="warning")
+        self._host = get_local_ip()
+        self._port = 15000
+        config = uvicorn.Config(app, host=self._host, port=self._port, log_level="warning")
         server = uvicorn.Server(config)
         threading.Thread(target=server.run, daemon=True).start()
         while not server.started:
             time.sleep(0.1)
-
-        self._host = _get_host_ip()
-        self._port = port
 
     def get_server_info(self):
         return self._host, self._port
@@ -229,7 +228,7 @@ class RolloutEngine:
 
 # ── Trainer worker (Ray actor) ────────────────────────────────────
 
-
+@ray.remote
 class TrainerWorker:
     """Ray actor — one per sender GPU.  Initialises torch.distributed
     with the other TrainerWorkers, then sends its weight shard."""
@@ -238,15 +237,13 @@ class TrainerWorker:
                  master_addr: str = None, master_port: int = None):
         self.world_size = world_size
         self.rank = rank
-        if rank == 0:
-            self.master_addr = _get_host_ip()
-            self.master_port = _find_free_port()
-        else:
-            self.master_addr = master_addr
-            self.master_port = master_port
-
-    def get_master_addr_port(self):
-        return self.master_addr, self.master_port
+        self.master_addr = master_addr
+        self.master_port = master_port
+        dist.init_process_group(
+            backend="nccl",
+            rank=rank,
+            world_size=world_size,
+        )
 
     def send_weights(self, tensors: dict, receiver_url: str):
         dist.init_process_group(
@@ -257,10 +254,9 @@ class TrainerWorker:
         )
 
         meta = _build_sender_metadata(self.rank)
-        local_tensors = _sender_local_tensors(self.rank, tensors)
+        local_tensors = _build_local_tensors(self.rank, meta, tensors)
 
         sender = WeightSender("gpu_direct", receiver_urls=[receiver_url])
-        sender.sender.backend = "nccl"
         sender.connect(meta)
         sender.send(local_tensors)
 
@@ -272,16 +268,13 @@ class TrainerWorker:
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(name)s  %(message)s")
-    ray.init()
+    ray.init(address="auto")
 
     # 1. Reserve GPUs via placement group
     pg, trainer_bundles, rollout_bundles = create_placement_group()
 
     # 2. Start rollout engine on the rollout node
-    RolloutRayActor = ray.remote(RolloutEngine)
-    rollout_engine = RolloutRayActor.options(
-        num_cpus=0.2,
-        num_gpus=0.2,
+    rollout_engine = RolloutEngine.options(
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=pg,
             placement_group_bundle_index=rollout_bundles[0],
@@ -301,23 +294,18 @@ def main():
     }
     logger.info("Created 3 tensors (each [%d, %d] %s)", ROWS, COLS, DTYPE)
 
-    TrainerRayActor = ray.remote(num_gpus=1)(TrainerWorker)
-
     workers = []
-    master_addr, master_port = None, None
+    master_addr = get_local_ip()
+    master_port = 60010
     for rank in range(NUM_SENDER_WORKERS):
-        worker = TrainerRayActor.options(
-            num_cpus=0.5,
-            num_gpus=0.5,
+        worker = TrainerWorker.options(
+            num_cpus=1,
+            num_gpus=1,
             scheduling_strategy=PlacementGroupSchedulingStrategy(
                 placement_group=pg,
                 placement_group_bundle_index=trainer_bundles[rank],
             ),
         ).remote(NUM_SENDER_WORKERS, rank, master_addr, master_port)
-        if rank == 0:
-            master_addr, master_port = ray.get(
-                worker.get_master_addr_port.remote()
-            )
         workers.append(worker)
 
     # 4. All trainer workers send weights
