@@ -117,7 +117,7 @@ def _build_receiver_metadata(rank: int) -> WeightData:
 def _build_local_tensors(rank: int, meta: WeightData, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Create tensor shards from either provided tensors or zeros"""
     local_tensors = {}
-    for name, meta_entry in meta.items():
+    for name, meta_entry in meta:
         slices = [
             slice(start, end)
             for start, end, _ in meta_entry["shard"]

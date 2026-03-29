@@ -68,16 +68,20 @@ class WeightReceiver:
         self.socket = self.context.socket(zmq.REQ)
         self.socket.connect(self.scheduler_ipc_name)
 
+
     def stop(self):
-        """Stop the receiver process."""
-        if self.process and self.process.is_alive():
-            self.process.terminate()
-            self.process.join()
+        """Stop the receiver subprocess if ``self.process`` was set (optional hook)."""
+        proc = getattr(self, "process", None)
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join()
+
 
     def request_update(self) -> dict[str, Any]:
         """Scheduler REQ/REP: trigger weight receive when state is AWAITING_SCHEDULER_UPDATE."""
         self.socket.send_string(UPDATE_REQUEST)
         return json.loads(self.socket.recv_string())["success"]
+
 
     @staticmethod
     def _serialize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, Any]:
@@ -87,9 +91,11 @@ class WeightReceiver:
             "state_dict_torch_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
         }
 
+
     def _handle_metadata_request(self, controller_socket: zmq.Socket) -> None:
         response = json.dumps({"rank": self.rank, "metadata": self.metadata})
         controller_socket.send_string(response)
+
 
     def _handle_connect_request(
         self, controller_socket: zmq.Socket, data: dict[str, Any]
@@ -118,22 +124,20 @@ class WeightReceiver:
             group_name=data["group_name"],
         )
         
-        # Receive the overlap metadata from the sender
+        # Receive overlap metadata sizes from each sender
+        sender_world_size = data["sender_world_size"]
         self.overlaps: dict[int, WeightData] = {}
-        handles: list = []
-        for sender_rank in range(data["sender_world_size"]):
+        overlap_buffers: dict[int, torch.Tensor] = {}
+        for sender_rank in range(sender_world_size):
             size_t = torch.zeros(1, dtype=torch.long, device=self.device)
-            handles.append(dist.irecv(size_t, src=sender_rank, group=self.group))
-            data_t = torch.zeros(
-                size_t.item(), dtype=torch.uint8, device=self.device
-            )
-            handles.append(dist.irecv(data_t, src=sender_rank, group=self.group))
-            overlap_dict = json.loads(
-                data_t.cpu().numpy().tobytes().decode("utf-8")
-            )
-            self.overlaps[sender_rank] = WeightData(overlap_dict)
-        for h in handles:
-            h.wait()
+            dist.recv(size_t, src=sender_rank, group=self.group)
+            overlap_buffers[sender_rank] = torch.zeros(int(size_t.item()), dtype=torch.uint8, device=self.device)
+
+        # Receive overlap metadata bytes from each sender
+        for sender_rank, buffer in overlap_buffers.items():
+            dist.recv(buffer, src=sender_rank, group=self.group)
+            self.overlaps[sender_rank] = WeightData(buffer)
+
         logger.info(
             "Receiver worker %d joined group %s as rank %d "
             "(world_size=%d, overlaps from %d senders)",
@@ -141,6 +145,7 @@ class WeightReceiver:
             data["world_size"], len(self.overlaps),
         )
         self._state = ReceiverState.CONNECTED
+
 
     def _handle_receive_request(self, controller_socket: zmq.Socket) -> None:
         if self._state != ReceiverState.CONNECTED:
@@ -150,6 +155,7 @@ class WeightReceiver:
             return
         controller_socket.send_string(json.dumps({"status": "ack"}))
         self._state = ReceiverState.AWAITING_SCHEDULER_UPDATE
+
 
     def _handle_scheduler_update(
         self, scheduler_socket: zmq.Socket, msg: str
@@ -167,6 +173,7 @@ class WeightReceiver:
         self._receive_weights()
         self._state = ReceiverState.CONNECTED
         scheduler_socket.send_string(json.dumps({"success": True}))
+
 
     def _receiver_process_entry(
         self
@@ -206,8 +213,9 @@ class WeightReceiver:
                 msg = scheduler_socket.recv_string()
                 self._handle_scheduler_update(scheduler_socket, msg)
 
+
     def _receive_weights(self) -> None:
-        """irecv overlap bytes from each sender, unpack to tensors (same order as sender ``pack_for``)."""
+        """Receive overlap bytes from each sender, unpack into ``state_dict`` via :class:`WeightTensorBridge`."""
         chunks = {
             sender_rank: torch.zeros(overlap.total_nbytes(), dtype=torch.uint8, device=self.device)
             for sender_rank, overlap in self.overlaps.items()
@@ -230,10 +238,9 @@ class WeightReceiverController:
     When created, it creates an IPC name file for ROUTER/DEALER communication with receivers.
     """
 
-    def __init__(self, app: FastAPI, worker_num: int = 0):
+    def __init__(self, app: FastAPI):
         # Create IPC name like PortArgs.init_new
         self._ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        self._receiver_identities: dict = {}  # identity bytes -> rank
 
         self._context = zmq.Context()
         self._router_socket = self._context.socket(zmq.ROUTER)
@@ -251,11 +258,16 @@ class WeightReceiverController:
         )
         app.include_router(self.router)
         
+        # These are set by the scheduler after the receiver workers are launched.
+        self._worker_num = None
+        self._receiver_identities = None
+        
         
     @property
     def ipc_name(self) -> str:
         """The IPC name for receivers to connect (ROUTER binds here)."""
         return self._ipc_name
+
 
     def set_worker_num(self, worker_num: int) -> None:
         """Set the expected number of receiver workers. Called after schedulers are launched."""
@@ -263,7 +275,7 @@ class WeightReceiverController:
         self._receiver_identities = [b"worker-%d" % rank for rank in range(worker_num)]
 
 
-    def _gather_responses(self) -> bool:
+    def _gather_responses(self) -> List[dict]:
         responses = []
         for _ in range(self._worker_num):
             msg_bytes = self._router_socket.recv_multipart()[1]

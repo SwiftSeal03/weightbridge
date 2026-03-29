@@ -15,7 +15,7 @@ from torch.distributed.distributed_c10d import (
 
 
 def get_local_ip() -> str:
-    """Return the local IP address and a new port."""
+    """Return this host's local IPv4 address (UDP connect trick to ``8.8.8.8``)."""
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]

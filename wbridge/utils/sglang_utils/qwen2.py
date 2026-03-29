@@ -65,47 +65,6 @@ class Qwen2Config:
         )
 
 
-def _make_shard(
-    t: torch.Tensor,
-    part_dim: Optional[int],
-    tp_rank: int,
-    tp_size: int,
-) -> List[Tuple[int, int, int]]:
-    """Build shard metadata. part_dim=None means replicated (unsharded)."""
-    if part_dim is None:
-        return [(0, d, d) for d in t.shape]
-    shard = []
-    for i, d in enumerate(t.shape):
-        if i != part_dim:
-            shard.append((0, d, d))
-        else:
-            shard_size = d  # local shard size
-            total = d * tp_size
-            l = tp_rank * shard_size
-            r = (tp_rank + 1) * shard_size
-            shard.append((l, r, total))
-    return shard
-
-
-def _add_to_meta_dict(
-    meta_dict: Dict,
-    name: str,
-    t: torch.Tensor,
-    shard: List[Tuple[int, int, int]],
-    vocab_size: Optional[int] = None,
-) -> None:
-    """Add shard metadata for *name* to *meta_dict* (WeightData format)."""
-    if vocab_size is not None and ("embed_tokens" in name or "lm_head" in name):
-        l, r, w = shard[0]
-        if l >= vocab_size:
-            return
-        r = min(vocab_size, r)
-        w = min(vocab_size, w)
-        shard = [(l, r, w)] + shard[1:]
-
-    meta_dict[name] = {"shard": shard, "dtype": dtype_to_str(t.dtype)}
-
-
 def convert_split_qwen2_to_hf(config: Qwen2Config, name: str, param: torch.Tensor) -> List[Tuple[str, torch.Tensor]]:
     if name == "model.embed_tokens.weight":
         return [("model.embed_tokens.weight", param, 0)]
@@ -169,22 +128,46 @@ def convert_sglang_qwen2_to_wb(
     """
     out_meta_dict: Dict[str, Dict] = {}
 
-    for name, param in state_dict.items():
-        if not isinstance(param, torch.Tensor):
+    for sgl_name, sgl_param in state_dict.items():
+        if not isinstance(sgl_param, torch.Tensor):
             continue
 
         # Skip non-weight tensors
-        if "inv_freq" in name or "cos_cached" in name or "sin_cached" in name:
+        if "inv_freq" in sgl_name or "cos_cached" in sgl_name or "sin_cached" in sgl_name:
             continue
-        if "projector" in name or "vision_tower" in name:
+        if "projector" in sgl_name or "vision_tower" in sgl_name:
             continue
         
-        converted = convert_split_qwen2_to_hf(config, name, param)
-        for hf_name, hf_param, partition_dim in converted:
+        converted = convert_split_qwen2_to_hf(config, sgl_name, sgl_param)
+        for name, param, partition_dim in converted:
             tp_rank, tp_size = config.tp_rank, config.tp_size
-            if any(attn_proj in hf_name for attn_proj in ["q_proj", "k_proj", "v_proj", "o_proj"]):
+            if any(attn_proj in name for attn_proj in ["q_proj", "k_proj", "v_proj", "o_proj"]):
                 tp_rank, tp_size = config.attn_tp_rank, config.attn_tp_size
-            shard = _make_shard(hf_param.data, partition_dim, tp_rank, tp_size)
-            _add_to_meta_dict(out_meta_dict, hf_name, hf_param.data, shard, config.vocab_size)
+
+            # Create shard metadata
+            if partition_dim is None:
+                shard = [(0, d, d) for d in param.shape]
+            else:
+                shard = []
+                for i, d in enumerate(param.shape):
+                    if i != partition_dim:
+                        shard.append((0, d, d))
+                    else:
+                        shard_size = d  # local shard size
+                        total = d * tp_size
+                        l = tp_rank * shard_size
+                        r = (tp_rank + 1) * shard_size
+                        shard.append((l, r, total))
+            
+            # Handle vocab size truncation
+            if config.vocab_size is not None and ("embed_tokens" in name or "lm_head" in name):
+                l, r, w = shard[0]
+                if l >= config.vocab_size:
+                    continue
+                r = min(config.vocab_size, r)
+                w = min(config.vocab_size, w)
+                shard = [(l, r, w)] + shard[1:]
+
+            out_meta_dict[name] = {"shard": shard, "dtype": dtype_to_str(param.dtype)}
 
     return WeightData(out_meta_dict)

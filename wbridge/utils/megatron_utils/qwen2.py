@@ -113,19 +113,3 @@ def convert_qwen2_to_wb_and_tensors(
             tensors[hf_name] = t
 
     return WeightData(meta_dict), tensors
-
-
-def convert_qwen2_to_wb(
-    args, named_tensors: list[tuple[str, torch.nn.Parameter]]
-) -> WeightData:
-    """Metadata-only :class:`~wbridge.utils.data.WeightData` for ``connect``."""
-    meta, _ = convert_qwen2_to_wb_and_tensors(args, named_tensors)
-    return meta
-
-
-def convert_qwen2_to_tensors(
-    args, named_tensors: list[tuple[str, torch.nn.Parameter]]
-) -> dict[str, torch.Tensor]:
-    """Local tensor dict for :meth:`~wbridge.frontend.sender.WeightSender.send`."""
-    _, tensors = convert_qwen2_to_wb_and_tensors(args, named_tensors)
-    return tensors

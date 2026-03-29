@@ -136,26 +136,24 @@ class DirectSender:
             group_name=group_name,
         )
 
-        # Compute overlap with each receiver and send it via the process group.
-        # Receivers iterate over sender ranks in the same order, so the
-        # point-to-point send/recv pairs are matched without deadlock.
+        # Compute overlap with each receiver and send the sizes of the overlap metadata to the receiver
         handles: list = []
-        for receiver_rank, receiver_meta_dict in all_receiver_workers:
-            receiver_wd = WeightData(receiver_meta_dict)
-            overlap = WeightData.compute_overlap(sender_metadata, receiver_wd)
+        for r_rank, r_meta_dict in all_receiver_workers:
+            receiver_metadata = WeightData(r_meta_dict)
+            overlap = WeightData.compute_overlap(sender_metadata, receiver_metadata)
             if not overlap:
                 continue
-            self.overlaps[receiver_rank] = overlap
-
-            overlap_bytes = json.dumps(overlap.meta_dict, default=str).encode("utf-8")
-            size_t = torch.tensor(
-                [len(overlap_bytes)], dtype=torch.long, device=self.device
-            )
-            data_t = torch.frombuffer(
-                bytearray(overlap_bytes), dtype=torch.uint8
-            ).to(self.device)
-            handles.append(dist.isend(size_t, dst=receiver_rank, group=self.group))
-            handles.append(dist.isend(data_t, dst=receiver_rank, group=self.group))
+            self.overlaps[r_rank] = overlap
+            byte_size = torch.tensor([len(bytes(overlap))], dtype=torch.long, device=self.device)
+            handles.append(dist.isend(byte_size, dst=r_rank, group=self.group))
+        for h in handles:
+            h.wait()
+            
+        # Send the overlap metadata bytes to the receivers
+        handles: list = []
+        for r_rank, overlap in self.overlaps.items():
+            overlap_bytes = torch.frombuffer(bytes(overlap), dtype=torch.uint8, device=self.device)
+            handles.append(dist.isend(overlap_bytes, dst=r_rank, group=self.group))
         for h in handles:
             h.wait()
 
