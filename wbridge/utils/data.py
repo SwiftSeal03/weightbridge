@@ -22,6 +22,15 @@ def dtype_to_str(dtype: torch.dtype) -> str:
     return str(dtype).split(".")[-1]
 
 
+def _normalize_dtype(dtype: torch.dtype | str) -> torch.dtype:
+    """Normalize ``dtype`` to :class:`torch.dtype` (accepts short strings, ``\"torch.*\"``, or dtype)."""
+    if isinstance(dtype, torch.dtype):
+        return dtype
+    if isinstance(dtype, str):
+        return dtype_str_to_torch(dtype)
+    raise TypeError(f"dtype must be torch.dtype or str, got {type(dtype)}")
+
+
 def _normalize_shards(
     shard: Shard | Shards,
 ) -> Shards:
@@ -41,11 +50,11 @@ def _shard_to_numel(shard: Shard) -> int:
     return math.prod(r - l for l, r, _ in shard)
 
 
-def _original_total_numel(shards: Shards) -> int:
-    return sum(_shard_to_numel(s) for s in shards[0])
+def original_total_numel(shards: Shards) -> int:
+    return _shard_to_numel(shards[0])
 
 
-def _shards_iterator(shards: Shards, offset: int = 0, item_size: int = 1) -> Iterator[tuple[int, int, Shard]]:
+def shards_iterator(shards: Shards, offset: int = 0, item_size: int = 1) -> Iterator[tuple[int, int, Shard]]:
     for shard in shards:
         length = _shard_to_numel(shard) * item_size
         yield offset, offset + length, shard
@@ -60,7 +69,7 @@ class WeightData:
         {
             "name": {
                 "shard": [[(l, r, w), ...], ...],  # always multi-shard form after init
-                "dtype": str,  # e.g. ``\"float32\"``
+                "dtype": torch.dtype,  # stored as ``torch.dtype`` (str accepted at construction)
             },
             ...
         }
@@ -68,6 +77,7 @@ class WeightData:
     At construction, each ``shard`` value is normalized to the multi-shard
     form ``[[dim, ...], ...]`` (see :func:`_normalize_shards`). Callers may
     pass either single-shard ``[(l, r, w), ...]`` or multi-shard input.
+    ``dtype`` may be :class:`torch.dtype` or a string (for JSON / legacy).
 
     Tensor values are passed separately as ``dict[str, torch.Tensor]`` to
     :meth:`__call__` (returns a :class:`WeightTensorBridge`) or
@@ -79,20 +89,20 @@ class WeightData:
         self.meta_dict = {
             name: {
                 "shard": _normalize_shards(value["shard"]),
-                "dtype": dtype_to_str(value["dtype"]),
+                "dtype": _normalize_dtype(value["dtype"]),
             } for name, value in meta_dict.items()
         }
-        
+
         # Sanity check
         for name, shards, dtype in self:
-            assert dtype_str_to_torch(dtype) is not None, f"Invalid dtype: {dtype}"
-            numel = _original_total_numel(shards)
+            assert isinstance(dtype, torch.dtype), f"Invalid dtype: {dtype}"
+            numel = original_total_numel(shards)
             assert len(shards) > 0, f"Empty shard list for {name}"
             for shard in shards:
                 assert len(shard) > 0, f"Empty shard in list for {name}"
                 for l, r, w in shard:
                     assert 0 <= l < r <= w, f"Invalid shard: {l, r, w} for {name}"
-                assert _original_total_numel([shard]) == numel, \
+                assert original_total_numel([shard]) == numel, \
                     f"Shard {shard} does not match original total numel: {numel}"
 
     def __call__(self, tensors: dict[str, torch.Tensor]) -> WeightTensorBridge:
@@ -103,16 +113,24 @@ class WeightData:
         """
         return WeightTensorBridge(self, tensors)
     
-    def __bytes__(self) -> bytes:
-        return json.dumps(self.meta_dict, default=str).encode("utf-8")
+    def to_jsonable(self) -> dict[str, dict]:
+        return {
+            name: {
+                "shard": shards,
+                "dtype": dtype_to_str(dtype)
+            } for name, shards, dtype in self
+        }
 
     def __str__(self) -> str:
-        return json.dumps(self.meta_dict, default=str, indent=4)
+        return json.dumps(self.to_jsonable(), default=str)
+    
+    def __bytes__(self) -> bytes:
+        return str(self).encode("utf-8")
     
     def __bool__(self) -> bool:
         return bool(self.meta_dict)
     
-    def __iter__(self) -> Iterator[tuple[str, Shards, str]]:
+    def __iter__(self) -> Iterator[tuple[str, Shards, torch.dtype]]:
         for name, entry in self.meta_dict.items():
             yield name, entry["shard"], entry["dtype"]
     
@@ -126,12 +144,15 @@ class WeightData:
         return self.meta_dict[key]
     
     def __setitem__(self, key: str, value: dict[str, ...]) -> None:
-        self.meta_dict[key] = value
+        v = dict(value)
+        v["dtype"] = _normalize_dtype(v["dtype"])
+        v["shard"] = _normalize_shards(v["shard"])
+        self.meta_dict[key] = v
     
-    def iter_with_intv(self) -> Iterator[tuple[int, int, str, Shards, str]]:
+    def iter_with_intv(self) -> Iterator[tuple[int, int, str, Shards, torch.dtype]]:
         offset = 0
         for name, shards, dtype in self:
-            length = _original_total_numel(shards) * dtype_str_to_torch(dtype).itemsize
+            length = original_total_numel(shards) * dtype.itemsize
             yield offset, offset + length, name, shards, dtype
             offset += length
 
@@ -139,7 +160,7 @@ class WeightData:
         """Total byte size of the data described by all shard entries."""
         total = 0
         for _, shards, dtype in self:
-            total += _original_total_numel(shards) * dtype_str_to_torch(dtype).itemsize
+            total += original_total_numel(shards) * dtype.itemsize
         return total
         
     @staticmethod
@@ -203,12 +224,12 @@ class WeightTensorBridge:
         for name, shards, dtype in self._metadata:
             assert name in self._tensors, f"Missing tensor {name} for overlap entry"
             tensor = self._tensors[name]
-            assert tensor.dtype == dtype_str_to_torch(dtype), (
+            assert tensor.dtype == dtype, (
                 f"Tensor dtype mismatch for {name}: {tensor.dtype} vs {dtype}"
             )
             assert tensor.is_contiguous(), f"Tensor {name} is not contiguous"
-            assert _original_total_numel(shards) == tensor.numel(), \
-                f"Tensor {name} does not match original total numel: {_original_total_numel(shards)} vs {tensor.numel()}"
+            assert original_total_numel(shards) == tensor.numel(), \
+                f"Tensor {name} does not match original total numel: {original_total_numel(shards)} vs {tensor.numel()}"
             self._tensors[name] = tensor.flatten().view(torch.uint8)
 
         # Remove tensors that are not in the metadata
@@ -232,20 +253,19 @@ class WeightTensorBridge:
             l_offsets[name] = l_byte_start
             
         
-        for s_offset, _, name, s_shards, s_dtype in small._metadata.iter_with_intv():
+        for s_offset, _, name, s_shards, dtype in small._metadata.iter_with_intv():
             s_tensor = small._tensors[name]
-            dtype = dtype_str_to_torch(s_dtype)
-            
+
             assert name in large._metadata, f"Missing tensor {name} for large entry"
             l_offset = l_offsets[name]
             l_shards = large._metadata[name]["shard"]
             l_tensor = large._tensors[name]
             assert l_tensor.dtype == dtype, f"Tensor dtype mismatch for {name}: {l_tensor.dtype} vs {dtype}"
             
-            for s_byte_start, s_byte_end, s_shard in _shards_iterator(
+            for s_byte_start, s_byte_end, s_shard in shards_iterator(
                 s_shards, offset=s_offset, item_size=dtype.itemsize
             ):
-                for l_byte_start, l_byte_end, l_shard in _shards_iterator(
+                for l_byte_start, l_byte_end, l_shard in shards_iterator(
                     l_shards, offset=l_offset, item_size=dtype.itemsize
                 ):
                     alignment = _check_shard_compatibility(l_shard, s_shard)

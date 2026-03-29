@@ -51,13 +51,12 @@ class WeightReceiver:
         controller_ipc_name: str,
         rank: int,
         metadata: WeightData,
-        state_dict: dict[str, torch.Tensor],
     ):
         self.controller_ipc_name = controller_ipc_name
         self.scheduler_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
         self.rank = rank
-        self.metadata = dict(metadata.meta_dict)
-        self.state_dict = state_dict
+        self.metadata = metadata
+        self.state_dict = None
         self._state = ReceiverState.DISCONNECTED
         self.receiver_thread = threading.Thread(
             target=self._receiver_process_entry
@@ -77,8 +76,9 @@ class WeightReceiver:
             proc.join()
 
 
-    def request_update(self) -> dict[str, Any]:
+    def request_update(self, state_dict: dict[str, torch.Tensor]) -> dict[str, Any]:
         """Scheduler REQ/REP: trigger weight receive when state is AWAITING_SCHEDULER_UPDATE."""
+        self.state_dict = state_dict # Receive to this state_dict
         self.socket.send_string(UPDATE_REQUEST)
         return json.loads(self.socket.recv_string())["success"]
 
@@ -93,7 +93,7 @@ class WeightReceiver:
 
 
     def _handle_metadata_request(self, controller_socket: zmq.Socket) -> None:
-        response = json.dumps({"rank": self.rank, "metadata": self.metadata})
+        response = json.dumps({"rank": self.rank, "metadata": self.metadata.to_jsonable()})
         controller_socket.send_string(response)
 
 
@@ -136,7 +136,7 @@ class WeightReceiver:
         # Receive overlap metadata bytes from each sender
         for sender_rank, buffer in overlap_buffers.items():
             dist.recv(buffer, src=sender_rank, group=self.group)
-            self.overlaps[sender_rank] = WeightData(buffer)
+            self.overlaps[sender_rank] = WeightData(buffer.cpu().numpy().tobytes())
 
         logger.info(
             "Receiver worker %d joined group %s as rank %d "
@@ -248,7 +248,7 @@ class WeightReceiverController:
 
         self.router = APIRouter()
         self.router.add_api_route(
-            path="/wbridge/metadata", endpoint=self.metadata, methods=["GET"]
+            path="/wbridge/metadata", endpoint=self.get_metadata, methods=["GET"]
         )
         self.router.add_api_route(
             path="/wbridge/connect", endpoint=self.connect, methods=["POST"]
@@ -283,7 +283,7 @@ class WeightReceiverController:
         return responses
         
         
-    async def metadata(self):
+    async def get_metadata(self):
         """Query all connected receivers via ROUTER/DEALER (``{"type": "metadata_request"}``).
         Collects until worker_num responses received or timeout.
         Each item includes ``rank`` and ``metadata`` (per worker JSON from the receiver).

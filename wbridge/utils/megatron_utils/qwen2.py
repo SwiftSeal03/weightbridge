@@ -8,7 +8,7 @@ import re
 import torch
 
 from megatron.core import mpu
-from wbridge.utils.data import WeightData, dtype_to_str
+from wbridge.utils.data import WeightData
 
 def convert_split_qwen2_to_hf(args, name, param):
     if name == "module.module.embedding.word_embeddings.weight":
@@ -109,7 +109,7 @@ def convert_qwen2_to_wb_and_tensors(
                 shard[0] = (l, r, w)
                 t = t[:r - l]
 
-            meta_dict[hf_name] = {"shard": shard, "dtype": dtype_to_str(hf_param.dtype)}
+            meta_dict[hf_name] = {"shard": shard, "dtype": hf_param.dtype}
             tensors[hf_name] = t
 
     return WeightData(meta_dict), tensors

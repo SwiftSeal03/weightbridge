@@ -24,7 +24,7 @@ class DirectSender:
         self.connected = False
         self.group: dist.ProcessGroup | None = None
         self.overlaps: dict[int, WeightData] = {}
-        self._sender_metadata: WeightData | None = None
+        self.metadata: WeightData | None = None
         self.backend = None
         self.device = None
 
@@ -73,13 +73,13 @@ class DirectSender:
 
     def connect(self, sender_metadata: WeightData) -> None:
         sender_metadata = self._dedup_sender_metadata(sender_metadata)
-        self._sender_metadata = sender_metadata
+        self.metadata = sender_metadata
 
         group_name = "wbridge"
 
         if self.rank == 0:            
             # Query receiver metadata and build per-worker list
-            all_receiver_workers: list[tuple[int, dict]] = []
+            receiver_metas: list[tuple[int, dict]] = []
             receiver_worker_counts: list[int] = []
             base_rank = self.world_size
             for url in self.receiver_urls:
@@ -87,8 +87,8 @@ class DirectSender:
                 resp.raise_for_status()
                 workers = sorted(resp.json(), key=lambda w: w["rank"])
                 receiver_worker_counts.append(len(workers))
-                all_receiver_workers.extend([(
-                    base_rank + worker["rank"], worker["metadata"]
+                receiver_metas.extend([(
+                    base_rank + worker["rank"], WeightData(worker["metadata"])
                 ) for worker in workers])
                 base_rank += len(workers)
 
@@ -118,13 +118,13 @@ class DirectSender:
                 master_port,
                 total_world_size,
                 group_name,
-                all_receiver_workers,
+                receiver_metas,
             ]
         else:
             connect_info = [None, None, None, None, None]
 
         dist.broadcast_object_list(connect_info, src=0)
-        master_address, master_port, total_world_size, group_name, all_receiver_workers = (
+        master_address, master_port, total_world_size, group_name, receiver_metas = (
             connect_info
         )
 
@@ -138,9 +138,8 @@ class DirectSender:
 
         # Compute overlap with each receiver and send the sizes of the overlap metadata to the receiver
         handles: list = []
-        for r_rank, r_meta_dict in all_receiver_workers:
-            receiver_metadata = WeightData(r_meta_dict)
-            overlap = WeightData.compute_overlap(sender_metadata, receiver_metadata)
+        for r_rank, r_meta in receiver_metas:
+            overlap = WeightData.compute_overlap(sender_metadata, r_meta)
             if not overlap:
                 continue
             self.overlaps[r_rank] = overlap
@@ -163,7 +162,7 @@ class DirectSender:
             group_name,
             self.backend,
             total_world_size,
-            len(all_receiver_workers),
+            len(receiver_metas),
         )
         self.connected = True
 
@@ -182,14 +181,14 @@ class GPUDirectSender(DirectSender):
         self.backend = "nccl"
 
     def send(self, state_dict: dict[str, torch.Tensor]) -> None:
-        if not self.connected or self._sender_metadata is None:
+        if not self.connected or self.metadata is None:
             raise RuntimeError("GPUDirectSender.send requires connect() first")
         if self.rank == 0:
             for url in self.receiver_urls:
                 resp = requests.post(f"{url}/wbridge/receive")
                 resp.raise_for_status()
 
-        chunks = self._sender_metadata(state_dict)[self.overlaps]
+        chunks = self.metadata(state_dict)[self.overlaps]
         handles = [
             dist.isend(chunk, dst=receiver_rank, group=self.group)
             for receiver_rank, chunk in chunks.items()

@@ -51,13 +51,13 @@ from ray.util.placement_group import placement_group
 from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from wbridge.utils.distributed import get_local_ip
-from wbridge import WeightData, WeightReceiver, WeightReceiverController, WeightSender, dtype_str_to_torch
+from wbridge import WeightData, WeightReceiver, WeightReceiverController, WeightSender
+from wbridge.utils.data import shards_iterator, original_total_numel
 
 logger = logging.getLogger("example")
 
 NUM_SENDER_WORKERS = 2
 NUM_RECEIVER_WORKERS = 2
-DTYPE_STR = "float32"
 DTYPE = torch.float32
 ROWS, COLS = 4, 8
 
@@ -71,30 +71,30 @@ def _build_sender_metadata(rank: int) -> WeightData:
         meta_dict = {
             "uneven_weight": {
                 "shard": [(0, 1, ROWS), (0, COLS, COLS)],
-                "dtype": DTYPE_STR,
+                "dtype": DTYPE,
             },
             "col_weight": {
                 "shard": [(0, ROWS, ROWS), (0, COLS // 2, COLS)],
-                "dtype": DTYPE_STR,
+                "dtype": DTYPE,
             },
             "dup_weight": {
                 "shard": [(0, ROWS, ROWS), (0, COLS, COLS)],
-                "dtype": DTYPE_STR,
+                "dtype": DTYPE,
             },
         }
     else:
         meta_dict = {
             "uneven_weight": {
                 "shard": [(1, ROWS, ROWS), (0, COLS, COLS)],
-                "dtype": DTYPE_STR,
+                "dtype": DTYPE,
             },
             "col_weight": {
                 "shard": [(0, ROWS, ROWS), (COLS // 2, COLS, COLS)],
-                "dtype": DTYPE_STR,
+                "dtype": DTYPE,
             },
             "dup_weight": {
                 "shard": [(0, ROWS, ROWS), (0, COLS, COLS)],
-                "dtype": DTYPE_STR,
+                "dtype": DTYPE,
             },
         }
     return WeightData(meta_dict)
@@ -108,7 +108,7 @@ def _build_receiver_metadata(rank: int) -> WeightData:
     else:
         shard = [(mid, ROWS, ROWS), (0, COLS, COLS)]
     meta_dict = {
-        name: {"shard": shard, "dtype": DTYPE_STR}
+        name: {"shard": shard, "dtype": DTYPE}
         for name in ("uneven_weight", "col_weight", "dup_weight")
     }
     return WeightData(meta_dict)
@@ -117,15 +117,14 @@ def _build_receiver_metadata(rank: int) -> WeightData:
 def _build_local_tensors(rank: int, meta: WeightData, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Create tensor shards from either provided tensors or zeros"""
     local_tensors = {}
-    for name, meta_entry in meta:
-        slices = [
-            slice(start, end)
-            for start, end, _ in meta_entry["shard"]
-        ]
+    for name, shards, dtype in meta:
+        slices = []
         if name in tensors:
+            for start, end, _ in shards_iterator(shards, item_size=dtype.itemsize):
+                slices.append(slice(start, end))
             local_tensors[name] = tensors[name][slices].contiguous()
         else:
-            local_tensors[name] = torch.zeros(meta_entry["shard"], dtype=dtype_str_to_torch(meta_entry["dtype"]))
+            local_tensors[name] = torch.zeros(original_total_numel(shards), dtype=dtype)
     return local_tensors
 
 
@@ -187,11 +186,10 @@ def _receiver_worker(ipc_name: str, rank: int):
     receiver = WeightReceiver(
         controller_ipc_name=ipc_name,
         rank=rank,
-        metadata=metadata,
-        state_dict=state_dict
+        metadata=metadata
     )
     while True:
-        if receiver.request_update()["success"]:
+        if receiver.request_update(state_dict)["success"]:
             break
         time.sleep(1)
 
@@ -241,18 +239,12 @@ class TrainerWorker:
         self.master_port = master_port
         dist.init_process_group(
             backend="nccl",
+            init_method=f"tcp://{master_addr}:{master_port}",
             rank=rank,
             world_size=world_size,
         )
 
     def send_weights(self, tensors: dict, receiver_url: str):
-        dist.init_process_group(
-            backend="nccl",
-            init_method=f"tcp://{self.master_addr}:{self.master_port}",
-            rank=self.rank,
-            world_size=self.world_size,
-        )
-
         meta = _build_sender_metadata(self.rank)
         local_tensors = _build_local_tensors(self.rank, meta, tensors)
 

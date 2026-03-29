@@ -9,7 +9,7 @@ from wbridge.utils.data import WeightData, _check_shard_compatibility
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_meta(shard, dtype: str = "float32"):
+def _make_meta(shard, dtype=torch.float32):
     """Single-entry metadata-only WeightData."""
     return WeightData({
         "weight": {"shard": shard, "dtype": dtype},

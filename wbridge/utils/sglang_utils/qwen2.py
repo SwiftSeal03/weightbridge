@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from wbridge.utils.data import WeightData, dtype_to_str
+from wbridge.utils.data import WeightData
 
 import logging
 logger = logging.getLogger(__name__)
@@ -168,6 +168,6 @@ def convert_sglang_qwen2_to_wb(
                 w = min(config.vocab_size, w)
                 shard = [(l, r, w)] + shard[1:]
 
-            out_meta_dict[name] = {"shard": shard, "dtype": dtype_to_str(param.dtype)}
+            out_meta_dict[name] = {"shard": shard, "dtype": param.dtype}
 
     return WeightData(out_meta_dict)
