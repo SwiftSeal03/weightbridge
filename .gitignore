@@ -29,3 +29,6 @@ htmlcov/
 
 # mypy
 .mypy_cache/
+
+# logs
+logs/

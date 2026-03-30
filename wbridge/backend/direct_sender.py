@@ -127,7 +127,8 @@ class DirectSender:
         master_address, master_port, total_world_size, group_name, receiver_metas = (
             connect_info
         )
-
+        
+        logger.info("Sender %d initializing process group with master %s:%d", self.rank, master_address, master_port)
         self.group = init_custom_process_group(
             backend=self.backend,
             init_method=f"tcp://{master_address}:{master_port}",
@@ -135,7 +136,7 @@ class DirectSender:
             rank=self.rank,
             group_name=group_name,
         )
-
+        logger.info("Sender %d initialized process group", self.rank)
         # Compute overlap with each receiver and send the sizes of the overlap metadata to the receiver
         handles: list = []
         for r_rank, r_meta in receiver_metas:
@@ -151,7 +152,7 @@ class DirectSender:
         # Send the overlap metadata bytes to the receivers
         handles: list = []
         for r_rank, overlap in self.overlaps.items():
-            overlap_bytes = torch.frombuffer(bytes(overlap), dtype=torch.uint8, device=self.device)
+            overlap_bytes = torch.frombuffer(bytes(overlap), dtype=torch.uint8).to(self.device)
             handles.append(dist.isend(overlap_bytes, dst=r_rank, group=self.group))
         for h in handles:
             h.wait()

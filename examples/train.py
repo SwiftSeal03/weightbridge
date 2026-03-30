@@ -61,6 +61,9 @@ NUM_RECEIVER_WORKERS = 2
 DTYPE = torch.float32
 ROWS, COLS = 4, 8
 
+ROLLOUT_SERVER_PORT = 15000
+SENDER_PG_PORT = 60010
+
 
 # ── Helpers ────────────────────────────────────────────────────────
 
@@ -122,7 +125,7 @@ def _build_local_tensors(rank: int, meta: WeightData, tensors: dict[str, torch.T
         if name in tensors:
             for start, end, _ in shards_iterator(shards, item_size=dtype.itemsize):
                 slices.append(slice(start, end))
-            local_tensors[name] = tensors[name][slices].contiguous()
+            local_tensors[name] = tensors[name][tuple(slices)].contiguous()
         else:
             local_tensors[name] = torch.zeros(original_total_numel(shards), dtype=dtype)
     return local_tensors
@@ -141,15 +144,17 @@ class _InfoActor:
 
 
 def create_placement_group():
-    """Reserve GPUs and return (pg, trainer_bundle_indices, rollout_bundle_indices).
+    """Reserve GPUs and return (pg, trainer_bundle_indices, rollout_bundle_idx).
 
-    Bundles are sorted by (node_ip, gpu_id) so that consecutive logical
-    ranks map to consecutive GPUs on the same node — the first
-    NUM_SENDER_WORKERS go to the trainer, the rest to the rollout engine.
+    Trainer gets NUM_SENDER_WORKERS individual 1-GPU bundles (sorted by
+    node_ip, gpu_id so consecutive ranks map to consecutive GPUs).
+    Rollout gets a single bundle with NUM_RECEIVER_WORKERS GPUs so the
+    RolloutEngine actor and its child processes can all access GPUs.
     """
-    total = NUM_SENDER_WORKERS + NUM_RECEIVER_WORKERS
-    bundles = [{"GPU": 1, "CPU": 1} for _ in range(total)]
-    pg = placement_group(bundles, strategy="PACK")  
+    bundles = [{"GPU": 1, "CPU": 1} for _ in range(NUM_SENDER_WORKERS)]
+    rollout_bundle_idx = len(bundles)
+    bundles.append({"GPU": NUM_RECEIVER_WORKERS, "CPU": 1})
+    pg = placement_group(bundles, strategy="PACK")
     ray.get(pg.ready())
 
     probes = [
@@ -158,22 +163,21 @@ def create_placement_group():
                 placement_group=pg, placement_group_bundle_index=i,
             ),
         ).remote()
-        for i in range(total)
+        for i in range(NUM_SENDER_WORKERS)
     ]
     infos = ray.get([p.get_ip_and_gpu_id.remote() for p in probes])
     for p in probes:
         ray.kill(p)
 
-    ordered = sorted(range(total), key=lambda i: (infos[i][0], infos[i][1]))
+    ordered = sorted(range(NUM_SENDER_WORKERS), key=lambda i: (infos[i][0], infos[i][1]))
     for rank, bundle_idx in enumerate(ordered):
         ip, gpu = infos[bundle_idx]
         logger.info(
             "  rank %d → bundle %d  (node %s, gpu %s)", rank, bundle_idx, ip, gpu
         )
 
-    trainer_bundles = ordered[:NUM_SENDER_WORKERS]
-    rollout_bundles = ordered[NUM_SENDER_WORKERS:]
-    return pg, trainer_bundles, rollout_bundles
+    trainer_bundles = ordered
+    return pg, trainer_bundles, rollout_bundle_idx, infos
 
 
 # ── Rollout engine (Ray actor) ────────────────────────────────────
@@ -188,11 +192,13 @@ def _receiver_worker(ipc_name: str, rank: int):
         rank=rank,
         metadata=metadata
     )
-    while True:
-        if receiver.request_update(state_dict)["success"]:
+    for _ in range(10):
+        if receiver.request_update(state_dict):
+            logger.info("Receiver worker %d received weights", rank)
             break
+        logger.info("Receiver worker %d waiting for weights", rank)
         time.sleep(1)
-
+    receiver.stop()
 
 @ray.remote
 class RolloutEngine:
@@ -213,7 +219,7 @@ class RolloutEngine:
         self.controller.set_worker_num(NUM_RECEIVER_WORKERS)
 
         self._host = get_local_ip()
-        self._port = 15000
+        self._port = ROLLOUT_SERVER_PORT
         config = uvicorn.Config(app, host=self._host, port=self._port, log_level="warning")
         server = uvicorn.Server(config)
         threading.Thread(target=server.run, daemon=True).start()
@@ -237,12 +243,14 @@ class TrainerWorker:
         self.rank = rank
         self.master_addr = master_addr
         self.master_port = master_port
+        logger.info("Trainer worker %d initializing with master %s:%d", rank, master_addr, master_port)
         dist.init_process_group(
             backend="nccl",
             init_method=f"tcp://{master_addr}:{master_port}",
             rank=rank,
             world_size=world_size,
         )
+        logger.info("Trainer worker %d initialized", rank)
 
     def send_weights(self, tensors: dict, receiver_url: str):
         meta = _build_sender_metadata(self.rank)
@@ -250,8 +258,9 @@ class TrainerWorker:
 
         sender = WeightSender("gpu_direct", receiver_urls=[receiver_url])
         sender.connect(meta)
+        logger.info("Trainer worker %d connected to receiver", self.rank)
         sender.send(local_tensors)
-
+        logger.info("Trainer worker %d sent weights", self.rank)
         dist.destroy_process_group()
 
 
@@ -260,16 +269,18 @@ class TrainerWorker:
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(name)s  %(message)s")
-    ray.init(address="auto")
+    ray.init()
 
     # 1. Reserve GPUs via placement group
-    pg, trainer_bundles, rollout_bundles = create_placement_group()
+    pg, trainer_bundles, rollout_bundle_idx, infos = create_placement_group()
 
     # 2. Start rollout engine on the rollout node
     rollout_engine = RolloutEngine.options(
+        num_cpus=1,
+        num_gpus=NUM_RECEIVER_WORKERS,
         scheduling_strategy=PlacementGroupSchedulingStrategy(
             placement_group=pg,
-            placement_group_bundle_index=rollout_bundles[0],
+            placement_group_bundle_index=rollout_bundle_idx,
             placement_group_capture_child_tasks=True,
         ),
     ).remote()
@@ -287,9 +298,10 @@ def main():
     logger.info("Created 3 tensors (each [%d, %d] %s)", ROWS, COLS, DTYPE)
 
     workers = []
-    master_addr = get_local_ip()
-    master_port = 60010
     for rank in range(NUM_SENDER_WORKERS):
+        info = infos[trainer_bundles[rank]]
+        master_addr = info[0]
+        master_port = SENDER_PG_PORT
         worker = TrainerWorker.options(
             num_cpus=1,
             num_gpus=1,
