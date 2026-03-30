@@ -57,9 +57,12 @@ def original_total_numel(shards: Shards) -> int:
     return math.prod(w for _, _, w in shards[0])
 
 
-def shards_iterator(shards: Shards, offset: int = 0, item_size: int = 1) -> Iterator[tuple[int, int, Shard]]:
+def shards_iterator(meta_entry: dict[str, ...]) -> Iterator[tuple[int, int, Shard]]:
+    shards = meta_entry["shard"]
+    dtype = meta_entry["dtype"]
+    offset = 0
     for shard in shards:
-        length = _shard_to_numel(shard) * item_size
+        length = _shard_to_numel(shard) * dtype.itemsize
         yield offset, offset + length, shard
         offset += length
 
@@ -247,28 +250,17 @@ class WeightTensorBridge:
         Copy data from one flattened buffer to another.
         The direction of the copy is determined by the `l2s` parameter.
         "small" should represent a subset of the data in "large".
-        """
-        l_offsets = {}
-        for l_byte_start, l_byte_end, name, _, _ in large._metadata.iter_with_intv():
-            l_offsets[name] = l_byte_start
-            
-        
-        for s_offset, _, name, s_shards, dtype in small._metadata.iter_with_intv():
+        """        
+        for name, s_shards, dtype in small._metadata:
             s_tensor = small._tensors[name]
 
             assert name in large._metadata, f"Missing tensor {name} for large entry"
-            l_offset = l_offsets[name]
-            l_shards = large._metadata[name]["shard"]
             l_dtype = large._metadata[name]["dtype"]
             l_tensor = large._tensors[name]
             assert l_dtype == dtype, f"Tensor dtype mismatch for {name}: {l_dtype} vs {dtype}"
             
-            for s_byte_start, s_byte_end, s_shard in shards_iterator(
-                s_shards, offset=s_offset, item_size=dtype.itemsize
-            ):
-                for l_byte_start, l_byte_end, l_shard in shards_iterator(
-                    l_shards, offset=l_offset, item_size=dtype.itemsize
-                ):
+            for s_byte_start, s_byte_end, s_shard in shards_iterator(small._metadata[name]):
+                for l_byte_start, l_byte_end, l_shard in shards_iterator(large._metadata[name]):
                     alignment = _check_shard_compatibility(l_shard, s_shard)
                     if alignment is None:
                         continue
