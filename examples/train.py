@@ -52,7 +52,7 @@ from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
 
 from wbridge.utils.distributed import get_local_ip
 from wbridge import WeightData, WeightReceiver, WeightReceiverController, WeightSender
-from wbridge.utils.data import shards_iterator, original_total_numel
+from wbridge.utils.data import shards_iterator, shards_to_numel
 
 logger = logging.getLogger("example")
 
@@ -127,7 +127,7 @@ def _build_local_tensors(rank: int, meta: WeightData, tensors: dict[str, torch.T
                 slices.append(slice(start, end))
             local_tensors[name] = tensors[name][tuple(slices)].contiguous()
         else:
-            local_tensors[name] = torch.zeros(original_total_numel(shards), dtype=dtype)
+            local_tensors[name] = torch.zeros(shards_to_numel(shards), dtype=dtype)
     return local_tensors
 
 
@@ -255,6 +255,9 @@ class TrainerWorker:
     def send_weights(self, tensors: dict, receiver_url: str):
         meta = _build_sender_metadata(self.rank)
         local_tensors = _build_local_tensors(self.rank, meta, tensors)
+        
+        logger.info("metadata: %s", meta)
+        logger.info("local_tensors: %s", local_tensors)
 
         sender = WeightSender("gpu_direct", receiver_urls=[receiver_url])
         sender.connect(meta)

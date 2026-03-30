@@ -5,7 +5,6 @@ import math
 from typing import Iterator, TypeAlias
 import torch
 
-Triple: TypeAlias = tuple[int, int, int]
 Shard: TypeAlias = list[tuple[int, int, int]]
 Shards: TypeAlias = list[Shard]
 
@@ -50,8 +49,12 @@ def _shard_to_numel(shard: Shard) -> int:
     return math.prod(r - l for l, r, _ in shard)
 
 
+def shards_to_numel(shards: Shards) -> int:
+    return sum(_shard_to_numel(shard) for shard in shards)
+
+
 def original_total_numel(shards: Shards) -> int:
-    return _shard_to_numel(shards[0])
+    return math.prod(w for _, _, w in shards[0])
 
 
 def shards_iterator(shards: Shards, offset: int = 0, item_size: int = 1) -> Iterator[tuple[int, int, Shard]]:
@@ -152,7 +155,7 @@ class WeightData:
     def iter_with_intv(self) -> Iterator[tuple[int, int, str, Shards, torch.dtype]]:
         offset = 0
         for name, shards, dtype in self:
-            length = original_total_numel(shards) * dtype.itemsize
+            length = shards_to_numel(shards) * dtype.itemsize
             yield offset, offset + length, name, shards, dtype
             offset += length
 
@@ -160,7 +163,7 @@ class WeightData:
         """Total byte size of the data described by all shard entries."""
         total = 0
         for _, shards, dtype in self:
-            total += original_total_numel(shards) * dtype.itemsize
+            total += shards_to_numel(shards) * dtype.itemsize
         return total
         
     @staticmethod
@@ -224,12 +227,9 @@ class WeightTensorBridge:
         for name, shards, dtype in self._metadata:
             assert name in self._tensors, f"Missing tensor {name} for overlap entry"
             tensor = self._tensors[name]
-            assert tensor.dtype == dtype, (
-                f"Tensor dtype mismatch for {name}: {tensor.dtype} vs {dtype}"
-            )
             assert tensor.is_contiguous(), f"Tensor {name} is not contiguous"
-            assert original_total_numel(shards) == tensor.numel(), \
-                f"Tensor {name} does not match original total numel: {original_total_numel(shards)} vs {tensor.numel()}"
+            assert shards_to_numel(shards) * dtype.itemsize == tensor.nbytes(), \
+                f"Meta and tensor nbytes mismatch: {shards_to_numel(shards) * dtype.itemsize} vs {tensor.nbytes()}"
             self._tensors[name] = tensor.flatten().view(torch.uint8)
 
         # Remove tensors that are not in the metadata
@@ -259,8 +259,9 @@ class WeightTensorBridge:
             assert name in large._metadata, f"Missing tensor {name} for large entry"
             l_offset = l_offsets[name]
             l_shards = large._metadata[name]["shard"]
+            l_dtype = large._metadata[name]["dtype"]
             l_tensor = large._tensors[name]
-            assert l_tensor.dtype == dtype, f"Tensor dtype mismatch for {name}: {l_tensor.dtype} vs {dtype}"
+            assert l_dtype == dtype, f"Tensor dtype mismatch for {name}: {l_dtype} vs {dtype}"
             
             for s_byte_start, s_byte_end, s_shard in shards_iterator(
                 s_shards, offset=s_offset, item_size=dtype.itemsize
