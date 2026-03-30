@@ -124,9 +124,9 @@ def _build_local_tensors(rank: int, meta: WeightData, tensors: dict[str, torch.T
         slices = []
         local_tensors[name] = torch.zeros(shards_to_numel(shards), dtype=dtype)
         if name in tensors:
-            for start, end, shard in shards_iterator(shards, item_size=dtype.itemsize):
+            for start, end, shard in shards_iterator(meta[name]):
                 slices = [slice(l, r) for l, r, _ in shard]
-                local_tensors[name][start:end] = tensors[name][slices].reshape(-1)
+                local_tensors[name][start:end] = tensors[name][tuple(slices)].reshape(-1)
     return local_tensors
 
 

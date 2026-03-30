@@ -234,6 +234,10 @@ class WeightTensorBridge:
             assert shards_to_numel(shards) * dtype.itemsize == tensor.nbytes, \
                 f"Meta and tensor nbytes mismatch: {shards_to_numel(shards) * dtype.itemsize} vs {tensor.nbytes}"
             self._tensors[name] = tensor.flatten().view(torch.uint8)
+            
+            if not hasattr(self, "device"):
+                self.device = tensor.device
+            assert self.device == tensor.device, f"Tensor {name} is not on the same device as other tensors"
 
         # Remove tensors that are not in the metadata
         for name in list(self._tensors):
@@ -251,7 +255,7 @@ class WeightTensorBridge:
         The direction of the copy is determined by the `l2s` parameter.
         "small" should represent a subset of the data in "large".
         """        
-        for name, s_shards, dtype in small._metadata:
+        for name, _, dtype in small._metadata:
             s_tensor = small._tensors[name]
 
             assert name in large._metadata, f"Missing tensor {name} for large entry"
@@ -290,7 +294,7 @@ class WeightTensorBridge:
     ) -> dict[int, torch.Tensor]:        
         dst_tensors = {}
         for rank, dst_meta in dst_metas.items():
-            dst_tensor = torch.empty(dst_meta.total_nbytes(), dtype=torch.uint8)
+            dst_tensor = torch.empty(dst_meta.total_nbytes(), dtype=torch.uint8, device=self.device)
             state_dict = {
                 name: dst_tensor[start:end]
                 for start, end, name, _, _ in dst_meta.iter_with_intv()
