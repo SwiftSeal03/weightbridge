@@ -228,8 +228,8 @@ class WeightTensorBridge:
             assert name in self._tensors, f"Missing tensor {name} for overlap entry"
             tensor = self._tensors[name]
             assert tensor.is_contiguous(), f"Tensor {name} is not contiguous"
-            assert shards_to_numel(shards) * dtype.itemsize == tensor.nbytes(), \
-                f"Meta and tensor nbytes mismatch: {shards_to_numel(shards) * dtype.itemsize} vs {tensor.nbytes()}"
+            assert shards_to_numel(shards) * dtype.itemsize == tensor.nbytes, \
+                f"Meta and tensor nbytes mismatch: {shards_to_numel(shards) * dtype.itemsize} vs {tensor.nbytes}"
             self._tensors[name] = tensor.flatten().view(torch.uint8)
 
         # Remove tensors that are not in the metadata
