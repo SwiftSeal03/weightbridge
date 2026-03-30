@@ -137,14 +137,16 @@ class DirectSender:
             group_name=group_name,
         )
         print(f"Sender {self.rank} initialized process group")
-        # Compute overlap with each receiver and send the sizes of the overlap metadata to the receiver
+        # Compute overlap with each receiver and send the sizes of the overlap metadata to the receiver.
+        # Always send a size (0 when no overlap) so receivers don't block on a recv that never comes.
         handles: list = []
         for r_rank, r_meta in receiver_metas:
             overlap = WeightData.compute_overlap(sender_metadata, r_meta)
-            if not overlap:
-                continue
-            self.overlaps[r_rank] = overlap
-            byte_size = torch.tensor([len(bytes(overlap))], dtype=torch.long, device=self.device)
+            if overlap:
+                self.overlaps[r_rank] = overlap
+                byte_size = torch.tensor([len(bytes(overlap))], dtype=torch.long, device=self.device)
+            else:
+                byte_size = torch.tensor([0], dtype=torch.long, device=self.device)
             handles.append(dist.isend(byte_size, dst=r_rank, group=self.group))
         for h in handles:
             h.wait()

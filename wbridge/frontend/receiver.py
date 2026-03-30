@@ -124,16 +124,18 @@ class WeightReceiver:
             group_name=data["group_name"],
         )
         
-        # Receive overlap metadata sizes from each sender
+        # Receive overlap metadata sizes from each sender (0 means no overlap)
         sender_world_size = data["sender_world_size"]
         self.overlaps: dict[int, WeightData] = {}
         overlap_buffers: dict[int, torch.Tensor] = {}
         for sender_rank in range(sender_world_size):
             size_t = torch.zeros(1, dtype=torch.long, device=self.device)
             dist.recv(size_t, src=sender_rank, group=self.group)
-            overlap_buffers[sender_rank] = torch.zeros(int(size_t.item()), dtype=torch.uint8, device=self.device)
+            size = int(size_t.item())
+            if size > 0:
+                overlap_buffers[sender_rank] = torch.zeros(size, dtype=torch.uint8, device=self.device)
 
-        # Receive overlap metadata bytes from each sender
+        # Receive overlap metadata bytes only from senders that have overlap
         for sender_rank, buffer in overlap_buffers.items():
             dist.recv(buffer, src=sender_rank, group=self.group)
             self.overlaps[sender_rank] = WeightData(buffer.cpu().numpy().tobytes())
