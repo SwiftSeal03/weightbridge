@@ -132,7 +132,7 @@ def _build_local_tensors(meta: WeightData, tensors: dict[str, torch.Tensor]) -> 
 # ── Rollout engine (Ray actor) ────────────────────────────────────
 
 
-def _receiver_worker(ipc_name: str, rank: int):
+def _receiver_worker(ipc_name: str, rank: int, ready_event: mp.Event):
     """Child process entry — creates a WeightReceiver and blocks."""
     metadata = _build_receiver_metadata(rank)
     state_dict = _build_local_tensors(metadata, {})
@@ -141,6 +141,7 @@ def _receiver_worker(ipc_name: str, rank: int):
         rank=rank,
         metadata=metadata
     )
+    ready_event.set()
     for _ in range(100):
         if receiver.request_update(state_dict):
             print(f"Receiver worker {rank} received weights")
@@ -158,13 +159,16 @@ class RolloutEngine:
         app = FastAPI()
         self.controller = WeightReceiverController(app)
 
+        ready_events = [mp.Event() for _ in range(NUM_RECEIVER_WORKERS)]
         for rank in range(NUM_RECEIVER_WORKERS):
             p = mp.Process(
                 target=_receiver_worker,
-                args=(self.controller.ipc_name, rank),
+                args=(self.controller.ipc_name, rank, ready_events[rank]),
                 daemon=True,
             )
             p.start()
+        for ready_event in ready_events:
+            ready_event.wait()
         self.controller.set_worker_num(NUM_RECEIVER_WORKERS)
 
         self._host = get_local_ip()
@@ -176,13 +180,7 @@ class RolloutEngine:
             time.sleep(0.1)
 
     def ready(self):
-        while True:
-            try:
-                response = requests.get(f"http://{self._host}:{self._port}/metadata")
-                print(f"Rollout engine {self._host}:{self._port} ready with metadata: {response.json()}")
-                return True
-            except requests.exceptions.RequestException:
-                time.sleep(0.1)
+        return True
 
 
 # ── Trainer worker (Ray actor) ────────────────────────────────────

@@ -25,6 +25,7 @@ CONNECT_REQUEST = "connect_request"
 RECEIVE_REQUEST = "receive_request"
 # Scheduler (REQ) -> receiver (REP); replaces the old ready check
 UPDATE_REQUEST = "update_request"
+READY_REQUEST = "ready_request"
 
 
 class ReceiverState(str, Enum):
@@ -58,6 +59,7 @@ class WeightReceiver:
         self.metadata = metadata
         self.state_dict = None
         self._state = ReceiverState.DISCONNECTED
+        self.ready_event = threading.Event()
         self.receiver_thread = threading.Thread(
             target=self._receiver_process_entry
         )
@@ -66,7 +68,9 @@ class WeightReceiver:
         self.context = zmq.Context()
         self.socket = self.context.socket(zmq.REQ)
         self.socket.connect(self.scheduler_ipc_name)
-
+        
+        if not self.ready_event.wait(timeout=10):
+            raise TimeoutError("Receiver thread did not become ready in time")
 
     def stop(self):
         """Stop the receiver subprocess if ``self.process`` was set (optional hook)."""
@@ -162,11 +166,6 @@ class WeightReceiver:
     def _handle_scheduler_update(
         self, scheduler_socket: zmq.Socket, msg: str
     ) -> None:
-        if msg != UPDATE_REQUEST:
-            scheduler_socket.send_string(
-                json.dumps({"success": False, "message": "unknown message"})
-            )
-            return
         if self._state != ReceiverState.AWAITING_SCHEDULER_UPDATE:
             scheduler_socket.send_string(
                 json.dumps({"success": False, "message": "no pending weights"})
@@ -196,6 +195,8 @@ class WeightReceiver:
         scheduler_socket = context.socket(zmq.REP)
         scheduler_socket.bind(self.scheduler_ipc_name)
         poller.register(scheduler_socket, zmq.POLLIN)
+        
+        self.ready_event.set()
 
         while True:
             socks = dict(poller.poll())
@@ -213,7 +214,10 @@ class WeightReceiver:
                     raise ValueError(f"Unknown message from controller: {msg}")
             if scheduler_socket in socks:
                 msg = scheduler_socket.recv_string()
-                self._handle_scheduler_update(scheduler_socket, msg)
+                if msg == UPDATE_REQUEST:
+                    self._handle_scheduler_update(scheduler_socket, msg)
+                else:
+                    raise ValueError(f"Unknown message from scheduler: {msg}")
 
 
     def _receive_weights(self) -> None:

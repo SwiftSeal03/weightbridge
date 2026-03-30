@@ -82,7 +82,6 @@ class DirectSender:
             receiver_metas: list[tuple[int, dict]] = []
             receiver_worker_counts: list[int] = []
             base_rank = self.world_size
-            print(f"Sender {self.rank} querying receiver metadata from {self.receiver_urls}")
             for url in self.receiver_urls:
                 resp = requests.get(f"{url}/wbridge/metadata")
                 resp.raise_for_status()
@@ -95,8 +94,6 @@ class DirectSender:
 
             total_world_size = self.world_size + sum(receiver_worker_counts)
             
-            print(f"Sender {self.rank} sending connect info to receivers: {receiver_metas}")
-
             # Tell each receiver to join, assigning ranks starting after all senders
             base_rank = self.world_size
             master_address, master_port = get_local_ip(), get_full_group_port()
@@ -131,7 +128,6 @@ class DirectSender:
             connect_info
         )
         
-        print(f"Sender {self.rank} initializing process group with master {master_address}:{master_port}")
         self.group = init_custom_process_group(
             backend=self.backend,
             init_method=f"tcp://{master_address}:{master_port}",
@@ -139,7 +135,7 @@ class DirectSender:
             rank=self.rank,
             group_name=group_name,
         )
-        print(f"Sender {self.rank} initialized process group")
+        
         # Compute overlap with each receiver and send the sizes of the overlap metadata to the receiver.
         # Always send a size (0 when no overlap) so receivers don't block on a recv that never comes.
         handles: list = []
