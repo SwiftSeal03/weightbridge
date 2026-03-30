@@ -152,9 +152,9 @@ class DirectSender:
             group_name=group_name,
         )
         
-        # Compute overlap with each receiver and send the sizes of the overlap metadata to the receiver.
+        # Compute overlap with each receiver and send the sizes of the overlap metadata.
         # Always send a size (0 when no overlap) so receivers don't block on a recv that never comes.
-        handles: list = []
+        size_ops: list[dist.P2POp] = []
         for r_rank, r_meta in receiver_metas:
             overlap = WeightData.compute_overlap(sender_metadata, r_meta)
             if overlap:
@@ -162,16 +162,18 @@ class DirectSender:
                 byte_size = torch.tensor([len(bytes(overlap))], dtype=torch.long, device=self.device)
             else:
                 byte_size = torch.tensor([0], dtype=torch.long, device=self.device)
-            handles.append(dist.isend(byte_size, dst=r_rank, group=self.group))
-        for h in handles:
+            size_ops.append(dist.P2POp(dist.isend, byte_size, r_rank, self.group))
+        for h in dist.batch_isend_irecv(size_ops):
             h.wait()
             
+        dist.barrier(group=self.group)
+
         # Send the overlap metadata bytes to the receivers
-        handles: list = []
+        meta_ops: list[dist.P2POp] = []
         for r_rank, overlap in self.overlaps.items():
             overlap_bytes = torch.frombuffer(bytes(overlap), dtype=torch.uint8).to(self.device)
-            handles.append(dist.isend(overlap_bytes, dst=r_rank, group=self.group))
-        for h in handles:
+            meta_ops.append(dist.P2POp(dist.isend, overlap_bytes, r_rank, self.group))
+        for h in dist.batch_isend_irecv(meta_ops):
             h.wait()
 
         self.connected = True
@@ -199,12 +201,13 @@ class GPUDirectSender(DirectSender):
                 resp.raise_for_status()
 
         chunks = self.metadata(state_dict)[self.overlaps]
-        handles = [
-            dist.isend(chunk, dst=receiver_rank, group=self.group)
+        ops = [
+            dist.P2POp(dist.isend, chunk, receiver_rank, self.group)
             for receiver_rank, chunk in chunks.items()
         ]
-        for h in handles:
-            h.wait()
+        if ops:
+            for h in dist.batch_isend_irecv(ops):
+                h.wait()
 
 
 class CPUDirectSender(DirectSender):

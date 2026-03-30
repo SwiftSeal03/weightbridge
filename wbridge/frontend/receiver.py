@@ -128,20 +128,39 @@ class WeightReceiver:
             group_name=data["group_name"],
         )
         
+        logger.info(f"Receiver {self.rank} received connect request from controller")
         # Receive overlap metadata sizes from each sender (0 means no overlap)
         sender_world_size = data["sender_world_size"]
         self.overlaps: dict[int, WeightData] = {}
+        size_tensors = {
+            sender_rank: torch.zeros(1, dtype=torch.long, device=self.device)
+            for sender_rank in range(sender_world_size)
+        }
+        size_ops = [
+            dist.P2POp(dist.irecv, size_t, sender_rank, self.group)
+            for sender_rank, size_t in size_tensors.items()
+        ]
+        for h in dist.batch_isend_irecv(size_ops):
+            h.wait()
+            
+        dist.barrier(group=self.group)
+
+        logger.info(f"Receiver {self.rank} received overlap sizes from {sender_world_size} senders")
         overlap_buffers: dict[int, torch.Tensor] = {}
-        for sender_rank in range(sender_world_size):
-            size_t = torch.zeros(1, dtype=torch.long, device=self.device)
-            dist.recv(size_t, src=sender_rank, group=self.group)
+        for sender_rank, size_t in size_tensors.items():
             size = int(size_t.item())
             if size > 0:
                 overlap_buffers[sender_rank] = torch.zeros(size, dtype=torch.uint8, device=self.device)
 
         # Receive overlap metadata bytes only from senders that have overlap
+        meta_ops = [
+            dist.P2POp(dist.irecv, buffer, sender_rank, self.group)
+            for sender_rank, buffer in overlap_buffers.items()
+        ]
+        for h in dist.batch_isend_irecv(meta_ops):
+            h.wait()
+            
         for sender_rank, buffer in overlap_buffers.items():
-            dist.recv(buffer, src=sender_rank, group=self.group)
             self.overlaps[sender_rank] = WeightData(buffer.cpu().numpy().tobytes())
 
         logger.info(
@@ -226,12 +245,13 @@ class WeightReceiver:
             sender_rank: torch.zeros(overlap.total_nbytes(), dtype=torch.uint8, device=self.device)
             for sender_rank, overlap in self.overlaps.items()
         }
-        handles = [
-            dist.irecv(chunk, src=sender_rank, group=self.group)
-            for sender_rank, chunk in chunks.items()
-        ]
-        for h in handles:
-            h.wait()
+        if chunks:
+            ops = [
+                dist.P2POp(dist.irecv, chunk, sender_rank, self.group)
+                for sender_rank, chunk in chunks.items()
+            ]
+            for h in dist.batch_isend_irecv(ops):
+                h.wait()
         
         self.metadata(self.state_dict)[self.overlaps] = chunks
 
