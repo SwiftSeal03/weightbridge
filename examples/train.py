@@ -35,6 +35,7 @@ Usage::
 
 import logging
 import multiprocessing as mp
+import os
 import threading
 import time
 
@@ -164,9 +165,10 @@ def _verify_rollout_against_expected(
 
 
 def _receiver_worker(
-    ipc_name: str, rank: int, ready_event: mp.Event, shard_queue: mp.Queue
+    ipc_name: str, rank: int, gpu_id: str, ready_event: mp.Event, shard_queue: mp.Queue
 ):
     """Child process entry — creates a WeightReceiver and blocks."""
+    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
     metadata = _build_receiver_metadata(rank)
     state_dict = _build_local_tensors(metadata, {})
     receiver = WeightReceiver(
@@ -191,8 +193,14 @@ class RolloutEngine:
     receiver worker child processes (analogous to SGLang schedulers)."""
 
     def __init__(self):
+        start_time = time.time()
         app = FastAPI()
         self.controller = WeightReceiverController(app)
+
+        gpu_ids = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
+        assert len(gpu_ids) >= NUM_RECEIVER_WORKERS, (
+            f"Need {NUM_RECEIVER_WORKERS} GPUs but CUDA_VISIBLE_DEVICES={gpu_ids}"
+        )
 
         ready_events = [mp.Event() for _ in range(NUM_RECEIVER_WORKERS)]
         self._shard_queues = [mp.Queue(maxsize=1) for _ in range(NUM_RECEIVER_WORKERS)]
@@ -202,14 +210,13 @@ class RolloutEngine:
                 args=(
                     self.controller.ipc_name,
                     rank,
+                    gpu_ids[rank],
                     ready_events[rank],
                     self._shard_queues[rank],
                 ),
                 daemon=True,
             )
             p.start()
-        for ready_event in ready_events:
-            ready_event.wait()
         self.controller.set_worker_num(NUM_RECEIVER_WORKERS)
 
         self._host = get_local_ip()
@@ -219,6 +226,11 @@ class RolloutEngine:
         threading.Thread(target=server.run, daemon=True).start()
         while not server.started:
             time.sleep(0.1)
+            
+        for ready_event in ready_events:
+            ready_event.wait()
+        
+        print(f"RolloutEngine started in {time.time() - start_time:.2f} seconds")
 
     def ready(self):
         return True
@@ -250,10 +262,12 @@ class TrainerWorker:
             "gpu_direct", receiver_urls=[receiver_url],
             rank=self.rank, world_size=self.world_size,
         )
+        start_time = time.time()
         sender.connect(meta, sender_init_method=self.sender_init_method)
-        print(f"Trainer worker {self.rank} connected to receiver")
+        print(f"Trainer worker {self.rank} connected to receiver in {time.time() - start_time:.2f} seconds")
+        start_time = time.time()
         sender.send(local_tensors)
-        print(f"Trainer worker {self.rank} sent weights")
+        print(f"Trainer worker {self.rank} sent weights in {time.time() - start_time:.2f} seconds")
 
 
 # ── Entry point ───────────────────────────────────────────────────
