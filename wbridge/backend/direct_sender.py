@@ -82,6 +82,7 @@ class DirectSender:
             receiver_metas: list[tuple[int, dict]] = []
             receiver_worker_counts: list[int] = []
             base_rank = self.world_size
+            print(f"Sender {self.rank} querying receiver metadata from {self.receiver_urls}")
             for url in self.receiver_urls:
                 resp = requests.get(f"{url}/wbridge/metadata")
                 resp.raise_for_status()
@@ -93,6 +94,8 @@ class DirectSender:
                 base_rank += len(workers)
 
             total_world_size = self.world_size + sum(receiver_worker_counts)
+            
+            print(f"Sender {self.rank} sending connect info to receivers: {receiver_metas}")
 
             # Tell each receiver to join, assigning ranks starting after all senders
             base_rank = self.world_size
@@ -159,13 +162,6 @@ class DirectSender:
         for h in handles:
             h.wait()
 
-        print(
-            f"Sender {self.rank} connected \
-                (group={group_name}, \
-                backend={self.backend}, \
-                world_size={total_world_size}, \
-                receiver_workers={len(receiver_metas)})"
-        )
         self.connected = True
 
     def send(self, state_dict: dict[str, torch.Tensor]) -> None:
