@@ -1,22 +1,19 @@
-"""Minimal WeightBridge example: Ray placement groups + GPU-direct transfer.
+"""Minimal WeightBridge example: Ray node pinning + GPU-direct transfer.
 
 Uses Ray to place the trainer (2 sender workers) and rollout engine
-(2 receiver workers) on separate nodes, each requiring 2 GPUs.
+(2 receiver workers) on separate nodes (alive Ray nodes ``[0]`` and ``[1]``),
+each requiring 2 GPUs.
 
 Architecture::
 
-    driver  (ray.init, creates tensors, orchestrates)
+    driver  (ray.init, first alive node = rollout, second = trainer)
     │
-    ├── placement group: 4 GPU bundles (PACK strategy)
-    │   bundles 0-1 → trainer node
-    │   bundles 2-3 → rollout node
-    │
-    ├── RolloutEngine  (Ray actor on rollout node)
+    ├── RolloutEngine  (Ray actor pinned to rollout node IP)
     │   ├── FastAPI + WeightReceiverController
     │   ├── receiver_worker 0  (child process, WeightReceiver)
     │   └── receiver_worker 1  (child process, WeightReceiver)
     │
-    └── TrainerWorker × NUM_SENDER_WORKERS  (Ray actors on trainer bundles)
+    └── TrainerWorker × NUM_SENDER_WORKERS  (Ray actors pinned to trainer node IP)
         └── torch.distributed (NCCL) + WeightSender.connect / .send
             (GPUDirectSender → NCCL isend to receivers)
 
@@ -38,7 +35,7 @@ Usage::
 
 import logging
 import multiprocessing as mp
-import os
+import requests
 import threading
 import time
 
@@ -47,12 +44,13 @@ import torch
 import torch.distributed as dist
 import uvicorn
 from fastapi import FastAPI
-from ray.util.placement_group import placement_group
-from ray.util.scheduling_strategies import PlacementGroupSchedulingStrategy
+from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from wbridge.utils.distributed import get_local_ip
 from wbridge import WeightData, WeightReceiver, WeightReceiverController, WeightSender
 from wbridge.utils.data import shards_iterator, shards_to_numel
+
+from utils import init_ray_and_get_rollout_trainer
 
 logger = logging.getLogger("example")
 
@@ -131,55 +129,6 @@ def _build_local_tensors(meta: WeightData, tensors: dict[str, torch.Tensor]) -> 
     return local_tensors
 
 
-# ── Placement group ───────────────────────────────────────────────
-
-
-@ray.remote(num_cpus=0)
-class _InfoActor:
-    """Lightweight probe to discover which node/GPU a bundle landed on."""
-
-    def get_ip_and_gpu_id(self):
-        gpu_ids = os.environ.get("CUDA_VISIBLE_DEVICES", "0")
-        return get_local_ip(), gpu_ids.split(",")[0]
-
-
-def create_placement_group():
-    """Reserve GPUs and return (pg, trainer_bundle_indices, rollout_bundle_idx).
-
-    Trainer gets NUM_SENDER_WORKERS individual 1-GPU bundles (sorted by
-    node_ip, gpu_id so consecutive ranks map to consecutive GPUs).
-    Rollout gets a single bundle with NUM_RECEIVER_WORKERS GPUs so the
-    RolloutEngine actor and its child processes can all access GPUs.
-    """
-    bundles = [{"GPU": 1, "CPU": 1} for _ in range(NUM_SENDER_WORKERS)]
-    rollout_bundle_idx = len(bundles)
-    bundles.append({"GPU": NUM_RECEIVER_WORKERS, "CPU": 1})
-    pg = placement_group(bundles, strategy="PACK")
-    ray.get(pg.ready())
-
-    probes = [
-        _InfoActor.options(
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=pg, placement_group_bundle_index=i,
-            ),
-        ).remote()
-        for i in range(NUM_SENDER_WORKERS)
-    ]
-    infos = ray.get([p.get_ip_and_gpu_id.remote() for p in probes])
-    for p in probes:
-        ray.kill(p)
-
-    ordered = sorted(range(NUM_SENDER_WORKERS), key=lambda i: (infos[i][0], infos[i][1]))
-    for rank, bundle_idx in enumerate(ordered):
-        ip, gpu = infos[bundle_idx]
-        logger.info(
-            "  rank %d → bundle %d  (node %s, gpu %s)", rank, bundle_idx, ip, gpu
-        )
-
-    trainer_bundles = ordered
-    return pg, trainer_bundles, rollout_bundle_idx, infos
-
-
 # ── Rollout engine (Ray actor) ────────────────────────────────────
 
 
@@ -205,7 +154,7 @@ class RolloutEngine:
     """Ray actor that hosts the receiver-side HTTP server and spawns
     receiver worker child processes (analogous to SGLang schedulers)."""
 
-    def init(self):
+    def __init__(self):
         app = FastAPI()
         self.controller = WeightReceiverController(app)
 
@@ -226,8 +175,14 @@ class RolloutEngine:
         while not server.started:
             time.sleep(0.1)
 
-    def get_server_info(self):
-        return self._host, self._port
+    def ready(self):
+        while True:
+            try:
+                response = requests.get(f"http://{self._host}:{self._port}/metadata")
+                print(f"Rollout engine {self._host}:{self._port} ready with metadata: {response.json()}")
+                return True
+            except requests.exceptions.RequestException:
+                time.sleep(0.1)
 
 
 # ── Trainer worker (Ray actor) ────────────────────────────────────
@@ -269,27 +224,24 @@ class TrainerWorker:
 
 def main():
     logging.basicConfig(level=logging.INFO, format="%(name)s  %(message)s")
-    ray.init()
 
-    # 1. Reserve GPUs via placement group
-    pg, trainer_bundles, rollout_bundle_idx, infos = create_placement_group()
+    rollout_ip, trainer_ip, rollout_node_id, trainer_node_id = (
+        init_ray_and_get_rollout_trainer()
+    )
+    logger.info("Rollout node IP: %s", rollout_ip)
+    logger.info("Trainer node IP: %s", trainer_ip)
 
-    # 2. Start rollout engine on the rollout node
+    # 1. Start rollout engine on the rollout node
     rollout_engine = RolloutEngine.options(
         num_cpus=1,
         num_gpus=NUM_RECEIVER_WORKERS,
-        scheduling_strategy=PlacementGroupSchedulingStrategy(
-            placement_group=pg,
-            placement_group_bundle_index=rollout_bundle_idx,
-            placement_group_capture_child_tasks=True,
+        scheduling_strategy=NodeAffinitySchedulingStrategy(
+            node_id=rollout_node_id,
+            soft=False,
         ),
     ).remote()
-    ray.get(rollout_engine.init.remote())
-    host, port = ray.get(rollout_engine.get_server_info.remote())
-    receiver_url = f"http://{host}:{port}"
-    logger.info("Rollout engine ready at %s", receiver_url)
 
-    # 3. Create tensors in the driver and dispatch to trainer workers
+    # 2. Create tensors in the driver and dispatch to trainer workers
     tensors = {
         "uneven_weight": torch.randn(ROWS, COLS, dtype=DTYPE),
         "col_weight": torch.randn(ROWS, COLS, dtype=DTYPE),
@@ -297,22 +249,21 @@ def main():
     }
     logger.info("Created 3 tensors (each [%d, %d] %s)", ROWS, COLS, DTYPE)
 
-    workers = []
-    for rank in range(NUM_SENDER_WORKERS):
-        info = infos[trainer_bundles[rank]]
-        master_addr = info[0]
-        master_port = SENDER_PG_PORT
-        worker = TrainerWorker.options(
+    workers = [
+        TrainerWorker.options(
             num_cpus=1,
             num_gpus=1,
-            scheduling_strategy=PlacementGroupSchedulingStrategy(
-                placement_group=pg,
-                placement_group_bundle_index=trainer_bundles[rank],
+            scheduling_strategy=NodeAffinitySchedulingStrategy(
+                node_id=trainer_node_id,
+                soft=False,
             ),
-        ).remote(NUM_SENDER_WORKERS, rank, master_addr, master_port)
-        workers.append(worker)
+        ).remote(NUM_SENDER_WORKERS, rank, trainer_ip, SENDER_PG_PORT)
+        for rank in range(NUM_SENDER_WORKERS)
+    ]
 
-    # 4. All trainer workers send weights
+    # 3. All trainer workers send weights
+    receiver_url = f"http://{rollout_ip}:{ROLLOUT_SERVER_PORT}"
+    ray.get(rollout_engine.ready.remote())
     ray.get([w.send_weights.remote(tensors, receiver_url) for w in workers])
 
     logger.info("All senders finished. Done.")
