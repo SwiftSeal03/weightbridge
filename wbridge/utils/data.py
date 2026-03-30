@@ -220,11 +220,10 @@ class WeightTensorBridge:
     :meth:`pack_for` performs one overlap's pack or unpack (see below).
     """
 
-    __slots__ = ("_metadata", "_tensors")
-
     def __init__(self, metadata: WeightData, tensors: dict[str, torch.Tensor]) -> None:
         self._metadata = metadata
         self._tensors = tensors
+        self.device = tensors[list(tensors.keys())[0]].device
 
         # Sanity check and flatten
         for name, shards, dtype in self._metadata:
@@ -235,8 +234,6 @@ class WeightTensorBridge:
                 f"Meta and tensor nbytes mismatch: {shards_to_numel(shards) * dtype.itemsize} vs {tensor.nbytes}"
             self._tensors[name] = tensor.flatten().view(torch.uint8)
             
-            if not hasattr(self, "device"):
-                self.device = tensor.device
             assert self.device == tensor.device, f"Tensor {name} is not on the same device as other tensors"
 
         # Remove tensors that are not in the metadata
