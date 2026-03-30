@@ -16,9 +16,11 @@ class DirectSender:
     def __init__(
         self,
         receiver_urls: list[str],
+        rank: int,
+        world_size: int,
     ):
-        self.rank = dist.get_rank()
-        self.world_size = dist.get_world_size()
+        self.rank = rank
+        self.world_size = world_size
         self.receiver_urls = receiver_urls
         
         self.connected = False
@@ -28,7 +30,9 @@ class DirectSender:
         self.backend = None
         self.device = None
 
-    def _dedup_sender_metadata(self, sender_metadata: WeightData) -> WeightData:
+    def _dedup_sender_metadata(
+        self, sender_metadata: WeightData, sender_coord_group: dist.ProcessGroup | None = None,
+    ) -> WeightData:
         """All-gather metadata across senders and deduplicate identical shards.
 
         For each named tensor present on multiple senders, the intersection of
@@ -41,7 +45,7 @@ class DirectSender:
 
         meta_dict = dict(sender_metadata.meta_dict)
         all_meta_dicts: list[dict | None] = [None] * self.world_size
-        dist.all_gather_object(all_meta_dicts, meta_dict)
+        dist.all_gather_object(all_meta_dicts, meta_dict, group=sender_coord_group)
 
         names_to_remove: set[str] = set()
         for peer_rank, peer_dict in enumerate(all_meta_dicts):
@@ -71,8 +75,18 @@ class DirectSender:
         return WeightData(new_meta_dict)
 
 
-    def connect(self, sender_metadata: WeightData) -> None:
-        sender_metadata = self._dedup_sender_metadata(sender_metadata)
+    def connect(self, sender_metadata: WeightData, sender_init_method: str) -> None:
+        sender_coord_group = None
+        if self.world_size > 1:
+            sender_coord_group = init_custom_process_group(
+                backend="gloo",
+                init_method=sender_init_method,
+                world_size=self.world_size,
+                rank=self.rank,
+                group_name="wbridge_sender_coord",
+            )
+
+        sender_metadata = self._dedup_sender_metadata(sender_metadata, sender_coord_group)
         self.metadata = sender_metadata
 
         group_name = "wbridge"
@@ -123,7 +137,9 @@ class DirectSender:
         else:
             connect_info = [None, None, None, None, None]
 
-        dist.broadcast_object_list(connect_info, src=0)
+        if sender_coord_group is not None:
+            dist.broadcast_object_list(connect_info, src=0, group=sender_coord_group)
+            dist.destroy_process_group(sender_coord_group)
         master_address, master_port, total_world_size, group_name, receiver_metas = (
             connect_info
         )
@@ -194,9 +210,10 @@ class GPUDirectSender(DirectSender):
 class CPUDirectSender(DirectSender):
     def __init__(
         self,
-        receiver_urls: list[str],
+        *args,
+        **kwargs,
     ):
-        super().__init__(receiver_urls)
+        super().__init__(*args, **kwargs)
         self.device = "cpu"
         self.backend = "gloo"
 

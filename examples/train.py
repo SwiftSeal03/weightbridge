@@ -35,13 +35,11 @@ Usage::
 
 import logging
 import multiprocessing as mp
-import requests
 import threading
 import time
 
 import ray
 import torch
-import torch.distributed as dist
 import uvicorn
 from fastapi import FastAPI
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
@@ -129,10 +127,45 @@ def _build_local_tensors(meta: WeightData, tensors: dict[str, torch.Tensor]) -> 
     return local_tensors
 
 
+def _assemble_rollout_shards(shards: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
+    """Stack row shards from receivers 0..1 into full ``[ROWS, COLS]`` tensors."""
+    mid = ROWS // 2
+    assert len(shards) == NUM_RECEIVER_WORKERS
+    out: dict[str, torch.Tensor] = {}
+    for name in shards[0]:
+        top = shards[0][name].reshape(mid, COLS)
+        bot = shards[1][name].reshape(ROWS - mid, COLS)
+        out[name] = torch.cat([top, bot], dim=0)
+    return out
+
+
+def _verify_rollout_against_expected(
+    expected: dict[str, torch.Tensor], shards: list[dict[str, torch.Tensor]]
+) -> None:
+    """Assemble rollout-side shards and check they match the driver tensors."""
+    assembled = _assemble_rollout_shards(shards)
+    for name, exp in expected.items():
+        assert name in assembled, f"missing {name} on rollout"
+        got = assembled[name]
+        exp_cpu = exp.detach().cpu().float()
+        got_cpu = got.detach().cpu().float()
+        if not torch.allclose(exp_cpu, got_cpu, rtol=1e-5, atol=1e-6):
+            max_err = (exp_cpu - got_cpu).abs().max().item()
+            raise AssertionError(
+                f"{name}: rollout assembled tensor differs from expected (max abs err {max_err})"
+            )
+    logger.info(
+        "Verified rollout tensors: all %d names match driver ground truth (allclose).",
+        len(expected),
+    )
+
+
 # ── Rollout engine (Ray actor) ────────────────────────────────────
 
 
-def _receiver_worker(ipc_name: str, rank: int, ready_event: mp.Event):
+def _receiver_worker(
+    ipc_name: str, rank: int, ready_event: mp.Event, shard_queue: mp.Queue
+):
     """Child process entry — creates a WeightReceiver and blocks."""
     metadata = _build_receiver_metadata(rank)
     state_dict = _build_local_tensors(metadata, {})
@@ -145,6 +178,8 @@ def _receiver_worker(ipc_name: str, rank: int, ready_event: mp.Event):
     for _ in range(100):
         if receiver.request_update(state_dict):
             print(f"Receiver worker {rank} received weights")
+            cpu_shards = {k: v.detach().cpu().clone() for k, v in state_dict.items()}
+            shard_queue.put(cpu_shards)
             break
         print(f"Receiver worker {rank} waiting for weights")
         time.sleep(2)
@@ -160,10 +195,16 @@ class RolloutEngine:
         self.controller = WeightReceiverController(app)
 
         ready_events = [mp.Event() for _ in range(NUM_RECEIVER_WORKERS)]
+        self._shard_queues = [mp.Queue(maxsize=1) for _ in range(NUM_RECEIVER_WORKERS)]
         for rank in range(NUM_RECEIVER_WORKERS):
             p = mp.Process(
                 target=_receiver_worker,
-                args=(self.controller.ipc_name, rank, ready_events[rank]),
+                args=(
+                    self.controller.ipc_name,
+                    rank,
+                    ready_events[rank],
+                    self._shard_queues[rank],
+                ),
                 daemon=True,
             )
             p.start()
@@ -182,39 +223,37 @@ class RolloutEngine:
     def ready(self):
         return True
 
+    def gather_received_shards(self) -> list[dict[str, torch.Tensor]]:
+        """CPU tensor dicts per receiver worker, in rank order, after a completed receive."""
+        return [q.get(timeout=120) for q in self._shard_queues]
+
 
 # ── Trainer worker (Ray actor) ────────────────────────────────────
 
 @ray.remote
 class TrainerWorker:
-    """Ray actor — one per sender GPU.  Initialises torch.distributed
-    with the other TrainerWorkers, then sends its weight shard."""
+    """Ray actor — one per sender GPU.  Sends its weight shard via
+    WeightBridge (no default torch.distributed group required)."""
 
     def __init__(self, world_size: int, rank: int,
                  master_addr: str = None, master_port: int = None):
         self.world_size = world_size
         self.rank = rank
-        self.master_addr = master_addr
-        self.master_port = master_port
-        print(f"Trainer worker {rank} initializing with master {master_addr}:{master_port}")
-        dist.init_process_group(
-            backend="nccl",
-            init_method=f"tcp://{master_addr}:{master_port}",
-            rank=rank,
-            world_size=world_size,
-        )
+        self.sender_init_method = f"tcp://{master_addr}:{master_port}"
         print(f"Trainer worker {rank} initialized")
 
     def send_weights(self, tensors: dict, receiver_url: str):
         meta = _build_sender_metadata(self.rank)
         local_tensors = _build_local_tensors(meta, tensors)
 
-        sender = WeightSender("gpu_direct", receiver_urls=[receiver_url])
-        sender.connect(meta)
+        sender = WeightSender(
+            "gpu_direct", receiver_urls=[receiver_url],
+            rank=self.rank, world_size=self.world_size,
+        )
+        sender.connect(meta, sender_init_method=self.sender_init_method)
         print(f"Trainer worker {self.rank} connected to receiver")
         sender.send(local_tensors)
         print(f"Trainer worker {self.rank} sent weights")
-        dist.destroy_process_group()
 
 
 # ── Entry point ───────────────────────────────────────────────────
@@ -263,6 +302,9 @@ def main():
     receiver_url = f"http://{rollout_ip}:{ROLLOUT_SERVER_PORT}"
     ray.get(rollout_engine.ready.remote())
     ray.get([w.send_weights.remote(tensors, receiver_url) for w in workers])
+
+    rollout_shards = ray.get(rollout_engine.gather_received_shards.remote())
+    _verify_rollout_against_expected(tensors, rollout_shards)
 
     logger.info("All senders finished. Done.")
     ray.shutdown()

@@ -222,7 +222,7 @@ class WeightTensorBridge:
 
     def __init__(self, metadata: WeightData, tensors: dict[str, torch.Tensor]) -> None:
         self._metadata = metadata
-        self._tensors = tensors
+        self._tensors = dict(tensors)
         self.device = tensors[list(tensors.keys())[0]].device
 
         # Sanity check and flatten
