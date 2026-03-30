@@ -60,6 +60,7 @@ NUM_SENDER_WORKERS = 2
 NUM_RECEIVER_WORKERS = 2
 DTYPE = torch.float32
 ROWS, COLS = 4, 8
+DEVICE = "cuda"
 
 ROLLOUT_SERVER_PORT = 15000
 SENDER_PG_PORT = 60010
@@ -117,12 +118,12 @@ def _build_receiver_metadata(rank: int) -> WeightData:
     return WeightData(meta_dict)
 
 
-def _build_local_tensors(rank: int, meta: WeightData, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+def _build_local_tensors(meta: WeightData, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
     """Create tensor shards from either provided tensors or zeros"""
     local_tensors = {}
     for name, shards, dtype in meta:
         slices = []
-        local_tensors[name] = torch.zeros(shards_to_numel(shards), dtype=dtype)
+        local_tensors[name] = torch.zeros(shards_to_numel(shards), dtype=dtype, device=DEVICE)
         if name in tensors:
             for start, end, shard in shards_iterator(meta[name]):
                 slices = [slice(l, r) for l, r, _ in shard]
@@ -185,18 +186,18 @@ def create_placement_group():
 def _receiver_worker(ipc_name: str, rank: int):
     """Child process entry — creates a WeightReceiver and blocks."""
     metadata = _build_receiver_metadata(rank)
-    state_dict = _build_local_tensors(rank, metadata, {})
+    state_dict = _build_local_tensors(metadata, {})
     receiver = WeightReceiver(
         controller_ipc_name=ipc_name,
         rank=rank,
         metadata=metadata
     )
-    for _ in range(10):
+    for _ in range(100):
         if receiver.request_update(state_dict):
-            logger.info("Receiver worker %d received weights", rank)
+            print(f"Receiver worker {rank} received weights")
             break
-        logger.info("Receiver worker %d waiting for weights", rank)
-        time.sleep(1)
+        print(f"Receiver worker {rank} waiting for weights")
+        time.sleep(2)
     receiver.stop()
 
 @ray.remote
@@ -242,27 +243,24 @@ class TrainerWorker:
         self.rank = rank
         self.master_addr = master_addr
         self.master_port = master_port
-        logger.info("Trainer worker %d initializing with master %s:%d", rank, master_addr, master_port)
+        print(f"Trainer worker {rank} initializing with master {master_addr}:{master_port}")
         dist.init_process_group(
             backend="nccl",
             init_method=f"tcp://{master_addr}:{master_port}",
             rank=rank,
             world_size=world_size,
         )
-        logger.info("Trainer worker %d initialized", rank)
+        print(f"Trainer worker {rank} initialized")
 
     def send_weights(self, tensors: dict, receiver_url: str):
         meta = _build_sender_metadata(self.rank)
-        local_tensors = _build_local_tensors(self.rank, meta, tensors)
-        
-        logger.info("metadata: %s", meta)
-        logger.info("local_tensors: %s", local_tensors)
+        local_tensors = _build_local_tensors(meta, tensors)
 
         sender = WeightSender("gpu_direct", receiver_urls=[receiver_url])
         sender.connect(meta)
-        logger.info("Trainer worker %d connected to receiver", self.rank)
+        print(f"Trainer worker {self.rank} connected to receiver")
         sender.send(local_tensors)
-        logger.info("Trainer worker %d sent weights", self.rank)
+        print(f"Trainer worker {self.rank} sent weights")
         dist.destroy_process_group()
 
 
