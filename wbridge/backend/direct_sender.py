@@ -128,7 +128,7 @@ class DirectSender:
             connect_info
         )
         
-        print("Sender %d initializing process group with master %s:%d", self.rank, master_address, master_port)
+        print(f"Sender {self.rank} initializing process group with master {master_address}:{master_port}")
         self.group = init_custom_process_group(
             backend=self.backend,
             init_method=f"tcp://{master_address}:{master_port}",
@@ -136,7 +136,7 @@ class DirectSender:
             rank=self.rank,
             group_name=group_name,
         )
-        print("Sender %d initialized process group", self.rank)
+        print(f"Sender {self.rank} initialized process group")
         # Compute overlap with each receiver and send the sizes of the overlap metadata to the receiver
         handles: list = []
         for r_rank, r_meta in receiver_metas:
@@ -158,12 +158,11 @@ class DirectSender:
             h.wait()
 
         print(
-            "Sender %d connected (group=%s, backend=%s, world_size=%d, receiver_workers=%d)",
-            self.rank,
-            group_name,
-            self.backend,
-            total_world_size,
-            len(receiver_metas),
+            f"Sender {self.rank} connected \
+                (group={group_name}, \
+                backend={self.backend}, \
+                world_size={total_world_size}, \
+                receiver_workers={len(receiver_metas)})"
         )
         self.connected = True
 
