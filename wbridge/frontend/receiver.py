@@ -125,7 +125,7 @@ class WeightReceiver:
 
         overlap_buffers: dict[int, torch.Tensor] = {}
         for sender_rank, size_t in size_tensors.items():
-            if size := size_t.item() > 0:
+            if (size := int(size_t.item())) > 0:
                 overlap_buffers[sender_rank] = torch.zeros(size, dtype=torch.uint8, device=self.device)
 
         # Receive overlap metadata bytes only from senders that have overlap
