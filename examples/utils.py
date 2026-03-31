@@ -4,7 +4,7 @@ import torch
 from wbridge.utils.data import WeightData, shards_iterator, shards_to_numel
 
 
-def init_ray_and_get_rollout_trainer():
+def get_ray_nodes():
     """``ray.init()`` then return rollout (``alive[0]``) and trainer (``alive[1]``).
 
     Returns ``(rollout_ip, trainer_ip, rollout_node_id, trainer_node_id)``.
