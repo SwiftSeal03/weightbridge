@@ -44,7 +44,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from wbridge import WeightData, WeightReceiver, WeightReceiverController, WeightSender
 
-from utils import init_ray_and_get_rollout_trainer, build_local_tensors
+from utils import init_ray_and_get_rollout_trainer, generate_local_tensors
 
 logger = logging.getLogger("example")
 
@@ -131,13 +131,13 @@ class RolloutWorker:
     def ready(self):
         return True
 
-    def set_expected(self, tensors: dict[str, torch.Tensor]):
-        """Slice the full ground-truth tensors into this worker's expected shard."""
-        self.expected = build_local_tensors(self.metadata, tensors, device=DEVICE)
+    def set_expected(self, seed: int):
+        """Generate ground-truth tensors from *seed* and slice into this worker's expected shard."""
+        self.expected = generate_local_tensors(self.metadata, device=DEVICE, seed=seed)
 
     def receive_and_verify(self) -> dict:
         """Block until weights arrive, then verify against expected shard."""
-        state_dict = build_local_tensors(self.metadata, {}, device=DEVICE)
+        state_dict = generate_local_tensors(self.metadata, device=DEVICE)
         for _ in range(200):
             if self.receiver.request_update(state_dict):
                 break
@@ -183,9 +183,6 @@ class RolloutEngine:
         self._workers = workers
         self.controller.set_worker_num(len(workers))
 
-    def ready(self):
-        return True
-
     def gather_results(self) -> list[dict]:
         results = ray.get([w.receive_and_verify.remote() for w in self._workers])
         return sorted(results, key=lambda r: r["rank"])
@@ -205,9 +202,9 @@ class TrainerWorker:
         self.sender_init_method = f"tcp://{master_addr}:{master_port}"
         print(f"Trainer worker {rank} initialized")
 
-    def send_weights(self, tensors: dict, receiver_url: str):
+    def send_weights(self, seed: int, receiver_url: str):
         meta = _build_sender_metadata(self.rank)
-        local_tensors = build_local_tensors(meta, tensors, device=DEVICE)
+        local_tensors = generate_local_tensors(meta, device=DEVICE, seed=seed)
 
         sender = WeightSender(
             "gpu_direct", receiver_urls=[receiver_url],
@@ -255,14 +252,10 @@ def main():
     ray.get([w.ready.remote() for w in rollout_workers])
     ray.get(rollout_engine.set_workers.remote(rollout_workers))
 
-    # 3. Create ground-truth tensors and distribute to rollout workers
-    tensors = {
-        "uneven_weight": torch.randn(ROWS, COLS, dtype=DTYPE),
-        "col_weight": torch.randn(ROWS, COLS, dtype=DTYPE),
-        "dup_weight": torch.randn(ROWS, COLS, dtype=DTYPE),
-    }
-    logger.info("Created 3 tensors (each [%d, %d] %s)", ROWS, COLS, DTYPE)
-    ray.get([w.set_expected.remote(tensors) for w in rollout_workers])
+    # 3. Share a seed so all workers generate identical ground-truth tensors locally
+    seed = torch.randint(0, 2**31, (1,)).item()
+    logger.info("Tensor seed: %d (each worker generates [%d, %d] %s locally)", seed, ROWS, COLS, DTYPE)
+    ray.get([w.set_expected.remote(seed) for w in rollout_workers])
 
     # 4. Start trainer workers and send weights
     trainer_workers = [
@@ -276,7 +269,7 @@ def main():
 
     receiver_url = f"http://{rollout_ip}:{ROLLOUT_SERVER_PORT}"
     ray.get(rollout_engine.ready.remote())
-    ray.get([w.send_weights.remote(tensors, receiver_url) for w in trainer_workers])
+    ray.get([w.send_weights.remote(seed, receiver_url) for w in trainer_workers])
 
     # 5. Each rollout worker verifies its own shard; engine gathers results
     results = ray.get(rollout_engine.gather_results.remote())

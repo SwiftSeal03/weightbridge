@@ -21,14 +21,28 @@ def init_ray_and_get_rollout_trainer():
         str(trainer["NodeID"]),
     )
 
-def build_local_tensors(meta: WeightData, tensors: dict[str, torch.Tensor], device: torch.device) -> dict[str, torch.Tensor]:
-    """Create tensor shards from either provided tensors or zeros"""
-    local_tensors = {}
-    for name, shards, dtype in meta:
-        slices = []
+def generate_local_tensors(
+    metadata: WeightData, device: str, seed: int | None = None,
+) -> dict[str, torch.Tensor]:
+    """Create flattened shard tensors described by *metadata*.
+
+    When *seed* is given, full tensors are generated deterministically
+    (shape inferred from the ``w`` values of each shard spec) and sliced
+    into local shards.  When *seed* is ``None``, zero-filled tensors are
+    returned.
+    """
+    full_tensors: dict[str, torch.Tensor] = {}
+    if seed is not None:
+        g = torch.Generator().manual_seed(seed)
+        for name, shards, dtype in metadata:
+            shape = tuple(w for _, _, w in shards[0])
+            full_tensors[name] = torch.randn(*shape, dtype=dtype, device=device, generator=g)
+
+    local_tensors: dict[str, torch.Tensor] = {}
+    for name, shards, dtype in metadata:
         local_tensors[name] = torch.zeros(shards_to_numel(shards), dtype=dtype, device=device)
-        if name in tensors:
-            for start, end, shard in shards_iterator(meta[name]):
-                slices = [slice(l, r) for l, r, _ in shard]
-                local_tensors[name][start:end] = tensors[name][tuple(slices)].reshape(-1)
+        if name in full_tensors:
+            for start, end, shard in shards_iterator(metadata[name]):
+                slices = tuple(slice(l, r) for l, r, _ in shard)
+                local_tensors[name][start:end] = full_tensors[name][slices].reshape(-1)
     return local_tensors
