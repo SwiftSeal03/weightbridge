@@ -12,8 +12,9 @@ Architecture::
     │   └── spawns RolloutWorker × NUM_RECEIVER_WORKERS  (Ray actors, 1 GPU each)
     │       └── WeightReceiver (NCCL recv) + local verification
     │
-    └── TrainerWorker × NUM_SENDER_WORKERS  (Ray actors, 1 GPU each)
-        └── WeightSender (NCCL isend to receivers)
+    └── TrainerEngine  (non-Ray manager in driver process)
+        └── TrainerWorker × NUM_SENDER_WORKERS  (Ray actors, 1 GPU each)
+            └── WeightSender (NCCL isend to receivers)
 
 Tensors (``float32``, shape ``[ROWS, COLS]`` = ``[4, 8]``):
 
@@ -41,21 +42,12 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 from wbridge import WeightData
 
 from utils import get_ray_nodes, generate_local_tensors
-from workers import RolloutEngine, TrainerWorker
+from workers import EngineArgs, RolloutEngine, TrainerEngine
 
 logger = logging.getLogger("example")
 
-NUM_SENDER_WORKERS = 2
-NUM_RECEIVER_WORKERS = 2
 DTYPE = torch.float32
 ROWS, COLS = 4, 8
-DEVICE = "cuda"
-
-ROLLOUT_SERVER_PORT = 15000
-SENDER_PG_PORT = 60010
-
-
-# ── Helpers ────────────────────────────────────────────────────────
 
 
 def _build_sender_metadata(rank: int) -> WeightData:
@@ -107,51 +99,34 @@ def _build_receiver_metadata(rank: int) -> WeightData:
     return WeightData(meta_dict)
 
 
-# ── Entry point ───────────────────────────────────────────────────
-
-
 def main():
-    logging.basicConfig(level=logging.INFO, format="%(name)s  %(message)s")
-
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(filename)s:%(lineno)d - %(message)s")
+    
     rollout_ip, trainer_ip, rollout_node_id, trainer_node_id = get_ray_nodes()
-    logger.info("Rollout node IP: %s", rollout_ip)
-    logger.info("Trainer node IP: %s", trainer_ip)
-
-    seed = torch.randint(0, 2**31, (1,)).item()
-    logger.info("Tensor seed: %d (each worker generates [%d, %d] %s locally)", seed, ROWS, COLS, DTYPE)
-    tensor_gen = partial(generate_local_tensors, device=DEVICE, seed=seed)
-
-    # 1. Start trainer workers
-    trainer_workers = [
-        TrainerWorker.options(
-            num_cpus=1, num_gpus=1,
-            scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=trainer_node_id, soft=False),
-        ).remote(
-            NUM_SENDER_WORKERS, rank, trainer_ip, SENDER_PG_PORT,
-            _build_sender_metadata,
-        )
-        for rank in range(NUM_SENDER_WORKERS)
-    ]
-
-    # 2. Start rollout engine (spawns receiver workers internally)
-    rollout_engine = RolloutEngine.options(
-        num_cpus=1,
-        scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=rollout_node_id, soft=False),
-    ).remote(
-        rollout_ip, ROLLOUT_SERVER_PORT, rollout_node_id, NUM_RECEIVER_WORKERS,
-        _build_receiver_metadata, tensor_gen,
+    engine_args = EngineArgs(
+        rollout_host=rollout_ip,
+        rollout_port=15000,
+        rollout_scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=rollout_node_id, soft=False),
+        num_rollout_workers=2,
+        rollout_metadata_generator=_build_receiver_metadata,
+        trainer_host=trainer_ip,
+        trainer_pg_port=60010,
+        trainer_scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=trainer_node_id, soft=False),
+        num_trainer_workers=2,
+        trainer_metadata_generator=_build_sender_metadata,
+        tensor_generator=partial(generate_local_tensors, device="cuda", seed=42),
     )
 
-    # 3. Send weights to rollout workers
-    receiver_url = f"http://{rollout_ip}:{ROLLOUT_SERVER_PORT}"
-    ray.get([w.send_weights.remote(tensor_gen, receiver_url) for w in trainer_workers])
+    trainer_engine = TrainerEngine(engine_args)
 
-    # 4. Each rollout worker verifies its own shard; engine gathers results
-    results = ray.get(rollout_engine.gather_results.remote())
-    for r in results:
-        if not r["ok"]:
-            raise AssertionError(f"RolloutWorker rank {r['rank']} failed: {r['detail']}")
-    logger.info("All %d rollout workers verified their shards independently.", len(results))
+    rollout_engine = RolloutEngine.options(scheduling_strategy=engine_args.rollout_scheduling_strategy).remote()
+    ray.get(rollout_engine.init.remote(engine_args))
+
+    trainer_engine.send_weights()
+
+    results = ray.get(rollout_engine.receive_and_verify_all.remote())
+    print(results)
+    
     ray.shutdown()
 
 

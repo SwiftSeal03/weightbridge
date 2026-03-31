@@ -1,18 +1,12 @@
 """Reusable Ray actor definitions for WeightBridge sender / receiver pipelines.
 
-The workers are parameterised by two callables so that callers can plug in
-their own sharding logic without touching this file:
-
-* ``metadata_generator(rank) -> WeightData``
-* ``tensor_generator(metadata) -> dict[str, Tensor]``
-
-``tensor_generator`` should be a partial with ``device`` and ``seed``
-already bound, e.g.
-``functools.partial(generate_local_tensors, device="cuda", seed=42)``.
+Configuration is passed as a single :class:`EngineArgs` instance to every
+engine and worker ``init`` path.
 """
 
 import threading
 import time
+from dataclasses import dataclass
 from typing import Callable
 
 import ray
@@ -27,121 +21,124 @@ MetadataGenerator = Callable[[int], WeightData]
 TensorGenerator = Callable[[WeightData], dict[str, torch.Tensor]]
 
 
-@ray.remote
+@dataclass
+class EngineArgs:
+    rollout_host: str
+    rollout_port: int
+    rollout_scheduling_strategy: NodeAffinitySchedulingStrategy
+    num_rollout_workers: int
+    rollout_controller_ipc_name: str
+    rollout_metadata_generator: MetadataGenerator
+
+    trainer_host: str
+    trainer_pg_port: int
+    trainer_scheduling_strategy: NodeAffinitySchedulingStrategy
+    num_trainer_workers: int
+    trainer_metadata_generator: MetadataGenerator
+
+    tensor_generator: TensorGenerator
+
+
+@ray.remote(num_gpus=1, num_cpus=1)
 class RolloutWorker:
     """One per receiver GPU.  Receives weights via NCCL and optionally
     verifies them against ground-truth tensors."""
 
-    def __init__(
-        self,
-        ipc_name: str,
-        rank: int,
-        metadata_generator: MetadataGenerator,
-        tensor_generator: TensorGenerator,
-    ):
+    def init(self, rank: int, args: EngineArgs):
         self.rank = rank
-        self.tensor_generator = tensor_generator
-        self.metadata = metadata_generator(rank)
+        self.args = args
+        self.metadata = args.rollout_metadata_generator(rank)
+        self.state_dict = args.tensor_generator(self.metadata)
         self.receiver = WeightReceiver(
-            controller_ipc_name=ipc_name,
+            controller_ipc_name=args.rollout_controller_ipc_name,
             rank=rank,
             metadata=self.metadata,
         )
-    def ready(self):
-        return True
 
     def receive_and_verify(self) -> dict:
         """Block until weights arrive, then verify against expected shard."""
-        expected = self.tensor_generator(self.metadata)
-        state_dict = {name: t.clone() for name, t in expected.items()}
-        for _ in range(200):
-            if self.receiver.request_update(state_dict):
+        recv_state_dict = {name: t.clone() for name, t in self.state_dict.items()}
+        for _ in range(10):
+            if self.receiver.request_update(recv_state_dict):
                 break
-            time.sleep(0.5)
+            time.sleep(1)
         else:
             return {"rank": self.rank, "ok": False, "detail": "timeout waiting for weights"}
 
-        for name, exp in expected.items():
-            got = state_dict[name]
-            if not torch.allclose(exp, got, rtol=1e-5, atol=1e-6):
-                max_err = float((exp - got).abs().max().item())
-                return {
-                    "rank": self.rank, "ok": False,
-                    "detail": f"{name}: max abs err {max_err}",
-                }
-        return {"rank": self.rank, "ok": True, "detail": "all tensors match"}
+        if all(
+            torch.allclose(exp, got, rtol=1e-5, atol=1e-6) 
+            for exp, got in zip(self.state_dict.values(), recv_state_dict.values(), strict=True)
+        ):
+            return {"rank": self.rank, "ok": True, "detail": "all tensors match"}
+        else:
+            return {"rank": self.rank, "ok": False, "detail": "some tensors do not match"}
 
 
-@ray.remote
+@ray.remote(num_cpus=1)
 class RolloutEngine:
     """Hosts the receiver-side HTTP server and spawns :class:`RolloutWorker`
     actors on the same node."""
 
-    def __init__(
-        self,
-        addr: str,
-        port: int,
-        node_id: str,
-        num_workers: int,
-        metadata_generator: MetadataGenerator,
-        tensor_generator: TensorGenerator,
-    ):
+    def init(self, args: EngineArgs):
         app = FastAPI()
         self.controller = WeightReceiverController(app)
+        args.rollout_controller_ipc_name = self.controller.ipc_name
 
-        config = uvicorn.Config(app, host=addr, port=port, log_level="warning")
+        # Start the HTTP server
+        config = uvicorn.Config(app, host=args.rollout_host, port=args.rollout_port)
         server = uvicorn.Server(config)
         threading.Thread(target=server.run, daemon=True).start()
         while not server.started:
             time.sleep(0.1)
+        print(f"RolloutEngine started on {args.rollout_host}:{args.rollout_port}")
 
-        sched = NodeAffinitySchedulingStrategy(node_id=node_id, soft=False)
-        self._workers = [
-            RolloutWorker.options(
-                num_cpus=1, num_gpus=1, scheduling_strategy=sched,
-            ).remote(
-                self.controller.ipc_name, rank,
-                metadata_generator, tensor_generator,
-            )
-            for rank in range(num_workers)
-        ]
-        ray.get([w.ready.remote() for w in self._workers])
-        self.controller.set_worker_num(num_workers)
+        # Spawn RolloutWorkers
+        n = args.num_rollout_workers
+        self._workers = [RolloutWorker.options(scheduling_strategy=args.rollout_scheduling_strategy).remote() for _ in range(n)]
+        ray.get([w.init.remote(rank, args)for rank, w in enumerate(self._workers)])
+        
+        self.controller.set_worker_num(n)
 
-    def gather_results(self) -> list[dict]:
+    def receive_and_verify_all(self) -> str:
         results = ray.get([w.receive_and_verify.remote() for w in self._workers])
-        return sorted(results, key=lambda r: r["rank"])
+        results = sorted(results, key=lambda r: r["rank"])
+        for r in results:
+            if not r["ok"]:
+                return f"RolloutWorker rank {r['rank']} failed: {r['detail']}"
+        return "All RolloutWorkers verified their shards independently."
 
 
-@ray.remote
+@ray.remote(num_gpus=1, num_cpus=1)
 class TrainerWorker:
     """One per sender GPU.  Sends its weight shard via WeightBridge
     (no default ``torch.distributed`` group required)."""
 
-    def __init__(
-        self,
-        world_size: int,
-        rank: int,
-        master_addr: str,
-        master_port: int,
-        metadata_generator: MetadataGenerator,
-    ):
-        self.world_size = world_size
+    def init(self, rank: int, args: EngineArgs):
+        self.args = args
         self.rank = rank
-        self.metadata_generator = metadata_generator
-        self.sender_init_method = f"tcp://{master_addr}:{master_port}"
-
-    def send_weights(self, tensor_generator: TensorGenerator, receiver_url: str):
-        meta = self.metadata_generator(self.rank)
-        local_tensors = tensor_generator(meta)
-
-        sender = WeightSender(
-            "gpu_direct", receiver_urls=[receiver_url],
-            rank=self.rank, world_size=self.world_size,
+        self.metadata = args.trainer_metadata_generator(rank)
+        self.state_dict = args.tensor_generator(self.metadata)
+        self.sender = WeightSender(
+            transfer_mode="gpu_direct",
+            receiver_urls=[f"http://{args.rollout_host}:{args.rollout_port}"],
+            rank=rank,
+            world_size=args.num_trainer_workers,
         )
-        start_time = time.time()
-        sender.connect(meta, sender_init_method=self.sender_init_method)
-        print(f"Trainer worker {self.rank} connected to receiver in {time.time() - start_time:.2f} seconds")
-        start_time = time.time()
-        sender.send(local_tensors)
-        print(f"Trainer worker {self.rank} sent weights in {time.time() - start_time:.2f} seconds")
+
+    def send_weights(self):
+        self.sender.connect(self.metadata, sender_init_method=f"tcp://{self.args.trainer_host}:{self.args.trainer_pg_port}")
+        self.sender.send(self.state_dict)
+
+
+class TrainerEngine:
+    """Non-Ray manager that creates and drives :class:`TrainerWorker` actors."""
+
+    def __init__(self, args: EngineArgs):
+        # Spawn TrainerWorkers
+        n = args.num_trainer_workers
+        self._workers = [TrainerWorker.options(scheduling_strategy=args.trainer_scheduling_strategy).remote() for _ in range(n)]
+        ray.get([w.init.remote(rank, args) for rank, w in enumerate(self._workers)])
+        print(f"TrainerEngine started on {args.trainer_host}:{args.trainer_pg_port}")
+
+    def send_weights(self):
+        ray.get([w.send_weights.remote() for w in self._workers])
