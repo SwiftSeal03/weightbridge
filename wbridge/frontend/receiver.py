@@ -12,7 +12,6 @@ import torch.distributed as dist
 import zmq
 from fastapi import FastAPI, APIRouter
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel
 
 from wbridge.utils.data import WeightData
 from wbridge.utils.distributed import init_custom_process_group
@@ -34,16 +33,6 @@ class ReceiverState(str, Enum):
     DISCONNECTED = "disconnected"
     CONNECTED = "connected"
     AWAITING_SCHEDULER_UPDATE = "awaiting_scheduler_update"
-
-
-class ConnectRequest(BaseModel):
-    master_address: str
-    master_port: int
-    base_rank: int
-    world_size: int
-    group_name: str
-    sender_world_size: int
-    backend: str  # "nccl" (gpu) or "gloo" (cpu)
 
 
 class WeightReceiver:
@@ -117,20 +106,12 @@ class WeightReceiver:
         if getattr(self, "group", None) is not None:
             dist.destroy_process_group(self.group)
             
-        # Initialize the process group
-        self.backend = data["backend"]
-        self.device = "cuda" if self.backend == "nccl" else "cpu"
-        self.group = init_custom_process_group(
-            backend=self.backend,
-            init_method=f"tcp://{data['master_address']}:{data['master_port']}",
-            world_size=data["world_size"],
-            rank=data["rank"],
-            group_name=data["group_name"],
-        )
-        
-        logger.info(f"Receiver {self.rank} received connect request from controller")
+        # Initialize the process group (pop keys not accepted by init_custom_process_group)
+        sender_world_size = int(data.pop("sender_world_size"))
+        self.device = "cuda" if data["backend"] == "nccl" else "cpu"
+        self.group = init_custom_process_group(**data)
+
         # Receive overlap metadata sizes from each sender (0 means no overlap)
-        sender_world_size = data["sender_world_size"]
         self.overlaps: dict[int, WeightData] = {}
         size_tensors = {
             sender_rank: torch.zeros(1, dtype=torch.long, device=self.device)
@@ -140,16 +121,11 @@ class WeightReceiver:
             dist.P2POp(dist.irecv, size_t, sender_rank, self.group)
             for sender_rank, size_t in size_tensors.items()
         ]
-        for h in dist.batch_isend_irecv(size_ops):
-            h.wait()
-            
-        dist.barrier(group=self.group)
+        assert all(h.wait() for h in dist.batch_isend_irecv(size_ops)), "Failed to receive overlap sizes"
 
-        logger.info(f"Receiver {self.rank} received overlap sizes from {sender_world_size} senders")
         overlap_buffers: dict[int, torch.Tensor] = {}
         for sender_rank, size_t in size_tensors.items():
-            size = int(size_t.item())
-            if size > 0:
+            if size := size_t.item() > 0:
                 overlap_buffers[sender_rank] = torch.zeros(size, dtype=torch.uint8, device=self.device)
 
         # Receive overlap metadata bytes only from senders that have overlap
@@ -157,8 +133,7 @@ class WeightReceiver:
             dist.P2POp(dist.irecv, buffer, sender_rank, self.group)
             for sender_rank, buffer in overlap_buffers.items()
         ]
-        for h in dist.batch_isend_irecv(meta_ops):
-            h.wait()
+        assert all(h.wait() for h in dist.batch_isend_irecv(meta_ops)), "Failed to receive overlap metadata"
             
         for sender_rank, buffer in overlap_buffers.items():
             self.overlaps[sender_rank] = WeightData(buffer.cpu().numpy().tobytes())
@@ -222,7 +197,7 @@ class WeightReceiver:
             if controller_socket in socks:
                 msg = controller_socket.recv_string()
                 data = json.loads(msg)
-                req_type = data.get("type")
+                req_type = data.pop("type")
                 if req_type == METADATA_REQUEST:
                     self._handle_metadata_request(controller_socket)
                 elif req_type == CONNECT_REQUEST:
@@ -321,7 +296,7 @@ class WeightReceiverController:
         return sorted(results, key=lambda r: r.get("rank", -1))
 
 
-    async def connect(self, request: ConnectRequest):
+    async def connect(self, request: dict[str, Any]):
         """Forward connection info to each worker, wait for acks, then return.
 
         Each worker is assigned rank ``request.base_rank + worker_index``.
@@ -329,15 +304,9 @@ class WeightReceiverController:
         so this endpoint returns as soon as all workers have the info.
         """
         for idx, identity in enumerate(self._receiver_identities):
-            connect_msg_bytes = json.dumps({
+            connect_msg_bytes = json.dumps(request.copy() | {
                 "type": CONNECT_REQUEST,
-                "master_address": request.master_address,
-                "master_port": request.master_port,
-                "rank": request.base_rank + idx,
-                "world_size": request.world_size,
-                "group_name": request.group_name,
-                "sender_world_size": request.sender_world_size,
-                "backend": request.backend,
+                "rank": request["rank"] + idx,
             }).encode("utf-8")
             self._router_socket.send_multipart([identity, connect_msg_bytes])
 

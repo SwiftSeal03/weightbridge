@@ -6,7 +6,7 @@ engine and worker ``init`` path.
 
 import threading
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Callable
 
 import ray
@@ -27,7 +27,6 @@ class EngineArgs:
     rollout_port: int
     rollout_scheduling_strategy: NodeAffinitySchedulingStrategy
     num_rollout_workers: int
-    rollout_controller_ipc_name: str
     rollout_metadata_generator: MetadataGenerator
 
     trainer_host: str
@@ -37,6 +36,7 @@ class EngineArgs:
     trainer_metadata_generator: MetadataGenerator
 
     tensor_generator: TensorGenerator
+    rollout_controller_ipc_name: str = field(init=False)
 
 
 @ray.remote(num_gpus=1, num_cpus=1)
@@ -123,10 +123,12 @@ class TrainerWorker:
             receiver_urls=[f"http://{args.rollout_host}:{args.rollout_port}"],
             rank=rank,
             world_size=args.num_trainer_workers,
+            master_addr=args.trainer_host,
+            master_port=args.trainer_pg_port,
         )
 
     def send_weights(self):
-        self.sender.connect(self.metadata, sender_init_method=f"tcp://{self.args.trainer_host}:{self.args.trainer_pg_port}")
+        self.sender.connect(self.metadata)
         self.sender.send(self.state_dict)
 
 

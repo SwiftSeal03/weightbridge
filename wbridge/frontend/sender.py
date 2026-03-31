@@ -11,18 +11,16 @@ class WeightSender:
         receiver_urls: list[str],
         rank: int,
         world_size: int,
+        master_addr: str,
+        master_port: int,
     ):
         self.transfer_mode = transfer_mode
         self.receiver_urls = receiver_urls
-        if transfer_mode == "gpu_direct":
-            self.sender = GPUDirectSender(receiver_urls, rank=rank, world_size=world_size)
-        elif transfer_mode == "cpu_direct":
-            self.sender = CPUDirectSender(receiver_urls, rank=rank, world_size=world_size)
-        else:
-            raise ValueError(f"Invalid transfer mode: {transfer_mode}")
+        sender_cls = GPUDirectSender if transfer_mode == "gpu_direct" else CPUDirectSender
+        self.sender = sender_cls(receiver_urls, rank=rank, world_size=world_size, master_addr=master_addr, master_port=master_port)
 
-    def connect(self, sender_metadata: WeightData, sender_init_method: str) -> None:
-        self.sender.connect(sender_metadata, sender_init_method=sender_init_method)
+    def connect(self, sender_metadata: WeightData) -> None:
+        self.sender.connect(sender_metadata)
 
     def send(self, state_dict: dict[str, torch.Tensor]) -> None:
         self.sender.send(state_dict)

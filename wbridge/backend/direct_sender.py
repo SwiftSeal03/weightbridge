@@ -18,11 +18,14 @@ class DirectSender:
         receiver_urls: list[str],
         rank: int,
         world_size: int,
+        master_addr: str,
+        master_port: int,
     ):
         self.rank = rank
         self.world_size = world_size
         self.receiver_urls = receiver_urls
-        
+        self._sender_coord_init_method = f"tcp://{master_addr}:{master_port}"
+
         self.connected = False
         self.group: dist.ProcessGroup | None = None
         self.overlaps: dict[int, WeightData] = {}
@@ -75,12 +78,18 @@ class DirectSender:
         return WeightData(new_meta_dict)
 
 
-    def connect(self, sender_metadata: WeightData, sender_init_method: str) -> None:
+    def connect(self, sender_metadata: WeightData) -> None:
+        """Join receivers over NCCL after a short-lived Gloo group for sender coordination.
+
+        The Gloo process group uses ``tcp://{master_addr}:{master_port}`` from
+        :meth:`__init__` so all sender ranks rendezvous before rank 0 drives
+        HTTP metadata/connect and broadcasts rendezvous info for the main group.
+        """
         sender_coord_group = None
         if self.world_size > 1:
             sender_coord_group = init_custom_process_group(
                 backend="gloo",
-                init_method=sender_init_method,
+                init_method=self._sender_coord_init_method,
                 world_size=self.world_size,
                 rank=self.rank,
                 group_name="wbridge_sender_coord",
@@ -115,13 +124,12 @@ class DirectSender:
                 resp = requests.post(
                     f"{url}/wbridge/connect",
                     json={
-                        "master_address": master_address,
-                        "master_port": master_port,
-                        "base_rank": base_rank,
+                        "backend": self.backend,
+                        "init_method": f"tcp://{master_address}:{master_port}",
+                        "rank": base_rank,
                         "world_size": total_world_size,
                         "group_name": group_name,
                         "sender_world_size": self.world_size,
-                        "backend": self.backend,
                     },
                 )
                 resp.raise_for_status()
