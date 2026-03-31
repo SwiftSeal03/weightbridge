@@ -1,21 +1,20 @@
 """Minimal WeightBridge example: Ray node pinning + GPU-direct transfer.
 
 Uses Ray to place the trainer (2 sender workers) and rollout engine
-(2 receiver workers) on separate nodes (alive Ray nodes ``[0]`` and ``[1]``),
-each requiring 2 GPUs.
+(1 controller + 2 receiver workers) on separate nodes (alive Ray nodes
+``[0]`` and ``[1]``).
 
 Architecture::
 
     driver  (ray.init, first alive node = rollout, second = trainer)
     │
-    ├── RolloutEngine  (Ray actor pinned to rollout node IP)
-    │   ├── FastAPI + WeightReceiverController
-    │   ├── receiver_worker 0  (child process, WeightReceiver)
-    │   └── receiver_worker 1  (child process, WeightReceiver)
+    ├── RolloutEngine  (Ray actor, no GPU — HTTP server + controller)
     │
-    └── TrainerWorker × NUM_SENDER_WORKERS  (Ray actors pinned to trainer node IP)
-        └── torch.distributed (NCCL) + WeightSender.connect / .send
-            (GPUDirectSender → NCCL isend to receivers)
+    ├── RolloutWorker × NUM_RECEIVER_WORKERS  (Ray actors, 1 GPU each)
+    │   └── WeightReceiver (NCCL recv) + local verification
+    │
+    └── TrainerWorker × NUM_SENDER_WORKERS  (Ray actors, 1 GPU each)
+        └── WeightSender (NCCL isend to receivers)
 
 Tensors (``float32``, shape ``[ROWS, COLS]`` = ``[4, 8]``):
 
@@ -34,8 +33,6 @@ Usage::
 """
 
 import logging
-import multiprocessing as mp
-import os
 import threading
 import time
 
@@ -45,11 +42,9 @@ import uvicorn
 from fastapi import FastAPI
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-from wbridge.utils.distributed import get_local_ip
 from wbridge import WeightData, WeightReceiver, WeightReceiverController, WeightSender
-from wbridge.utils.data import shards_iterator, shards_to_numel
 
-from utils import init_ray_and_get_rollout_trainer
+from utils import init_ray_and_get_rollout_trainer, build_local_tensors
 
 logger = logging.getLogger("example")
 
@@ -115,129 +110,85 @@ def _build_receiver_metadata(rank: int) -> WeightData:
     return WeightData(meta_dict)
 
 
-def _build_local_tensors(meta: WeightData, tensors: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
-    """Create tensor shards from either provided tensors or zeros"""
-    local_tensors = {}
-    for name, shards, dtype in meta:
-        slices = []
-        local_tensors[name] = torch.zeros(shards_to_numel(shards), dtype=dtype, device=DEVICE)
-        if name in tensors:
-            for start, end, shard in shards_iterator(meta[name]):
-                slices = [slice(l, r) for l, r, _ in shard]
-                local_tensors[name][start:end] = tensors[name][tuple(slices)].reshape(-1)
-    return local_tensors
+# ── Rollout engine + workers (Ray actors) ─────────────────────────
 
-
-def _assemble_rollout_shards(shards: list[dict[str, torch.Tensor]]) -> dict[str, torch.Tensor]:
-    """Stack row shards from receivers 0..1 into full ``[ROWS, COLS]`` tensors."""
-    mid = ROWS // 2
-    assert len(shards) == NUM_RECEIVER_WORKERS
-    out: dict[str, torch.Tensor] = {}
-    for name in shards[0]:
-        top = shards[0][name].reshape(mid, COLS)
-        bot = shards[1][name].reshape(ROWS - mid, COLS)
-        out[name] = torch.cat([top, bot], dim=0)
-    return out
-
-
-def _verify_rollout_against_expected(
-    expected: dict[str, torch.Tensor], shards: list[dict[str, torch.Tensor]]
-) -> None:
-    """Assemble rollout-side shards and check they match the driver tensors."""
-    assembled = _assemble_rollout_shards(shards)
-    for name, exp in expected.items():
-        assert name in assembled, f"missing {name} on rollout"
-        got = assembled[name]
-        exp_cpu = exp.detach().cpu().float()
-        got_cpu = got.detach().cpu().float()
-        if not torch.allclose(exp_cpu, got_cpu, rtol=1e-5, atol=1e-6):
-            max_err = (exp_cpu - got_cpu).abs().max().item()
-            raise AssertionError(
-                f"{name}: rollout assembled tensor differs from expected (max abs err {max_err})"
-            )
-    logger.info(
-        "Verified rollout tensors: all %d names match driver ground truth (allclose).",
-        len(expected),
-    )
-
-
-# ── Rollout engine (Ray actor) ────────────────────────────────────
-
-
-def _receiver_worker(
-    ipc_name: str, rank: int, gpu_id: str, ready_event: mp.Event, shard_queue: mp.Queue
-):
-    """Child process entry — creates a WeightReceiver and blocks."""
-    os.environ["CUDA_VISIBLE_DEVICES"] = gpu_id
-    metadata = _build_receiver_metadata(rank)
-    state_dict = _build_local_tensors(metadata, {})
-    receiver = WeightReceiver(
-        controller_ipc_name=ipc_name,
-        rank=rank,
-        metadata=metadata
-    )
-    ready_event.set()
-    for _ in range(100):
-        if receiver.request_update(state_dict):
-            print(f"Receiver worker {rank} received weights")
-            cpu_shards = {k: v.detach().cpu().clone() for k, v in state_dict.items()}
-            shard_queue.put(cpu_shards)
-            break
-        print(f"Receiver worker {rank} waiting for weights")
-        time.sleep(2)
-    receiver.stop()
 
 @ray.remote
-class RolloutEngine:
-    """Ray actor that hosts the receiver-side HTTP server and spawns
-    receiver worker child processes (analogous to SGLang schedulers)."""
+class RolloutWorker:
+    """Ray actor — one per receiver GPU.  Receives weights via NCCL and
+    verifies them against pre-loaded ground truth."""
 
-    def __init__(self):
-        start_time = time.time()
-        app = FastAPI()
-        self.controller = WeightReceiverController(app)
-
-        gpu_ids = os.environ.get("CUDA_VISIBLE_DEVICES", "").split(",")
-        assert len(gpu_ids) >= NUM_RECEIVER_WORKERS, (
-            f"Need {NUM_RECEIVER_WORKERS} GPUs but CUDA_VISIBLE_DEVICES={gpu_ids}"
+    def __init__(self, ipc_name: str, rank: int):
+        self.rank = rank
+        self.metadata = _build_receiver_metadata(rank)
+        self.receiver = WeightReceiver(
+            controller_ipc_name=ipc_name,
+            rank=rank,
+            metadata=self.metadata,
         )
-
-        ready_events = [mp.Event() for _ in range(NUM_RECEIVER_WORKERS)]
-        self._shard_queues = [mp.Queue(maxsize=1) for _ in range(NUM_RECEIVER_WORKERS)]
-        for rank in range(NUM_RECEIVER_WORKERS):
-            p = mp.Process(
-                target=_receiver_worker,
-                args=(
-                    self.controller.ipc_name,
-                    rank,
-                    gpu_ids[rank],
-                    ready_events[rank],
-                    self._shard_queues[rank],
-                ),
-                daemon=True,
-            )
-            p.start()
-        self.controller.set_worker_num(NUM_RECEIVER_WORKERS)
-
-        self._host = get_local_ip()
-        self._port = ROLLOUT_SERVER_PORT
-        config = uvicorn.Config(app, host=self._host, port=self._port, log_level="warning")
-        server = uvicorn.Server(config)
-        threading.Thread(target=server.run, daemon=True).start()
-        while not server.started:
-            time.sleep(0.1)
-            
-        for ready_event in ready_events:
-            ready_event.wait()
-        
-        print(f"RolloutEngine started in {time.time() - start_time:.2f} seconds")
+        self.expected: dict[str, torch.Tensor] | None = None
 
     def ready(self):
         return True
 
-    def gather_received_shards(self) -> list[dict[str, torch.Tensor]]:
-        """CPU tensor dicts per receiver worker, in rank order, after a completed receive."""
-        return [q.get(timeout=120) for q in self._shard_queues]
+    def set_expected(self, tensors: dict[str, torch.Tensor]):
+        """Slice the full ground-truth tensors into this worker's expected shard."""
+        self.expected = build_local_tensors(self.metadata, tensors, device=DEVICE)
+
+    def receive_and_verify(self) -> dict:
+        """Block until weights arrive, then verify against expected shard."""
+        state_dict = build_local_tensors(self.metadata, {}, device=DEVICE)
+        for _ in range(200):
+            if self.receiver.request_update(state_dict):
+                break
+            time.sleep(0.5)
+        else:
+            return {"rank": self.rank, "ok": False, "detail": "timeout waiting for weights"}
+
+        if self.expected is None:
+            return {"rank": self.rank, "ok": True, "detail": "no expected tensors set, skipped"}
+
+        for name, exp in self.expected.items():
+            got = state_dict[name]
+            if not torch.allclose(exp, got, rtol=1e-5, atol=1e-6):
+                max_err = float((exp - got).abs().max().item())
+                return {
+                    "rank": self.rank, "ok": False,
+                    "detail": f"{name}: max abs err {max_err}",
+                }
+        return {"rank": self.rank, "ok": True, "detail": "all tensors match"}
+
+
+@ray.remote
+class RolloutEngine:
+    """Ray actor that hosts the receiver-side HTTP server and the
+    WeightReceiverController.  Workers are separate RolloutWorker actors."""
+
+    def __init__(self, addr, port):
+        app = FastAPI()
+        self.controller = WeightReceiverController(app)
+
+        config = uvicorn.Config(app, host=addr, port=port, log_level="warning")
+        server = uvicorn.Server(config)
+        threading.Thread(target=server.run, daemon=True).start()
+        while not server.started:
+            time.sleep(0.1)
+
+        self._workers: list = []
+
+    def get_ipc_name(self) -> str:
+        return self.controller.ipc_name
+
+    def set_workers(self, workers: list):
+        self._workers = workers
+        self.controller.set_worker_num(len(workers))
+
+    def ready(self):
+        return True
+
+    def gather_results(self) -> list[dict]:
+        results = ray.get([w.receive_and_verify.remote() for w in self._workers])
+        return sorted(results, key=lambda r: r["rank"])
 
 
 # ── Trainer worker (Ray actor) ────────────────────────────────────
@@ -256,7 +207,7 @@ class TrainerWorker:
 
     def send_weights(self, tensors: dict, receiver_url: str):
         meta = _build_sender_metadata(self.rank)
-        local_tensors = _build_local_tensors(meta, tensors)
+        local_tensors = build_local_tensors(meta, tensors, device=DEVICE)
 
         sender = WeightSender(
             "gpu_direct", receiver_urls=[receiver_url],
@@ -282,45 +233,58 @@ def main():
     logger.info("Rollout node IP: %s", rollout_ip)
     logger.info("Trainer node IP: %s", trainer_ip)
 
-    # 1. Start rollout engine on the rollout node
+    rollout_sched = NodeAffinitySchedulingStrategy(node_id=rollout_node_id, soft=False)
+    trainer_sched = NodeAffinitySchedulingStrategy(node_id=trainer_node_id, soft=False)
+
+    # 1. Start rollout engine (HTTP server only, no GPUs needed)
     rollout_engine = RolloutEngine.options(
         num_cpus=1,
-        num_gpus=NUM_RECEIVER_WORKERS,
-        scheduling_strategy=NodeAffinitySchedulingStrategy(
-            node_id=rollout_node_id,
-            soft=False,
-        ),
-    ).remote()
+        scheduling_strategy=rollout_sched,
+    ).remote(rollout_ip, ROLLOUT_SERVER_PORT)
+    ipc_name = ray.get(rollout_engine.get_ipc_name.remote())
 
-    # 2. Create tensors in the driver and dispatch to trainer workers
+    # 2. Start rollout workers (one Ray actor per receiver GPU)
+    rollout_workers = [
+        RolloutWorker.options(
+            num_cpus=1,
+            num_gpus=1,
+            scheduling_strategy=rollout_sched,
+        ).remote(ipc_name, rank)
+        for rank in range(NUM_RECEIVER_WORKERS)
+    ]
+    ray.get([w.ready.remote() for w in rollout_workers])
+    ray.get(rollout_engine.set_workers.remote(rollout_workers))
+
+    # 3. Create ground-truth tensors and distribute to rollout workers
     tensors = {
         "uneven_weight": torch.randn(ROWS, COLS, dtype=DTYPE),
         "col_weight": torch.randn(ROWS, COLS, dtype=DTYPE),
         "dup_weight": torch.randn(ROWS, COLS, dtype=DTYPE),
     }
     logger.info("Created 3 tensors (each [%d, %d] %s)", ROWS, COLS, DTYPE)
+    ray.get([w.set_expected.remote(tensors) for w in rollout_workers])
 
-    workers = [
+    # 4. Start trainer workers and send weights
+    trainer_workers = [
         TrainerWorker.options(
             num_cpus=1,
             num_gpus=1,
-            scheduling_strategy=NodeAffinitySchedulingStrategy(
-                node_id=trainer_node_id,
-                soft=False,
-            ),
+            scheduling_strategy=trainer_sched,
         ).remote(NUM_SENDER_WORKERS, rank, trainer_ip, SENDER_PG_PORT)
         for rank in range(NUM_SENDER_WORKERS)
     ]
 
-    # 3. All trainer workers send weights
     receiver_url = f"http://{rollout_ip}:{ROLLOUT_SERVER_PORT}"
     ray.get(rollout_engine.ready.remote())
-    ray.get([w.send_weights.remote(tensors, receiver_url) for w in workers])
+    ray.get([w.send_weights.remote(tensors, receiver_url) for w in trainer_workers])
 
-    rollout_shards = ray.get(rollout_engine.gather_received_shards.remote())
-    _verify_rollout_against_expected(tensors, rollout_shards)
+    # 5. Each rollout worker verifies its own shard; engine gathers results
+    results = ray.get(rollout_engine.gather_results.remote())
+    for r in results:
+        if not r["ok"]:
+            raise AssertionError(f"RolloutWorker rank {r['rank']} failed: {r['detail']}")
+    logger.info("All %d rollout workers verified their shards independently.", len(results))
 
-    logger.info("All senders finished. Done.")
     ray.shutdown()
 
 

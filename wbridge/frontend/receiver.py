@@ -245,13 +245,12 @@ class WeightReceiver:
             sender_rank: torch.zeros(overlap.total_nbytes(), dtype=torch.uint8, device=self.device)
             for sender_rank, overlap in self.overlaps.items()
         }
-        if chunks:
-            ops = [
-                dist.P2POp(dist.irecv, chunk, sender_rank, self.group)
-                for sender_rank, chunk in chunks.items()
-            ]
-            for h in dist.batch_isend_irecv(ops):
-                h.wait()
+        ops = [
+            dist.P2POp(dist.irecv, chunk, sender_rank, self.group)
+            for sender_rank, chunk in chunks.items()
+        ]
+        for h in dist.batch_isend_irecv(ops):
+            h.wait()
         
         self.metadata(self.state_dict)[self.overlaps] = chunks
 
