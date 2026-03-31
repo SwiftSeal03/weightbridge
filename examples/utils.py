@@ -33,7 +33,7 @@ def generate_local_tensors(
     """
     full_tensors: dict[str, torch.Tensor] = {}
     if seed is not None:
-        g = torch.Generator().manual_seed(seed)
+        g = torch.Generator(device=device).manual_seed(seed)
         for name, shards, dtype in metadata:
             shape = tuple(w for _, _, w in shards[0])
             full_tensors[name] = torch.randn(*shape, dtype=dtype, device=device, generator=g)
