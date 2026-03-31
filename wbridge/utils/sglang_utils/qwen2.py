@@ -119,7 +119,7 @@ def convert_split_qwen2_to_hf(config: Qwen2Config, name: str, param: torch.Tenso
             return [(name, param, None)]
             
             
-def convert_sglang_qwen2_to_wb(
+def convert_qwen2_to_wb(
     config: Qwen2Config,
     state_dict: Dict[str, torch.Tensor],
 ) -> WeightData:

@@ -80,7 +80,7 @@ def convert_split_qwen2_to_hf(args, name, param):
     raise ValueError(f"Unknown parameter name: {name}")
 
 
-def convert_qwen2_to_wb_and_tensors(
+def convert_qwen2_to_wb(
     args, named_tensors: list[tuple[str, torch.nn.Parameter]]
 ) -> tuple[WeightData, dict[str, torch.Tensor]]:
     """HF-style metadata (``WeightData``) and matching local tensor shards for send."""

@@ -9,7 +9,7 @@ import torch
 
 from wbridge.utils.data import WeightData
 
-from .qwen2 import Qwen2Config, convert_sglang_qwen2_to_wb
+from .qwen2 import Qwen2Config, convert_qwen2_to_wb
 
 
 def convert_to_wb(
@@ -45,7 +45,7 @@ def convert_to_wb(
     model_type = str(model_type).lower()
     if model_type in ("qwen2", "qwen3"):
         config = Qwen2Config.from_model_config(model_config, tp_rank, tp_size, attn_tp_rank, attn_tp_size)
-        return convert_sglang_qwen2_to_wb(
+        return convert_qwen2_to_wb(
             config=config,
             state_dict=state_dict,
         )
