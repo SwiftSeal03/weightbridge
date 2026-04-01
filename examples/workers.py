@@ -54,20 +54,19 @@ class RolloutWorker:
             rank=rank,
             metadata=self.metadata,
         )
-
-    def receive_and_verify(self) -> dict:
-        """Block until weights arrive, then verify against expected shard."""
-        recv_state_dict = {name: t.clone() for name, t in self.state_dict.items()}
-        for _ in range(10):
-            if self.receiver.request_update(recv_state_dict):
+        
+    def recv_weights(self) -> None:
+        self.recv_state_dict = {name: torch.zeros_like(t) for name, t in self.state_dict.items()}
+        for _ in range(100):
+            if self.receiver.request_update(self.recv_state_dict):
                 break
-            time.sleep(1)
-        else:
-            return {"rank": self.rank, "ok": False, "detail": "timeout waiting for weights"}
+            time.sleep(0.2)
 
+    def verify(self) -> dict:
+        """Block until weights arrive, then verify against expected shard."""
         if all(
             torch.allclose(exp, got, rtol=1e-5, atol=1e-6) 
-            for exp, got in zip(self.state_dict.values(), recv_state_dict.values(), strict=True)
+            for exp, got in zip(self.state_dict.values(), self.recv_state_dict.values(), strict=True)
         ):
             return {"rank": self.rank, "ok": True, "detail": "all tensors match"}
         else:
@@ -99,8 +98,11 @@ class RolloutEngine:
         
         self.controller.set_worker_num(n)
 
-    def receive_and_verify_all(self) -> str:
-        results = ray.get([w.receive_and_verify.remote() for w in self._workers])
+    def recv_weights(self) -> None:
+        ray.get([w.recv_weights.remote() for w in self._workers])
+
+    def verify_all(self) -> str:
+        results = ray.get([w.verify.remote() for w in self._workers])
         results = sorted(results, key=lambda r: r["rank"])
         for r in results:
             if not r["ok"]:

@@ -67,7 +67,7 @@ class WeightReceiver:
             proc.join()
 
 
-    def request_update(self, state_dict: dict[str, torch.Tensor]) -> dict[str, Any]:
+    def request_update(self, state_dict: dict[str, torch.Tensor]) -> bool:
         """Scheduler REQ/REP: trigger weight receive when state is AWAITING_SCHEDULER_UPDATE."""
         self.state_dict = state_dict # Receive to this state_dict
         self.socket.send_string(UPDATE_REQUEST)
