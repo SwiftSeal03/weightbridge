@@ -162,25 +162,21 @@ class DirectSender:
         
         # Compute overlap with each receiver and send the sizes of the overlap metadata.
         # Always send a size (0 when no overlap) so receivers don't block on a recv that never comes.
-        size_ops: list[dist.P2POp] = []
-        for r_rank, r_meta in receiver_metas:
-            overlap = WeightData.compute_overlap(sender_metadata, r_meta)
-            if overlap:
-                self.overlaps[r_rank] = overlap
-                size_bytes = len(bytes(overlap))
-                byte_size = torch.tensor([size_bytes], dtype=torch.long, device=self.device)
-            else:
-                size_bytes = 0
-                byte_size = torch.tensor([size_bytes], dtype=torch.long, device=self.device)
-            size_ops.append(dist.P2POp(dist.isend, byte_size, r_rank, self.group))
+        self.overlaps = {
+            r_rank: overlap
+            for r_rank, r_meta in receiver_metas if (overlap := WeightData.compute_overlap(sender_metadata, r_meta))
+        }
+        size_ops = [
+            dist.P2POp(dist.isend, size_tensor[i:i+1], i, self.group)
+            for i in range(self.world_size) if overlap_sizes[i]
+        ]
         assert all(h.wait() for h in dist.batch_isend_irecv(size_ops)), "Failed to send overlap sizes"
             
         # Send the overlap metadata bytes to the receivers
-        meta_ops: list[dist.P2POp] = []
-        for r_rank, overlap in self.overlaps.items():
-            overlap_bytes = bytearray(bytes(overlap))
-            overlap_bytes = torch.frombuffer(overlap_bytes, dtype=torch.uint8).to(self.device)
-            meta_ops.append(dist.P2POp(dist.isend, overlap_bytes, r_rank, self.group))
+        meta_ops = [
+            dist.P2POp(dist.isend, torch.frombuffer(bytearray(bytes(overlap)), dtype=torch.uint8).to(self.device), r_rank, self.group)
+            for r_rank, overlap in self.overlaps.items()
+        ]
         assert all(h.wait() for h in dist.batch_isend_irecv(meta_ops)), "Failed to send overlap metadata"
 
         self.connected = True

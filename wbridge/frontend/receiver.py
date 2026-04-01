@@ -108,42 +108,32 @@ class WeightReceiver:
             
         # Initialize the process group (pop keys not accepted by init_custom_process_group)
         sender_world_size = int(data.pop("sender_world_size"))
-        self.device = "cuda" if data["backend"] == "nccl" else "cpu"
+        data["rank"] += self.rank
         self.group = init_custom_process_group(**data)
+        self.device = "cuda" if data["backend"] == "nccl" else "cpu"
 
         # Receive overlap metadata sizes from each sender (0 means no overlap)
-        self.overlaps: dict[int, WeightData] = {}
-        size_tensors = {
-            sender_rank: torch.zeros(1, dtype=torch.long, device=self.device)
-            for sender_rank in range(sender_world_size)
-        }
+        size_tensor = torch.zeros(sender_world_size, dtype=torch.long, device=self.device)
         size_ops = [
-            dist.P2POp(dist.irecv, size_t, sender_rank, self.group)
-            for sender_rank, size_t in size_tensors.items()
+            dist.P2POp(dist.irecv, size_tensor[sender_rank:sender_rank+1], sender_rank, self.group)
+            for sender_rank in range(sender_world_size)
         ]
         assert all(h.wait() for h in dist.batch_isend_irecv(size_ops)), "Failed to receive overlap sizes"
 
-        overlap_buffers: dict[int, torch.Tensor] = {}
-        for sender_rank, size_t in size_tensors.items():
-            if (size := int(size_t.item())) > 0:
-                overlap_buffers[sender_rank] = torch.zeros(size, dtype=torch.uint8, device=self.device)
-
         # Receive overlap metadata bytes only from senders that have overlap
+        self.overlaps = {
+            sender_rank: torch.zeros(size, dtype=torch.uint8, device=self.device)
+            for sender_rank in range(sender_world_size) if (size := int(size_tensor[sender_rank].item())) > 0
+        }
         meta_ops = [
             dist.P2POp(dist.irecv, buffer, sender_rank, self.group)
-            for sender_rank, buffer in overlap_buffers.items()
+            for sender_rank, buffer in self.overlaps.items()
         ]
         assert all(h.wait() for h in dist.batch_isend_irecv(meta_ops)), "Failed to receive overlap metadata"
             
-        for sender_rank, buffer in overlap_buffers.items():
+        for sender_rank, buffer in self.overlaps.items():
             self.overlaps[sender_rank] = WeightData(buffer.cpu().numpy().tobytes())
-
-        logger.info(
-            "Receiver worker %d joined group %s as rank %d "
-            "(world_size=%d, overlaps from %d senders)",
-            self.rank, data["group_name"], data["rank"],
-            data["world_size"], len(self.overlaps),
-        )
+            
         self._state = ReceiverState.CONNECTED
 
 
@@ -304,10 +294,7 @@ class WeightReceiverController:
         so this endpoint returns as soon as all workers have the info.
         """
         for idx, identity in enumerate(self._receiver_identities):
-            connect_msg_bytes = json.dumps(request.copy() | {
-                "type": CONNECT_REQUEST,
-                "rank": request["rank"] + idx,
-            }).encode("utf-8")
+            connect_msg_bytes = json.dumps({"type": CONNECT_REQUEST, **request}).encode("utf-8")
             self._router_socket.send_multipart([identity, connect_msg_bytes])
 
         success = all(resp["status"] == "ack" for resp in self._gather_responses())
