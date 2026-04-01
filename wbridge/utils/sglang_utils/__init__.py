@@ -1,13 +1,13 @@
 """
 SGLang to WeightBridge format conversion.
-Converts SGLang TP-sharded state_dict to WeightData for weight bridging.
+Converts SGLang TP-sharded state_dict to :class:`~wbridge.utils.data.ShardSpec` for weight bridging.
 """
 
 from typing import Any, Dict, Optional
 
 import torch
 
-from wbridge.utils.data import WeightData
+from wbridge.utils.data import ShardSpec
 
 from .qwen2 import Qwen2Config, convert_qwen2_to_wb
 
@@ -19,7 +19,7 @@ def convert_to_wb(
     tp_size: int,
     attn_tp_rank: Optional[int] = None,
     attn_tp_size: Optional[int] = None,
-) -> WeightData:
+) -> ShardSpec:
     """
     Route SGLang state_dict to the appropriate converter based on model type.
 
@@ -32,7 +32,7 @@ def convert_to_wb(
         attn_tp_size: Attention TP size. Defaults to tp_size.
 
     Returns:
-        WeightData with HF-style names and shard metadata.
+        :class:`~wbridge.utils.data.ShardSpec` with HF-style names and shard metadata.
     """
     model_type = getattr(
         getattr(model_config, "hf_config", None),

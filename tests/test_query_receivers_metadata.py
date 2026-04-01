@@ -5,16 +5,16 @@ import time
 from fastapi import FastAPI
 
 from wbridge.frontend import WeightReceiver, WeightReceiverController
-from wbridge.utils.data import WeightData
+from wbridge.utils.data import ShardSpec
 
 
 def test_query_receivers_metadata():
     """`_query_receivers_metadata` returns one dict per worker (rank, metadata, state, …), sorted by rank."""
     app = FastAPI()
-    controller = WeightReceiverController(app, worker_num=0)
+    controller = WeightReceiverController(app)
     controller.set_worker_num(2)
 
-    empty = WeightData(meta_dict={})
+    empty = ShardSpec({})
     receiver0 = WeightReceiver(controller_ipc_name=controller.ipc_name, rank=0, metadata=empty)
     receiver1 = WeightReceiver(controller_ipc_name=controller.ipc_name, rank=1, metadata=empty)
 

@@ -1,7 +1,7 @@
 import ray
 
 import torch
-from wbridge.utils.data import WeightData, shards_iterator, shards_to_numel
+from wbridge.utils.data import ShardSpec, shards_iterator, shards_to_numel
 
 
 def get_ray_nodes():
@@ -22,7 +22,7 @@ def get_ray_nodes():
     )
 
 def generate_local_tensors(
-    metadata: WeightData, device: str, seed: int | None = None,
+    metadata: ShardSpec, device: str, seed: int | None = None,
 ) -> dict[str, torch.Tensor]:
     """Create flattened shard tensors described by *metadata*.
 

@@ -39,7 +39,7 @@ import ray
 import torch
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-from wbridge import WeightData
+from wbridge import ShardSpec
 
 from utils import get_ray_nodes, generate_local_tensors
 from workers import EngineArgs, RolloutEngine, TrainerEngine
@@ -50,7 +50,7 @@ DTYPE = torch.float32
 ROWS, COLS = 4, 8
 
 
-def _build_sender_metadata(rank: int) -> WeightData:
+def _build_sender_metadata(rank: int) -> ShardSpec:
     """Shard metadata for the given sender rank (``connect``)."""
     if rank == 0:
         meta_dict = {
@@ -82,11 +82,11 @@ def _build_sender_metadata(rank: int) -> WeightData:
                 "dtype": DTYPE,
             },
         }
-    return WeightData(meta_dict)
+    return ShardSpec(meta_dict)
 
 
-def _build_receiver_metadata(rank: int) -> WeightData:
-    """Build metadata-only WeightData for a receiver worker."""
+def _build_receiver_metadata(rank: int) -> ShardSpec:
+    """Build metadata-only :class:`~wbridge.ShardSpec` for a receiver worker."""
     mid = ROWS // 2
     if rank == 0:
         shard = [(0, mid, ROWS), (0, COLS, COLS)]
@@ -96,7 +96,7 @@ def _build_receiver_metadata(rank: int) -> WeightData:
         name: {"shard": shard, "dtype": DTYPE}
         for name in ("uneven_weight", "col_weight", "dup_weight")
     }
-    return WeightData(meta_dict)
+    return ShardSpec(meta_dict)
 
 
 def main():

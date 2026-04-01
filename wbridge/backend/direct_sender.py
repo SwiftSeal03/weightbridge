@@ -6,7 +6,7 @@ import requests
 import torch
 import torch.distributed as dist
 
-from wbridge.utils.data import WeightData
+from wbridge.utils.data import ShardSpec
 from wbridge.utils.distributed import init_custom_process_group, get_local_ip, get_full_group_port
 
 logger = logging.getLogger(__name__)
@@ -28,13 +28,13 @@ class DirectSender:
 
         self.connected = False
         self.group: dist.ProcessGroup | None = None
-        self.overlaps: dict[int, WeightData] = {}
-        self.metadata: WeightData | None = None
+        self.overlaps: dict[int, ShardSpec] = {}
+        self.metadata: ShardSpec | None = None
         self.backend = None
         self.device = None
             
 
-    def connect(self, sender_metadata: WeightData) -> None:
+    def connect(self, sender_metadata: ShardSpec) -> None:
         """Join receivers over NCCL after a short-lived Gloo group for sender coordination.
 
         The Gloo process group uses ``tcp://{master_addr}:{master_port}`` from
@@ -79,7 +79,7 @@ class DirectSender:
         
         self.overlaps = {
             rank: overlap for rank, meta in enumerate(all_metas) 
-            if rank >= self.world_size and (overlap := WeightData.compute_overlap(self.metadata, meta))
+            if rank >= self.world_size and (overlap := ShardSpec.compute_overlap(self.metadata, meta))
         }
         self.connected = True
 

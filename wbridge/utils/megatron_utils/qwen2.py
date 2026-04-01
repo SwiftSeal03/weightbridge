@@ -8,7 +8,7 @@ import re
 import torch
 
 from megatron.core import mpu
-from wbridge.utils.data import WeightData
+from wbridge.utils.data import ShardSpec
 
 def convert_split_qwen2_to_hf(args, name, param):
     if name == "module.module.embedding.word_embeddings.weight":
@@ -82,8 +82,8 @@ def convert_split_qwen2_to_hf(args, name, param):
 
 def convert_qwen2_to_wb(
     args, named_tensors: list[tuple[str, torch.nn.Parameter]]
-) -> tuple[WeightData, dict[str, torch.Tensor]]:
-    """HF-style metadata (``WeightData``) and matching local tensor shards for send."""
+) -> tuple[ShardSpec, dict[str, torch.Tensor]]:
+    """HF-style :class:`~wbridge.utils.data.ShardSpec` and matching local tensor shards for send."""
     meta_dict: dict[str, dict] = {}
     tensors: dict[str, torch.Tensor] = {}
     tprk = mpu.get_tensor_model_parallel_rank()
@@ -112,4 +112,4 @@ def convert_qwen2_to_wb(
             meta_dict[hf_name] = {"shard": shard, "dtype": hf_param.dtype}
             tensors[hf_name] = t
 
-    return WeightData(meta_dict), tensors
+    return ShardSpec(meta_dict), tensors

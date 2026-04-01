@@ -13,7 +13,7 @@ import zmq
 from fastapi import FastAPI, APIRouter
 from fastapi.responses import JSONResponse
 
-from wbridge.utils.data import WeightData
+from wbridge.utils.data import ShardSpec
 from wbridge.utils.distributed import init_custom_process_group
 
 logger = logging.getLogger(__name__)
@@ -38,7 +38,7 @@ class WeightReceiver:
         self,
         controller_ipc_name: str,
         rank: int,
-        metadata: WeightData,
+        metadata: ShardSpec,
     ):
         self.controller_ipc_name = controller_ipc_name
         self.scheduler_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
@@ -66,6 +66,10 @@ class WeightReceiver:
             proc.terminate()
             proc.join()
 
+
+    def is_weights_ready(self) -> bool:
+        """True after the trainer has POSTed ``/wbridge/receive``; then call :meth:`request_update`."""
+        return self._state == ReceiverState.AWAITING_SCHEDULER_UPDATE
 
     def request_update(self, state_dict: dict[str, torch.Tensor]) -> bool:
         """Scheduler REQ/REP: trigger weight receive when state is AWAITING_SCHEDULER_UPDATE."""
@@ -100,7 +104,7 @@ class WeightReceiver:
         dist.all_gather_object(all_metas, self.metadata, group=self.group)
         self.overlaps = {
             rank: overlap for rank, meta in enumerate(all_metas) 
-            if rank < sender_world_size and (overlap := WeightData.compute_overlap(meta, self.metadata))
+            if rank < sender_world_size and (overlap := ShardSpec.compute_overlap(meta, self.metadata))
         }
             
         self._state = ReceiverState.CONNECTED
@@ -172,7 +176,7 @@ class WeightReceiver:
 
 
     def _receive_weights(self) -> None:
-        """Receive overlap bytes from each sender, unpack into ``state_dict`` via :class:`WeightTensorBridge`."""
+        """Receive overlap bytes from each sender, unpack into ``state_dict`` via :class:`BoundShardSpec`."""
         chunks = {
             sender_rank: torch.zeros(overlap.total_nbytes(), dtype=torch.uint8, device=self.device)
             for sender_rank, overlap in self.overlaps.items()

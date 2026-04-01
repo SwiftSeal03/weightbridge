@@ -1,7 +1,7 @@
 """
 Qwen2/Qwen3 SGLang state_dict to WeightBridge format conversion.
 Mirrors wbridge/utils/megatron_utils/qwen2.py structure; converts SGLang's
-TP-sharded state_dict to WeightData with HF-style names and shard metadata.
+TP-sharded state_dict to :class:`~wbridge.utils.data.ShardSpec` with HF-style names and shard metadata.
 
 SGLang partitioning (from sglang/srt/models/qwen2.py, qwen3.py, layers/linear.py):
 - Column parallel (shard dim 0): qkv_proj, gate_up_proj, embed_tokens, lm_head
@@ -15,7 +15,7 @@ from typing import Any, Dict, List, Optional, Tuple
 
 import torch
 
-from wbridge.utils.data import WeightData
+from wbridge.utils.data import ShardSpec
 
 import logging
 logger = logging.getLogger(__name__)
@@ -122,9 +122,9 @@ def convert_split_qwen2_to_hf(config: Qwen2Config, name: str, param: torch.Tenso
 def convert_qwen2_to_wb(
     config: Qwen2Config,
     state_dict: Dict[str, torch.Tensor],
-) -> WeightData:
+) -> ShardSpec:
     """
-    Convert SGLang Qwen2/Qwen3 state_dict to WeightData.
+    Convert SGLang Qwen2/Qwen3 state_dict to :class:`~wbridge.utils.data.ShardSpec`.
     """
     out_meta_dict: Dict[str, Dict] = {}
 
@@ -170,4 +170,4 @@ def convert_qwen2_to_wb(
 
             out_meta_dict[name] = {"shard": shard, "dtype": param.dtype}
 
-    return WeightData(out_meta_dict)
+    return ShardSpec(out_meta_dict)

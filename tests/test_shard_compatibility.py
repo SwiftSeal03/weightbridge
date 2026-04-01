@@ -1,8 +1,8 @@
-"""Tests for _check_shard_compatibility, WeightData.compute_overlap, and pack_for."""
+"""Tests for _check_shard_compatibility, ShardSpec.compute_overlap, and BoundShardSpec pack/unpack."""
 
 import torch
 
-from wbridge.utils.data import WeightData, _check_shard_compatibility
+from wbridge.utils.data import ShardSpec, _check_shard_compatibility
 
 
 # ---------------------------------------------------------------------------
@@ -10,8 +10,8 @@ from wbridge.utils.data import WeightData, _check_shard_compatibility
 # ---------------------------------------------------------------------------
 
 def _make_meta(shard, dtype=torch.float32):
-    """Single-entry metadata-only WeightData."""
-    return WeightData({
+    """Single-entry metadata-only :class:`~wbridge.utils.data.ShardSpec`."""
+    return ShardSpec({
         "weight": {"shard": shard, "dtype": dtype},
     })
 
@@ -314,7 +314,7 @@ class TestComputeOverlap:
         r_shard = [(2, 4, 4), (2, 5, 6)]
         sender = _make_meta(s_shard, dtype)
         receiver = _make_meta(r_shard, dtype)
-        overlap = WeightData.compute_overlap(sender, receiver)
+        overlap = ShardSpec.compute_overlap(sender, receiver)
         assert "weight" in overlap.meta_dict
         o_shard = overlap["weight"]["shard"]
         assert o_shard == [(2, 3, 4), (2, 5, 6)]
@@ -326,12 +326,12 @@ class TestComputeOverlap:
         r_shard = [(2, 4, 4), (0, 6, 6)]
         sender = _make_meta(s_shard, dtype)
         receiver = _make_meta(r_shard, dtype)
-        overlap = WeightData.compute_overlap(sender, receiver)
+        overlap = ShardSpec.compute_overlap(sender, receiver)
         assert len(overlap.meta_dict) == 0
 
 
 # ---------------------------------------------------------------------------
-# pack_for / tensors_from_flat
+# BoundShardSpec pack / unpack via __getitem__ / __setitem__
 # ---------------------------------------------------------------------------
 
 class TestPackFor:
@@ -340,8 +340,9 @@ class TestPackFor:
         shard = [(0, 4, 4), (0, 6, 6)]
         sender = _make_meta(shard, dtype)
         receiver = _make_meta(shard, dtype)
-        overlap = WeightData.compute_overlap(sender, receiver)
+        overlap = ShardSpec.compute_overlap(sender, receiver)
         t = _tensor_for_shard(shard, dtype)
-        packed = WeightData.pack_for(sender, {"weight": t}, overlap)
-        out = overlap.tensors_from_flat(packed)
-        assert torch.equal(out["weight"], t)
+        packed = sender({"weight": t})[{0: overlap}][0]
+        t_out = torch.zeros_like(t)
+        receiver({"weight": t_out})[{0: overlap}] = {0: packed}
+        assert torch.equal(t_out, t)

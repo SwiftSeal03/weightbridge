@@ -15,10 +15,10 @@ import uvicorn
 from fastapi import FastAPI
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-from wbridge import WeightData, WeightReceiver, WeightReceiverController, WeightSender
+from wbridge import ShardSpec, WeightReceiver, WeightReceiverController, WeightSender
 
-MetadataGenerator = Callable[[int], WeightData]
-TensorGenerator = Callable[[WeightData], dict[str, torch.Tensor]]
+MetadataGenerator = Callable[[int], ShardSpec]
+TensorGenerator = Callable[[ShardSpec], dict[str, torch.Tensor]]
 
 
 @dataclass

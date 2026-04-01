@@ -2,7 +2,8 @@
 
 from wbridge.frontend import WeightReceiver, WeightSender, WeightReceiverController
 from wbridge.utils.data import (
-    WeightData,
+    BoundShardSpec,
+    ShardSpec,
     dtype_str_to_torch,
     dtype_to_str,
 )
@@ -10,7 +11,8 @@ from wbridge.utils.data import (
 __all__ = [
     "WeightReceiver",
     "WeightSender",
-    "WeightData",
+    "ShardSpec",
+    "BoundShardSpec",
     "WeightReceiverController",
     "dtype_str_to_torch",
     "dtype_to_str",

@@ -78,7 +78,7 @@ def _sanity_check(name: str, shards: Shards, dtype: torch.dtype) -> None:
     assert original_total_numel([shard]) == numel, f"Shard {shard} does not match original total numel: {numel}"
 
 
-class WeightData:
+class ShardSpec:
     """
     Shard metadata for weight transfer (no tensor storage).
 
@@ -98,7 +98,7 @@ class WeightData:
     ``dtype`` may be :class:`torch.dtype` or a string (for JSON / legacy).
 
     Tensor values are passed separately as ``dict[str, torch.Tensor]`` to
-    :meth:`__call__` (returns a :class:`WeightTensorBridge`) or
+    :meth:`__call__` (returns a :class:`BoundShardSpec`) or
     """
 
     def __init__(self, meta_dict: dict[str, dict[str, ...]] | bytes):
@@ -112,13 +112,13 @@ class WeightData:
         for name, shards, dtype in self:
             _sanity_check(name, shards, dtype)
 
-    def __call__(self, tensors: dict[str, torch.Tensor]) -> WeightTensorBridge:
+    def __call__(self, tensors: dict[str, torch.Tensor]) -> "BoundShardSpec":
         """Bind *tensors* to this metadata for overlap packing / unpacking.
 
-        Returns a :class:`WeightTensorBridge` for ``f[overlaps]`` /
-        ``f[overlaps] = chunks`` (see :class:`WeightTensorBridge`).
+        Returns a :class:`BoundShardSpec` for ``f[overlaps]`` /
+        ``f[overlaps] = chunks`` (see :class:`BoundShardSpec`).
         """
-        return WeightTensorBridge(self, tensors)
+        return BoundShardSpec(self, tensors)
     
     def to_jsonable(self) -> dict[str, dict]:
         return {
@@ -167,11 +167,11 @@ class WeightData:
         return total
         
     @staticmethod
-    def compute_overlap(sender: "WeightData", receiver: "WeightData") -> "WeightData":
-        """Return a new WeightData whose entries describe the shard regions
+    def compute_overlap(sender: "ShardSpec", receiver: "ShardSpec") -> "ShardSpec":
+        """Return a new :class:`ShardSpec` whose entries describe the shard regions
         where *sender* and *receiver* overlap (metadata only, no tensor data).
 
-        Sender and receiver metadata must be :class:`WeightData` (shards
+        Sender and receiver metadata must be :class:`ShardSpec` (shards
         normalized at construction). Every sender shard is paired against every
         receiver shard and all non-empty overlaps are collected.
         """
@@ -201,23 +201,20 @@ class WeightData:
             if overlap_shards:
                 result[name] = {"shard": overlap_shards, "dtype": dtype}
 
-        return WeightData(result)
+        return ShardSpec(result)
 
 
-class WeightTensorBridge:
-    """``f = metadata(tensors)``: overlap-indexed pack/unpack into *tensors*.
+class BoundShardSpec:
+    """``f = spec(tensors)``: overlap-indexed pack/unpack into *tensors*.
 
-    * ``v = f[c]`` — *c* is a :class:`WeightData` or ``list[WeightData]`` (overlap
-      specs). Returns a ``list`` of ``len(c)`` one-dimensional ``uint8`` tensors
-      (wire layout), each the packed overlap for that entry.
-    * ``f[c] = v`` — *v* is a matching ``list`` of ``uint8`` flat tensors (or a
-      single tensor when ``len(c) == 1``), copied into *tensors* at the overlap
-      regions (receiver layout; *metadata* must describe *tensors*).
-
-    :meth:`pack_for` performs one overlap's pack or unpack (see below).
+    * ``v = f[c]`` — *c* maps ranks to overlap :class:`ShardSpec` entries.
+      Returns a ``dict`` of one-dimensional ``uint8`` tensors (wire layout).
+    * ``f[c] = v`` — *v* maps ranks to matching ``uint8`` flat tensors, copied
+      into *tensors* at the overlap regions (receiver layout; *metadata* must
+      describe *tensors*).
     """
 
-    def __init__(self, metadata: WeightData, tensors: dict[str, torch.Tensor]) -> None:
+    def __init__(self, metadata: ShardSpec, tensors: dict[str, torch.Tensor]) -> None:
         self._metadata = metadata
         self._tensors = dict(tensors)
         self.device = tensors[list(tensors.keys())[0]].device
@@ -240,8 +237,8 @@ class WeightTensorBridge:
 
     @staticmethod
     def slice_copy(
-        large: WeightTensorBridge, 
-        small: WeightTensorBridge,
+        large: "BoundShardSpec",
+        small: "BoundShardSpec",
         l2s: bool = True
     ) -> None:
         """
@@ -284,7 +281,7 @@ class WeightTensorBridge:
                     break
 
     def __getitem__(
-        self, dst_metas: dict[int, WeightData]
+        self, dst_metas: dict[int, ShardSpec]
     ) -> dict[int, torch.Tensor]:        
         dst_tensors = {}
         for rank, dst_meta in dst_metas.items():
@@ -293,13 +290,13 @@ class WeightTensorBridge:
                 name: dst_tensor[start:end]
                 for start, end, name, _, _ in dst_meta.iter_with_intv()
             }
-            WeightTensorBridge.slice_copy(self, dst_meta(state_dict), l2s=True)
+            BoundShardSpec.slice_copy(self, dst_meta(state_dict), l2s=True)
             dst_tensors[rank] = dst_tensor
         return dst_tensors
 
     def __setitem__(
         self,
-        src_metas: dict[int, WeightData],
+        src_metas: dict[int, ShardSpec],
         src_tensors: dict[int, torch.Tensor],
     ) -> None:
         for rank, src_meta in src_metas.items():
@@ -308,7 +305,7 @@ class WeightTensorBridge:
                 name: src_tensor[start:end]
                 for start, end, name, _, _ in src_meta.iter_with_intv()
             }
-            WeightTensorBridge.slice_copy(self, src_meta(state_dict), l2s=False)
+            BoundShardSpec.slice_copy(self, src_meta(state_dict), l2s=False)
 
 
 def _check_shard_compatibility(
