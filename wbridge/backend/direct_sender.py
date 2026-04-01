@@ -32,32 +32,6 @@ class DirectSender:
         self.metadata: WeightData | None = None
         self.backend = None
         self.device = None
-
-    def _dedup_sender_metadata(self) -> None:
-        """All-gather metadata across senders and deduplicate identical shards.
-
-        For each named tensor present on multiple senders, the intersection of
-        their shard specs must be either empty (the common case) or exactly
-        equal.  When equal, only the lowest-rank sender keeps the entry;
-        higher-rank senders drop it.  Any partial overlap raises an error.
-        """
-        if self.world_size == 1:
-            return
-
-        all_meta_dicts = [None] * self.world_size
-        dist.all_gather_object(all_meta_dicts, self.metadata, group=self.sender_group)
-
-        for peer_rank, peer_meta in enumerate(all_meta_dicts):
-            if peer_rank >= self.rank:
-                continue
-            
-            # This implies compatibility between the two senders.
-            overlap = WeightData.compute_overlap(self.metadata, peer_meta)
-            for name, _, _ in overlap:
-                if self.metadata[name]["shard"] == peer_meta[name]["shard"]:
-                    del self.metadata[name]
-                    continue
-                raise ValueError(f"Partial shard overlap for '{name}' between sender {self.rank} and {peer_rank}.")
             
 
     def connect(self, sender_metadata: WeightData) -> None:
@@ -99,10 +73,8 @@ class DirectSender:
                 base_rank += num_workers
         
         self.group = init_custom_process_group(**pg_init_args)
-        self.sender_group = dist.new_group(ranks=range(self.world_size), backend=self.backend)
-        self.metadata = self._dedup_sender_metadata()
         
-        all_metas = [None] * self.world_size
+        all_metas = [None] * total_world_size
         dist.all_gather_object(all_metas, self.metadata, group=self.group)
         
         self.overlaps = {
