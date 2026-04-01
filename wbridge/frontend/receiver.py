@@ -19,12 +19,10 @@ from wbridge.utils.distributed import init_custom_process_group
 logger = logging.getLogger(__name__)
 
 # Message types for controller <-> receiver communication
-METADATA_REQUEST = "metadata_request"
 CONNECT_REQUEST = "connect_request"
 RECEIVE_REQUEST = "receive_request"
 # Scheduler (REQ) -> receiver (REP); replaces the old ready check
 UPDATE_REQUEST = "update_request"
-READY_REQUEST = "ready_request"
 
 
 class ReceiverState(str, Enum):
@@ -76,20 +74,6 @@ class WeightReceiver:
         return json.loads(self.socket.recv_string())["success"]
 
 
-    @staticmethod
-    def _serialize_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, Any]:
-        buf = io.BytesIO()
-        torch.save(state_dict, buf)
-        return {
-            "state_dict_torch_b64": base64.b64encode(buf.getvalue()).decode("ascii"),
-        }
-
-
-    def _handle_metadata_request(self, controller_socket: zmq.Socket) -> None:
-        response = json.dumps({"rank": self.rank, "metadata": self.metadata.to_jsonable()})
-        controller_socket.send_string(response)
-
-
     def _handle_connect_request(
         self, controller_socket: zmq.Socket, data: dict[str, Any]
     ) -> None:
@@ -112,27 +96,12 @@ class WeightReceiver:
         self.group = init_custom_process_group(**data)
         self.device = "cuda" if data["backend"] == "nccl" else "cpu"
 
-        # Receive overlap metadata sizes from each sender (0 means no overlap)
-        size_tensor = torch.zeros(sender_world_size, dtype=torch.long, device=self.device)
-        size_ops = [
-            dist.P2POp(dist.irecv, size_tensor[sender_rank:sender_rank+1], sender_rank, self.group)
-            for sender_rank in range(sender_world_size)
-        ]
-        assert all(h.wait() for h in dist.batch_isend_irecv(size_ops)), "Failed to receive overlap sizes"
-
-        # Receive overlap metadata bytes only from senders that have overlap
+        all_metas = [None] * data["world_size"]
+        dist.all_gather_object(all_metas, self.metadata, group=self.group)
         self.overlaps = {
-            sender_rank: torch.zeros(size, dtype=torch.uint8, device=self.device)
-            for sender_rank in range(sender_world_size) if (size := int(size_tensor[sender_rank].item())) > 0
+            rank: overlap for rank, meta in enumerate(all_metas) 
+            if rank < sender_world_size and (overlap := WeightData.compute_overlap(meta, self.metadata))
         }
-        meta_ops = [
-            dist.P2POp(dist.irecv, buffer, sender_rank, self.group)
-            for sender_rank, buffer in self.overlaps.items()
-        ]
-        assert all(h.wait() for h in dist.batch_isend_irecv(meta_ops)), "Failed to receive overlap metadata"
-            
-        for sender_rank, buffer in self.overlaps.items():
-            self.overlaps[sender_rank] = WeightData(buffer.cpu().numpy().tobytes())
             
         self._state = ReceiverState.CONNECTED
 
@@ -188,9 +157,7 @@ class WeightReceiver:
                 msg = controller_socket.recv_string()
                 data = json.loads(msg)
                 req_type = data.pop("type")
-                if req_type == METADATA_REQUEST:
-                    self._handle_metadata_request(controller_socket)
-                elif req_type == CONNECT_REQUEST:
+                if req_type == CONNECT_REQUEST:
                     self._handle_connect_request(controller_socket, data)
                 elif req_type == RECEIVE_REQUEST:
                     self._handle_receive_request(controller_socket)
@@ -274,16 +241,8 @@ class WeightReceiverController:
         
         
     async def get_metadata(self):
-        """Query all connected receivers via ROUTER/DEALER (``{"type": "metadata_request"}``).
-        Collects until worker_num responses received or timeout.
-        Each item includes ``rank`` and ``metadata`` (per worker JSON from the receiver).
-        """
-        metadata_msg_bytes = json.dumps({"type": METADATA_REQUEST}).encode("utf-8")
-        for identity in self._receiver_identities:
-            self._router_socket.send_multipart([identity, metadata_msg_bytes])
-
-        results = self._gather_responses()
-        return sorted(results, key=lambda r: r.get("rank", -1))
+        """Return the world size of the receiver group."""
+        return JSONResponse(content={"status": "success", "world_size": self._worker_num})
 
 
     async def connect(self, request: dict[str, Any]):

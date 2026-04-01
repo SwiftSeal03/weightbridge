@@ -24,7 +24,7 @@ class DirectSender:
         self.rank = rank
         self.world_size = world_size
         self.receiver_urls = receiver_urls
-        self._sender_coord_init_method = f"tcp://{master_addr}:{master_port}"
+        self.init_method = f"tcp://{master_addr}:{master_port}"
 
         self.connected = False
         self.group: dist.ProcessGroup | None = None
@@ -33,9 +33,7 @@ class DirectSender:
         self.backend = None
         self.device = None
 
-    def _dedup_sender_metadata(
-        self, sender_metadata: WeightData, sender_coord_group: dist.ProcessGroup | None = None,
-    ) -> WeightData:
+    def _dedup_sender_metadata(self) -> None:
         """All-gather metadata across senders and deduplicate identical shards.
 
         For each named tensor present on multiple senders, the intersection of
@@ -44,39 +42,23 @@ class DirectSender:
         higher-rank senders drop it.  Any partial overlap raises an error.
         """
         if self.world_size == 1:
-            return sender_metadata
+            return
 
-        meta_dict = dict(sender_metadata.meta_dict)
-        all_meta_dicts: list[dict | None] = [None] * self.world_size
-        dist.all_gather_object(all_meta_dicts, meta_dict, group=sender_coord_group)
+        all_meta_dicts = [None] * self.world_size
+        dist.all_gather_object(all_meta_dicts, self.metadata, group=self.sender_group)
 
-        names_to_remove: set[str] = set()
-        for peer_rank, peer_dict in enumerate(all_meta_dicts):
-            if peer_rank == self.rank:
+        for peer_rank, peer_meta in enumerate(all_meta_dicts):
+            if peer_rank >= self.rank:
                 continue
-            peer_wd = WeightData(peer_dict)
-            overlap = WeightData.compute_overlap(sender_metadata, peer_wd)
-
-            for name in overlap.meta_dict:
-                if meta_dict[name]["shard"] == peer_dict[name]["shard"]:
-                    if self.rank > peer_rank:
-                        names_to_remove.add(name)
-                else:
-                    raise ValueError(
-                        f"Partial shard overlap for '{name}' between sender "
-                        f"rank {self.rank} and rank {peer_rank}. Senders must "
-                        f"have identical or non-overlapping shards."
-                    )
-
-        if not names_to_remove:
-            return sender_metadata
-
-        new_meta_dict = {
-            k: v for k, v in sender_metadata.meta_dict.items()
-            if k not in names_to_remove
-        }
-        return WeightData(new_meta_dict)
-
+            
+            # This implies compatibility between the two senders.
+            overlap = WeightData.compute_overlap(self.metadata, peer_meta)
+            for name, _, _ in overlap:
+                if self.metadata[name]["shard"] == peer_meta[name]["shard"]:
+                    del self.metadata[name]
+                    continue
+                raise ValueError(f"Partial shard overlap for '{name}' between sender {self.rank} and {peer_rank}.")
+            
 
     def connect(self, sender_metadata: WeightData) -> None:
         """Join receivers over NCCL after a short-lived Gloo group for sender coordination.
@@ -85,100 +67,48 @@ class DirectSender:
         :meth:`__init__` so all sender ranks rendezvous before rank 0 drives
         HTTP metadata/connect and broadcasts rendezvous info for the main group.
         """
-        sender_coord_group = None
-        if self.world_size > 1:
-            sender_coord_group = init_custom_process_group(
-                backend="gloo",
-                init_method=self._sender_coord_init_method,
-                world_size=self.world_size,
-                rank=self.rank,
-                group_name="wbridge_sender_coord",
-            )
-
-        sender_metadata = self._dedup_sender_metadata(sender_metadata, sender_coord_group)
         self.metadata = sender_metadata
+        if self.group is not None:
+            dist.destroy_process_group(self.group)
 
-        group_name = "wbridge"
-
-        if self.rank == 0:            
-            # Query receiver metadata and build per-worker list
-            receiver_metas: list[tuple[int, dict]] = []
-            receiver_worker_counts: list[int] = []
-            base_rank = self.world_size
-            for url in self.receiver_urls:
-                resp = requests.get(f"{url}/wbridge/metadata")
-                resp.raise_for_status()
-                workers = sorted(resp.json(), key=lambda w: w["rank"])
-                receiver_worker_counts.append(len(workers))
-                receiver_metas.extend([(
-                    base_rank + worker["rank"], WeightData(worker["metadata"])
-                ) for worker in workers])
-                base_rank += len(workers)
-
-            total_world_size = self.world_size + sum(receiver_worker_counts)
-            
-            # Tell each receiver to join, assigning ranks starting after all senders
-            base_rank = self.world_size
-            master_address, master_port = get_local_ip(), get_full_group_port()
-            for url, count in zip(self.receiver_urls, receiver_worker_counts):
-                resp = requests.post(
-                    f"{url}/wbridge/connect",
-                    json={
-                        "backend": self.backend,
-                        "init_method": f"tcp://{master_address}:{master_port}",
-                        "rank": base_rank,
-                        "world_size": total_world_size,
-                        "group_name": group_name,
-                        "sender_world_size": self.world_size,
-                    },
-                )
-                resp.raise_for_status()
-                base_rank += count
-
-            connect_info = [
-                master_address,
-                master_port,
-                total_world_size,
-                group_name,
-                receiver_metas,
-            ]
-        else:
-            connect_info = [None, None, None, None, None]
-
-        if sender_coord_group is not None:
-            dist.broadcast_object_list(connect_info, src=0, group=sender_coord_group)
-            dist.destroy_process_group(sender_coord_group)
-        master_address, master_port, total_world_size, group_name, receiver_metas = (
-            connect_info
-        )
+        # Query receiver metadata and build per-worker list
+        rollout_num_workers = []
+        resps = [requests.get(f"{url}/wbridge/metadata") for url in self.receiver_urls]
+        assert all(resp.status_code == 200 for resp in resps), "Failed to get receiver metadata"
+        rollout_num_workers = [resp.json()["world_size"] for resp in resps]
+        total_world_size = self.world_size + sum(rollout_num_workers)
         
-        self.group = init_custom_process_group(
-            backend=self.backend,
-            init_method=f"tcp://{master_address}:{master_port}",
-            world_size=total_world_size,
-            rank=self.rank,
-            group_name=group_name,
-        )
-        
-        # Compute overlap with each receiver and send the sizes of the overlap metadata.
-        # Always send a size (0 when no overlap) so receivers don't block on a recv that never comes.
-        self.overlaps = {
-            r_rank: overlap
-            for r_rank, r_meta in receiver_metas if (overlap := WeightData.compute_overlap(sender_metadata, r_meta))
+        pg_init_args = {
+            "backend": self.backend,
+            "init_method": self.init_method,
+            "world_size": total_world_size,
+            "rank": self.rank,
+            "group_name": "wbridge",
         }
-        size_ops = [
-            dist.P2POp(dist.isend, size_tensor[i:i+1], i, self.group)
-            for i in range(self.world_size) if overlap_sizes[i]
-        ]
-        assert all(h.wait() for h in dist.batch_isend_irecv(size_ops)), "Failed to send overlap sizes"
             
-        # Send the overlap metadata bytes to the receivers
-        meta_ops = [
-            dist.P2POp(dist.isend, torch.frombuffer(bytearray(bytes(overlap)), dtype=torch.uint8).to(self.device), r_rank, self.group)
-            for r_rank, overlap in self.overlaps.items()
-        ]
-        assert all(h.wait() for h in dist.batch_isend_irecv(meta_ops)), "Failed to send overlap metadata"
-
+        if self.rank == 0:
+            base_rank = self.world_size
+            for url, num_workers in zip(self.receiver_urls, rollout_num_workers):
+                connect_args = {
+                    **pg_init_args,
+                    "rank": base_rank,
+                    "sender_world_size": self.world_size,
+                }
+                resp = requests.post(f"{url}/wbridge/connect", json=connect_args)
+                resp.raise_for_status()
+                base_rank += num_workers
+        
+        self.group = init_custom_process_group(**pg_init_args)
+        self.sender_group = dist.new_group(ranks=range(self.world_size), backend=self.backend)
+        self.metadata = self._dedup_sender_metadata()
+        
+        all_metas = [None] * self.world_size
+        dist.all_gather_object(all_metas, self.metadata, group=self.group)
+        
+        self.overlaps = {
+            rank: overlap for rank, meta in enumerate(all_metas) 
+            if rank >= self.world_size and (overlap := WeightData.compute_overlap(self.metadata, meta))
+        }
         self.connected = True
 
     def send(self, state_dict: dict[str, torch.Tensor]) -> None:
