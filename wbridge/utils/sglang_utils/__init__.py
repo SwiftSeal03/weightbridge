@@ -32,7 +32,7 @@ def convert_to_wb(
         attn_tp_size: Attention TP size. Defaults to tp_size.
 
     Returns:
-        :class:`~wbridge.utils.data.ShardSpec` with HF-style names and shard metadata.
+        :class:`~wbridge.utils.data.ShardSpec` with HF-style names and per-tensor shard entries.
     """
     model_type = getattr(
         getattr(model_config, "hf_config", None),

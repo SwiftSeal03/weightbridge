@@ -57,9 +57,9 @@ def original_total_numel(shards: Shards) -> int:
     return math.prod(w for _, _, w in shards[0])
 
 
-def shards_iterator(meta_entry: dict[str, ...]) -> Iterator[tuple[int, int, Shard]]:
-    shards = meta_entry["shard"]
-    dtype = meta_entry["dtype"]
+def shards_iterator(spec_entry: dict[str, ...]) -> Iterator[tuple[int, int, Shard]]:
+    shards = spec_entry["shard"]
+    dtype = spec_entry["dtype"]
     offset = 0
     for shard in shards:
         length = _shard_to_numel(shard) * dtype.itemsize
@@ -80,7 +80,7 @@ def _sanity_check(name: str, shards: Shards, dtype: torch.dtype) -> None:
 
 class ShardSpec:
     """
-    Shard metadata for weight transfer (no tensor storage).
+    Per-tensor shard layout and dtype for weight transfer (no tensor storage).
 
     Format::
 
@@ -101,19 +101,19 @@ class ShardSpec:
     :meth:`__call__` (returns a :class:`BoundShardSpec`) or
     """
 
-    def __init__(self, meta_dict: dict[str, dict[str, ...]] | bytes):
-        self.meta_dict = {
+    def __init__(self, entries: dict[str, dict[str, ...]] | bytes):
+        self.entries = {
             name: {
                 "shard": _normalize_shards(value["shard"]),
                 "dtype": _normalize_dtype(value["dtype"]),
-            } for name, value in meta_dict.items()
+            } for name, value in entries.items()
         }
         
         for name, shards, dtype in self:
             _sanity_check(name, shards, dtype)
 
     def __call__(self, tensors: dict[str, torch.Tensor]) -> "BoundShardSpec":
-        """Bind *tensors* to this metadata for overlap packing / unpacking.
+        """Bind *tensors* to this shard spec for overlap packing / unpacking.
 
         Returns a :class:`BoundShardSpec` for ``f[overlaps]`` /
         ``f[overlaps] = chunks`` (see :class:`BoundShardSpec`).
@@ -129,28 +129,28 @@ class ShardSpec:
         }
     
     def __bool__(self) -> bool:
-        return bool(self.meta_dict)
+        return bool(self.entries)
     
     def __iter__(self) -> Iterator[tuple[str, Shards, torch.dtype]]:
-        for name, entry in self.meta_dict.items():
+        for name, entry in self.entries.items():
             yield name, entry["shard"], entry["dtype"]
     
     def __len__(self) -> int:
-        return len(self.meta_dict)
+        return len(self.entries)
     
     def __contains__(self, key: str) -> bool:
-        return key in self.meta_dict
+        return key in self.entries
     
     def __delitem__(self, key: str) -> None:
-        del self.meta_dict[key]
+        del self.entries[key]
     
     def __getitem__(self, key: str) -> dict[str, ...]:
-        return self.meta_dict[key]
+        return self.entries[key]
     
     def __setitem__(self, key: str, value: dict[str, ...]) -> None:
         shards, dtype = _normalize_shards(value["shard"]), _normalize_dtype(value["dtype"])
         _sanity_check(key, shards, dtype)
-        self.meta_dict[key] = {"shard": shards, "dtype": dtype}
+        self.entries[key] = {"shard": shards, "dtype": dtype}
     
     def iter_with_intv(self) -> Iterator[tuple[int, int, str, Shards, torch.dtype]]:
         offset = 0
@@ -169,9 +169,9 @@ class ShardSpec:
     @staticmethod
     def compute_overlap(sender: "ShardSpec", receiver: "ShardSpec") -> "ShardSpec":
         """Return a new :class:`ShardSpec` whose entries describe the shard regions
-        where *sender* and *receiver* overlap (metadata only, no tensor data).
+        where *sender* and *receiver* overlap (spec only, no tensor data).
 
-        Sender and receiver metadata must be :class:`ShardSpec` (shards
+        Sender and receiver specs must be :class:`ShardSpec` (shards
         normalized at construction). Every sender shard is paired against every
         receiver shard and all non-empty overlaps are collected.
         """
@@ -210,17 +210,17 @@ class BoundShardSpec:
     * ``v = f[c]`` — *c* maps ranks to overlap :class:`ShardSpec` entries.
       Returns a ``dict`` of one-dimensional ``uint8`` tensors (wire layout).
     * ``f[c] = v`` — *v* maps ranks to matching ``uint8`` flat tensors, copied
-      into *tensors* at the overlap regions (receiver layout; *metadata* must
+      into *tensors* at the overlap regions (receiver layout; *shard_spec* must
       describe *tensors*).
     """
 
-    def __init__(self, metadata: ShardSpec, tensors: dict[str, torch.Tensor]) -> None:
-        self._metadata = metadata
+    def __init__(self, shard_spec: ShardSpec, tensors: dict[str, torch.Tensor]) -> None:
+        self._shard_spec = shard_spec
         self._tensors = dict(tensors)
         self.device = tensors[list(tensors.keys())[0]].device
 
         # Sanity check and flatten
-        for name, shards, dtype in self._metadata:
+        for name, shards, dtype in self._shard_spec:
             assert name in self._tensors, f"Missing tensor {name} for overlap entry"
             tensor = self._tensors[name]
             assert tensor.is_contiguous(), f"Tensor {name} is not contiguous"
@@ -230,9 +230,9 @@ class BoundShardSpec:
             
             assert self.device == tensor.device, f"Tensor {name} is not on the same device as other tensors"
 
-        # Remove tensors that are not in the metadata
+        # Drop tensors not listed in shard_spec
         for name in list(self._tensors):
-            if name not in self._metadata:
+            if name not in self._shard_spec:
                 del self._tensors[name]
 
     @staticmethod
@@ -246,16 +246,16 @@ class BoundShardSpec:
         The direction of the copy is determined by the `l2s` parameter.
         "small" should represent a subset of the data in "large".
         """        
-        for name, _, dtype in small._metadata:
+        for name, _, dtype in small._shard_spec:
             s_tensor = small._tensors[name]
 
-            assert name in large._metadata, f"Missing tensor {name} for large entry"
-            l_dtype = large._metadata[name]["dtype"]
+            assert name in large._shard_spec, f"Missing tensor {name} for large entry"
+            l_dtype = large._shard_spec[name]["dtype"]
             l_tensor = large._tensors[name]
             assert l_dtype == dtype, f"Tensor dtype mismatch for {name}: {l_dtype} vs {dtype}"
             
-            for s_byte_start, s_byte_end, s_shard in shards_iterator(small._metadata[name]):
-                for l_byte_start, l_byte_end, l_shard in shards_iterator(large._metadata[name]):
+            for s_byte_start, s_byte_end, s_shard in shards_iterator(small._shard_spec[name]):
+                for l_byte_start, l_byte_end, l_shard in shards_iterator(large._shard_spec[name]):
                     alignment = _check_shard_compatibility(l_shard, s_shard)
                     if alignment is None:
                         continue

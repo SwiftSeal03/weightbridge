@@ -38,12 +38,12 @@ class WeightReceiver:
         self,
         controller_ipc_name: str,
         rank: int,
-        metadata: ShardSpec,
+        shard_spec: ShardSpec,
     ):
         self.controller_ipc_name = controller_ipc_name
         self.scheduler_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
         self.rank = rank
-        self.metadata = metadata
+        self.shard_spec = shard_spec
         self.state_dict = None
         self._state = ReceiverState.DISCONNECTED
         self.ready_event = threading.Event()
@@ -100,11 +100,11 @@ class WeightReceiver:
         self.group = init_custom_process_group(**data)
         self.device = "cuda" if data["backend"] == "nccl" else "cpu"
 
-        all_metas = [None] * data["world_size"]
-        dist.all_gather_object(all_metas, self.metadata, group=self.group)
+        all_specs = [None] * data["world_size"]
+        dist.all_gather_object(all_specs, self.shard_spec, group=self.group)
         self.overlaps = {
-            rank: overlap for rank, meta in enumerate(all_metas) 
-            if rank < sender_world_size and (overlap := ShardSpec.compute_overlap(meta, self.metadata))
+            rank: overlap for rank, peer_spec in enumerate(all_specs) 
+            if rank < sender_world_size and (overlap := ShardSpec.compute_overlap(peer_spec, self.shard_spec))
         }
             
         self._state = ReceiverState.CONNECTED
@@ -142,7 +142,7 @@ class WeightReceiver:
         context = zmq.Context()
         poller = zmq.Poller()
 
-        # DEALER: connect to controller's ROUTER for metadata requests
+        # DEALER: connect to controller's ROUTER for control messages
         controller_socket = context.socket(zmq.DEALER)
         controller_socket.setsockopt_string(zmq.IDENTITY, f"worker-{self.rank}")
         controller_socket.connect(self.controller_ipc_name)
@@ -188,14 +188,14 @@ class WeightReceiver:
         for h in dist.batch_isend_irecv(ops):
             h.wait()
         
-        self.metadata(self.state_dict)[self.overlaps] = chunks
+        self.shard_spec(self.state_dict)[self.overlaps] = chunks
 
 
 class WeightReceiverController:
     """
     Server for receiving weights from a WeightSender.
 
-    It is used to pass metadata and dispatching requests to underlying WeightReceiver instances.
+    It forwards control messages and dispatches to underlying WeightReceiver instances.
     When created, it creates an IPC name file for ROUTER/DEALER communication with receivers.
     """
 
@@ -209,7 +209,7 @@ class WeightReceiverController:
 
         self.router = APIRouter()
         self.router.add_api_route(
-            path="/wbridge/metadata", endpoint=self.get_metadata, methods=["GET"]
+            path="/wbridge/receiver_world", endpoint=self.get_receiver_world, methods=["GET"]
         )
         self.router.add_api_route(
             path="/wbridge/connect", endpoint=self.connect, methods=["POST"]
@@ -244,7 +244,7 @@ class WeightReceiverController:
         return responses
         
         
-    async def get_metadata(self):
+    async def get_receiver_world(self):
         """Return the world size of the receiver group."""
         return JSONResponse(content={"status": "success", "world_size": self._worker_num})
 

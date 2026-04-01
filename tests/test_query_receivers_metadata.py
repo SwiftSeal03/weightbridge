@@ -1,32 +1,21 @@
-"""Test that WeightReceiverController._query_receivers_metadata works with 2 WeightReceivers."""
-
-import time
+"""HTTP route for receiver world size (WeightReceiverController)."""
 
 from fastapi import FastAPI
+from fastapi.testclient import TestClient
 
-from wbridge.frontend import WeightReceiver, WeightReceiverController
-from wbridge.utils.data import ShardSpec
+from wbridge.frontend import WeightReceiverController
 
 
-def test_query_receivers_metadata():
-    """`_query_receivers_metadata` returns one dict per worker (rank, metadata, state, …), sorted by rank."""
+def test_receiver_world_route():
     app = FastAPI()
     controller = WeightReceiverController(app)
     controller.set_worker_num(2)
-
-    empty = ShardSpec({})
-    receiver0 = WeightReceiver(controller_ipc_name=controller.ipc_name, rank=0, metadata=empty)
-    receiver1 = WeightReceiver(controller_ipc_name=controller.ipc_name, rank=1, metadata=empty)
-
-    # Give receivers time to connect and start polling
-    time.sleep(0.5)
-
-    results = controller._query_receivers_metadata()
-    assert len(results) == 2, f"Expected 2 responses, got {results}"
-    assert [r["rank"] for r in results] == [0, 1]
-    assert all(r["metadata"] == {} for r in results)
+    client = TestClient(app)
+    resp = client.get("/wbridge/receiver_world")
+    assert resp.status_code == 200
+    assert resp.json() == {"status": "success", "world_size": 2}
 
 
 if __name__ == "__main__":
-    test_query_receivers_metadata()
-    print("test_query_receivers_metadata passed")
+    test_receiver_world_route()
+    print("test_receiver_world_route passed")

@@ -9,8 +9,8 @@ from wbridge.utils.data import ShardSpec, _check_shard_compatibility
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_meta(shard, dtype=torch.float32):
-    """Single-entry metadata-only :class:`~wbridge.utils.data.ShardSpec`."""
+def _make_shard_spec(shard, dtype=torch.float32):
+    """Single-entry :class:`~wbridge.utils.data.ShardSpec` (one tensor name)."""
     return ShardSpec({
         "weight": {"shard": shard, "dtype": dtype},
     })
@@ -304,7 +304,7 @@ class TestCheckShardCompatibility:
 
 
 # ---------------------------------------------------------------------------
-# compute_overlap (metadata only)
+# compute_overlap (spec only)
 # ---------------------------------------------------------------------------
 
 class TestComputeOverlap:
@@ -312,10 +312,10 @@ class TestComputeOverlap:
         dtype = torch.float32
         s_shard = [(1, 3, 4), (0, 6, 6)]
         r_shard = [(2, 4, 4), (2, 5, 6)]
-        sender = _make_meta(s_shard, dtype)
-        receiver = _make_meta(r_shard, dtype)
+        sender = _make_shard_spec(s_shard, dtype)
+        receiver = _make_shard_spec(r_shard, dtype)
         overlap = ShardSpec.compute_overlap(sender, receiver)
-        assert "weight" in overlap.meta_dict
+        assert "weight" in overlap.entries
         o_shard = overlap["weight"]["shard"]
         assert o_shard == [(2, 3, 4), (2, 5, 6)]
 
@@ -324,10 +324,10 @@ class TestComputeOverlap:
         dtype = torch.float32
         s_shard = [(0, 2, 4), (0, 6, 6)]
         r_shard = [(2, 4, 4), (0, 6, 6)]
-        sender = _make_meta(s_shard, dtype)
-        receiver = _make_meta(r_shard, dtype)
+        sender = _make_shard_spec(s_shard, dtype)
+        receiver = _make_shard_spec(r_shard, dtype)
         overlap = ShardSpec.compute_overlap(sender, receiver)
-        assert len(overlap.meta_dict) == 0
+        assert len(overlap.entries) == 0
 
 
 # ---------------------------------------------------------------------------
@@ -338,8 +338,8 @@ class TestPackFor:
     def test_full_shard_roundtrip(self):
         dtype = torch.float32
         shard = [(0, 4, 4), (0, 6, 6)]
-        sender = _make_meta(shard, dtype)
-        receiver = _make_meta(shard, dtype)
+        sender = _make_shard_spec(shard, dtype)
+        receiver = _make_shard_spec(shard, dtype)
         overlap = ShardSpec.compute_overlap(sender, receiver)
         t = _tensor_for_shard(shard, dtype)
         packed = sender({"weight": t})[{0: overlap}][0]

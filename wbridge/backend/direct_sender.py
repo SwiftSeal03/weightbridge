@@ -29,26 +29,26 @@ class DirectSender:
         self.connected = False
         self.group: dist.ProcessGroup | None = None
         self.overlaps: dict[int, ShardSpec] = {}
-        self.metadata: ShardSpec | None = None
+        self.shard_spec: ShardSpec | None = None
         self.backend = None
         self.device = None
             
 
-    def connect(self, sender_metadata: ShardSpec) -> None:
+    def connect(self, shard_spec: ShardSpec) -> None:
         """Join receivers over NCCL after a short-lived Gloo group for sender coordination.
 
         The Gloo process group uses ``tcp://{master_addr}:{master_port}`` from
         :meth:`__init__` so all sender ranks rendezvous before rank 0 drives
-        HTTP metadata/connect and broadcasts rendezvous info for the main group.
+        HTTP receiver_world/connect and broadcasts rendezvous info for the main group.
         """
-        self.metadata = sender_metadata
+        self.shard_spec = shard_spec
         if self.group is not None:
             dist.destroy_process_group(self.group)
 
-        # Query receiver metadata and build per-worker list
+        # Query receiver world size and build per-worker list
         rollout_num_workers = []
-        resps = [requests.get(f"{url}/wbridge/metadata") for url in self.receiver_urls]
-        assert all(resp.status_code == 200 for resp in resps), "Failed to get receiver metadata"
+        resps = [requests.get(f"{url}/wbridge/receiver_world") for url in self.receiver_urls]
+        assert all(resp.status_code == 200 for resp in resps), "Failed to get receiver world size"
         rollout_num_workers = [resp.json()["world_size"] for resp in resps]
         total_world_size = self.world_size + sum(rollout_num_workers)
         
@@ -74,12 +74,12 @@ class DirectSender:
         
         self.group = init_custom_process_group(**pg_init_args)
         
-        all_metas = [None] * total_world_size
-        dist.all_gather_object(all_metas, self.metadata, group=self.group)
+        all_specs = [None] * total_world_size
+        dist.all_gather_object(all_specs, self.shard_spec, group=self.group)
         
         self.overlaps = {
-            rank: overlap for rank, meta in enumerate(all_metas) 
-            if rank >= self.world_size and (overlap := ShardSpec.compute_overlap(self.metadata, meta))
+            rank: overlap for rank, peer_spec in enumerate(all_specs) 
+            if rank >= self.world_size and (overlap := ShardSpec.compute_overlap(self.shard_spec, peer_spec))
         }
         self.connected = True
 
@@ -98,14 +98,14 @@ class GPUDirectSender(DirectSender):
         self.backend = "nccl"
 
     def send(self, state_dict: dict[str, torch.Tensor]) -> None:
-        if not self.connected or self.metadata is None:
+        if not self.connected or self.shard_spec is None:
             raise RuntimeError("GPUDirectSender.send requires connect() first")
         if self.rank == 0:
             for url in self.receiver_urls:
                 resp = requests.post(f"{url}/wbridge/receive")
                 resp.raise_for_status()
 
-        chunks = self.metadata(state_dict)[self.overlaps]
+        chunks = self.shard_spec(state_dict)[self.overlaps]
         ops = [
             dist.P2POp(dist.isend, chunk, receiver_rank, self.group)
             for receiver_rank, chunk in chunks.items()

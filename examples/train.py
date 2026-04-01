@@ -22,8 +22,8 @@ Tensors (``float32``, shape ``[ROWS, COLS]`` = ``[4, 8]``):
        rank 1 → rows ``[1, 4)``.
     2. ``col_weight`` — column-sharded: rank 0 → cols ``[0, 4)``, rank 1 →
        cols ``[4, 8)``.
-    3. ``dup_weight`` — full tensor duplicated on both sender ranks (deduped in
-       ``DirectSender._dedup_sender_metadata``).
+    3. ``dup_weight`` — full tensor duplicated on both sender ranks (deduped on
+       the sender side when shards match across ranks).
 
 Usage::
 
@@ -50,10 +50,10 @@ DTYPE = torch.float32
 ROWS, COLS = 4, 8
 
 
-def _build_sender_metadata(rank: int) -> ShardSpec:
-    """Shard metadata for the given sender rank (``connect``)."""
+def _build_sender_shard_spec(rank: int) -> ShardSpec:
+    """Shard spec for the given sender rank (``connect``)."""
     if rank == 0:
-        meta_dict = {
+        entries = {
             "uneven_weight": {
                 "shard": [(0, 1, ROWS), (0, COLS, COLS)],
                 "dtype": DTYPE,
@@ -68,7 +68,7 @@ def _build_sender_metadata(rank: int) -> ShardSpec:
             },
         }
     else:
-        meta_dict = {
+        entries = {
             "uneven_weight": {
                 "shard": [(1, ROWS, ROWS), (0, COLS, COLS)],
                 "dtype": DTYPE,
@@ -82,21 +82,21 @@ def _build_sender_metadata(rank: int) -> ShardSpec:
                 "dtype": DTYPE,
             },
         }
-    return ShardSpec(meta_dict)
+    return ShardSpec(entries)
 
 
-def _build_receiver_metadata(rank: int) -> ShardSpec:
-    """Build metadata-only :class:`~wbridge.ShardSpec` for a receiver worker."""
+def _build_receiver_shard_spec(rank: int) -> ShardSpec:
+    """Build :class:`~wbridge.ShardSpec` for a receiver worker."""
     mid = ROWS // 2
     if rank == 0:
         shard = [(0, mid, ROWS), (0, COLS, COLS)]
     else:
         shard = [(mid, ROWS, ROWS), (0, COLS, COLS)]
-    meta_dict = {
+    entries = {
         name: {"shard": shard, "dtype": DTYPE}
         for name in ("uneven_weight", "col_weight", "dup_weight")
     }
-    return ShardSpec(meta_dict)
+    return ShardSpec(entries)
 
 
 def main():
@@ -108,12 +108,12 @@ def main():
         rollout_port=15000,
         rollout_scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=rollout_node_id, soft=False),
         num_rollout_workers=2,
-        rollout_metadata_generator=_build_receiver_metadata,
+        rollout_shard_spec_generator=_build_receiver_shard_spec,
         trainer_host=trainer_ip,
         trainer_pg_port=60010,
         trainer_scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=trainer_node_id, soft=False),
         num_trainer_workers=2,
-        trainer_metadata_generator=_build_sender_metadata,
+        trainer_shard_spec_generator=_build_sender_shard_spec,
         tensor_generator=partial(generate_local_tensors, device="cuda", seed=42),
     )
 

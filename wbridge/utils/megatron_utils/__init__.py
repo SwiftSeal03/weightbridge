@@ -13,7 +13,7 @@ def convert_to_wb(args, model_name: str, named_tensors: list[tuple[str, torch.nn
     Convert Megatron parameters to WeightBridge format.
 
     Returns:
-        ``(ShardSpec, dict[str, Tensor])`` — shard metadata and local tensor shards for send.
+        ``(ShardSpec, dict[str, Tensor])`` — shard spec and local tensor shards for send.
     """
     # TODO: support quantization_config when needed
     return _convert_to_wb_core(args, model_name, named_tensors)

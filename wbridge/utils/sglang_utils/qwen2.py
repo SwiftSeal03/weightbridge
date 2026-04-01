@@ -1,7 +1,7 @@
 """
 Qwen2/Qwen3 SGLang state_dict to WeightBridge format conversion.
 Mirrors wbridge/utils/megatron_utils/qwen2.py structure; converts SGLang's
-TP-sharded state_dict to :class:`~wbridge.utils.data.ShardSpec` with HF-style names and shard metadata.
+TP-sharded state_dict to :class:`~wbridge.utils.data.ShardSpec` with HF-style names and per-tensor shard specs.
 
 SGLang partitioning (from sglang/srt/models/qwen2.py, qwen3.py, layers/linear.py):
 - Column parallel (shard dim 0): qkv_proj, gate_up_proj, embed_tokens, lm_head
@@ -126,7 +126,7 @@ def convert_qwen2_to_wb(
     """
     Convert SGLang Qwen2/Qwen3 state_dict to :class:`~wbridge.utils.data.ShardSpec`.
     """
-    out_meta_dict: Dict[str, Dict] = {}
+    entries: Dict[str, Dict] = {}
 
     for sgl_name, sgl_param in state_dict.items():
         if not isinstance(sgl_param, torch.Tensor):
@@ -144,7 +144,7 @@ def convert_qwen2_to_wb(
             if any(attn_proj in name for attn_proj in ["q_proj", "k_proj", "v_proj", "o_proj"]):
                 tp_rank, tp_size = config.attn_tp_rank, config.attn_tp_size
 
-            # Create shard metadata
+            # Per-tensor shard spec entry
             if partition_dim is None:
                 shard = [(0, d, d) for d in param.shape]
             else:
@@ -168,6 +168,6 @@ def convert_qwen2_to_wb(
                 w = min(config.vocab_size, w)
                 shard = [(l, r, w)] + shard[1:]
 
-            out_meta_dict[name] = {"shard": shard, "dtype": param.dtype}
+            entries[name] = {"shard": shard, "dtype": param.dtype}
 
-    return ShardSpec(out_meta_dict)
+    return ShardSpec(entries)

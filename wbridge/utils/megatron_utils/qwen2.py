@@ -84,7 +84,7 @@ def convert_qwen2_to_wb(
     args, named_tensors: list[tuple[str, torch.nn.Parameter]]
 ) -> tuple[ShardSpec, dict[str, torch.Tensor]]:
     """HF-style :class:`~wbridge.utils.data.ShardSpec` and matching local tensor shards for send."""
-    meta_dict: dict[str, dict] = {}
+    entries: dict[str, dict] = {}
     tensors: dict[str, torch.Tensor] = {}
     tprk = mpu.get_tensor_model_parallel_rank()
     tpws = mpu.get_tensor_model_parallel_world_size()
@@ -109,7 +109,7 @@ def convert_qwen2_to_wb(
                 shard[0] = (l, r, w)
                 t = t[:r - l]
 
-            meta_dict[hf_name] = {"shard": shard, "dtype": hf_param.dtype}
+            entries[hf_name] = {"shard": shard, "dtype": hf_param.dtype}
             tensors[hf_name] = t
 
-    return ShardSpec(meta_dict), tensors
+    return ShardSpec(entries), tensors

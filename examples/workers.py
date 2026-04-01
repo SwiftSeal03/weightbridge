@@ -17,7 +17,7 @@ from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from wbridge import ShardSpec, WeightReceiver, WeightReceiverController, WeightSender
 
-MetadataGenerator = Callable[[int], ShardSpec]
+ShardSpecGenerator = Callable[[int], ShardSpec]
 TensorGenerator = Callable[[ShardSpec], dict[str, torch.Tensor]]
 
 
@@ -27,13 +27,13 @@ class EngineArgs:
     rollout_port: int
     rollout_scheduling_strategy: NodeAffinitySchedulingStrategy
     num_rollout_workers: int
-    rollout_metadata_generator: MetadataGenerator
+    rollout_shard_spec_generator: ShardSpecGenerator
 
     trainer_host: str
     trainer_pg_port: int
     trainer_scheduling_strategy: NodeAffinitySchedulingStrategy
     num_trainer_workers: int
-    trainer_metadata_generator: MetadataGenerator
+    trainer_shard_spec_generator: ShardSpecGenerator
 
     tensor_generator: TensorGenerator
     rollout_controller_ipc_name: str = field(init=False)
@@ -47,12 +47,12 @@ class RolloutWorker:
     def init(self, rank: int, args: EngineArgs):
         self.rank = rank
         self.args = args
-        self.metadata = args.rollout_metadata_generator(rank)
-        self.state_dict = args.tensor_generator(self.metadata)
+        self.shard_spec = args.rollout_shard_spec_generator(rank)
+        self.state_dict = args.tensor_generator(self.shard_spec)
         self.receiver = WeightReceiver(
             controller_ipc_name=args.rollout_controller_ipc_name,
             rank=rank,
-            metadata=self.metadata,
+            shard_spec=self.shard_spec,
         )
         
     def recv_weights(self) -> None:
@@ -118,8 +118,8 @@ class TrainerWorker:
     def init(self, rank: int, args: EngineArgs):
         self.args = args
         self.rank = rank
-        self.metadata = args.trainer_metadata_generator(rank)
-        self.state_dict = args.tensor_generator(self.metadata)
+        self.shard_spec = args.trainer_shard_spec_generator(rank)
+        self.state_dict = args.tensor_generator(self.shard_spec)
         self.sender = WeightSender(
             transfer_mode="gpu_direct",
             receiver_urls=[f"http://{args.rollout_host}:{args.rollout_port}"],
@@ -130,7 +130,7 @@ class TrainerWorker:
         )
 
     def send_weights(self):
-        self.sender.connect(self.metadata)
+        self.sender.connect(self.shard_spec)
         self.sender.send(self.state_dict)
 
 
