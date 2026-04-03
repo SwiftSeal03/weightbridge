@@ -7,14 +7,14 @@ from collections.abc import Callable, Iterable
 import pytest
 import torch
 
-from wbridge.utils.specgen import _LazyHfToDeviceWeights, infer_shard_spec
+from wbridge.utils.specgen import infer_shard_spec
 
 
 @pytest.fixture(scope="module")
 def device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda", torch.cuda.current_device())
-    return torch.device("cpu")
+    if not torch.cuda.is_available():
+        pytest.skip("infer_shard_spec requires CUDA worker tensors")
+    return torch.device("cuda", torch.cuda.current_device())
 
 
 def _complex_sglang_like_lw(
@@ -50,8 +50,6 @@ def _complex_sglang_like_lw(
             return
         if name == "model.embed_tokens.weight":
             wksd["embed_tokens.weight"].copy_(t[:V, :])
-            return
-        if name == "lm_head.weight":
             wksd["lm_head.weight"].copy_(t[:V, :])
             return
         if name.endswith("self_attn.q_proj.weight"):
@@ -77,7 +75,7 @@ def _complex_sglang_like_lw(
             wksd["triton_linear.weight"].copy_(t.T.contiguous())
             return
 
-    def lw(weights: _LazyHfToDeviceWeights | Iterable[tuple[str, torch.Tensor]]) -> None:
+    def lw(weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         for name, t in weights:
             _dispatch(name, t)
         for name, t in weights:
@@ -86,37 +84,6 @@ def _complex_sglang_like_lw(
                 break
 
     return lw
-
-
-def test_lazy_iterator_no_batch_gpu_transfer(device: torch.device, monkeypatch) -> None:
-    """HF tensors stay on CPU until yielded; each tensor calls ``.to(device)`` only when consumed."""
-    to_calls: list[tuple[int, torch.Size]] = []
-    real_to = torch.Tensor.to
-
-    def spy_to(self, *args, **kwargs):
-        if args and args[0] == device:
-            to_calls.append((id(self), self.shape))
-        return real_to(self, *args, **kwargs)
-
-    monkeypatch.setattr(torch.Tensor, "to", spy_to)
-    hfsd = {
-        "a": torch.randn(2, 3),
-        "b": torch.randn(4, 5),
-        "c": torch.randn(1, 1),
-    }
-    lazy = _LazyHfToDeviceWeights(hfsd, ["a", "b", "c"], device)
-    assert to_calls == []
-
-    first = list(lazy)
-    assert len(to_calls) == 3
-    assert len(first) == 3
-    for _n, t in first:
-        assert t.device == device
-    assert all(v.device.type == "cpu" for v in hfsd.values())
-
-    second = list(lazy)
-    assert len(to_calls) == 6
-    assert len(second) == 3
 
 
 def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
@@ -129,7 +96,6 @@ def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
     hfsd = {
         "pp_skip.model.layers.0.mlp.fc.weight": torch.randn(3, 3),
         "model.embed_tokens.weight": torch.randn(V + V_PAD, H),
-        "lm_head.weight": torch.randn(V + V_PAD, H),
         "model.layers.1.self_attn.q_proj.weight": torch.randn(q_dim, H),
         "model.layers.1.self_attn.k_proj.weight": torch.randn(kv_dim, H),
         "model.layers.1.self_attn.v_proj.weight": torch.randn(kv_dim, H),
@@ -159,17 +125,14 @@ def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
         kv_dim=kv_dim,
     )
 
-    spec = infer_shard_spec(hfsd, wksd, lw, device=device)
+    spec = infer_shard_spec(hfsd, wksd, lw)
 
     assert "pp_skip.model.layers.0.mlp.fc.weight" not in spec.entries
 
     def _shard(name: str) -> list:
         return spec[name]["shard"]
 
-    # Tied pass writes the same HF tensor into ``lm_head`` as well → two worker targets.
-    embed_shard = [(0, V, V + V_PAD), (0, H, H)]
-    assert _shard("model.embed_tokens.weight") == [embed_shard, embed_shard]
-    assert _shard("lm_head.weight") == [[(0, V, V + V_PAD), (0, H, H)]]
+    assert _shard("model.embed_tokens.weight") == [[(0, V, V + V_PAD), (0, H, H)]]
     assert _shard("model.layers.1.self_attn.q_proj.weight") == [[(0, q_dim, q_dim), (0, H, H)]]
     assert _shard("model.layers.1.self_attn.k_proj.weight") == [[(0, kv_dim, kv_dim), (0, H, H)]]
     assert _shard("model.layers.1.self_attn.v_proj.weight") == [[(0, kv_dim, kv_dim), (0, H, H)]]
