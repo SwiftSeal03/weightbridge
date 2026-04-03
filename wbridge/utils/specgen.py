@@ -35,7 +35,12 @@ import torch
 
 from wbridge.utils.data import Shard, ShardSpec
 
-LoadWeightsFn = Callable[[Iterable[tuple[str, torch.Tensor]]], Any]
+WeightsIterable = Iterable[tuple[str, torch.Tensor]]
+LoadWeightsFn = Callable[[WeightsIterable], Any]
+
+# Default cap on total CPU storage for HF placeholder tensors per infer batch.
+DEFAULT_MAX_HF_BYTES = 20 * 1024**3
+
 
 def _sd_subset_iterator(
     hfsd: dict[str, torch.Tensor],
@@ -46,7 +51,7 @@ def _sd_subset_iterator(
 
 
 def _worker_nonzero(t: torch.Tensor) -> bool:
-    ret =  bool(torch.any(t != 0).item())
+    ret = bool(torch.any(t != 0).item())
     if ret:
         t.zero_()
     return ret
@@ -69,13 +74,16 @@ def _match_hf_to_worker_names(
         hfsd[hf].fill_(1.0)
     for wk in wk_keys:
         wksd[wk].zero_()
+        
+    lw(_sd_subset_iterator(hfsd, hf_keys))
+    wk_candidates = {wk for wk in wk_keys if _worker_nonzero(wksd[wk])}
 
     def recurse(h_subset: list[str], wk_candidates: list[str]) -> None:
         if not h_subset or not wk_candidates:
             return
         if len(h_subset) == 1:
             mapping[h_subset[0]] = wk_candidates
-            return  
+            return
 
         mid = len(h_subset) // 2
         left, right = h_subset[:mid], h_subset[mid:]
@@ -89,7 +97,7 @@ def _match_hf_to_worker_names(
         recurse(left, w_left)
         recurse(right, w_right)
 
-    recurse(hf_keys, wk_keys)
+    recurse(hf_keys, wk_candidates)
     return dict(mapping)
 
 
@@ -102,87 +110,131 @@ def _extract_shard(
 ) -> Shard:
     hf_tensor = hfsd[hf_name]
     wk_tensor = wksd[wk_name]
-    
+
     hf_tensor.fill_(1.0)
     wk_tensor.zero_()
     lw(_sd_subset_iterator(hfsd, [hf_name]))
     wk_mask = wk_tensor != 0
-    
+
     hf_numel = hf_tensor.numel()
     wk_numel = wk_mask.sum()
+    assert wk_numel > 0, "no worker tensors affected by HF tensor"
     ele_bits = wk_tensor.dtype.itemsize * 8
     idx_bits = max(ele_bits, (hf_numel - 1).bit_length() + 1)
-    idx_dtype : torch.dtype = getattr(torch, f"int{1 << (idx_bits.bit_length() - 1)}")
-    int_dtype : torch.dtype = getattr(torch, f"int{ele_bits}")
+    idx_dtype: torch.dtype = getattr(torch, f"int{1 << (idx_bits.bit_length() - 1)}")
+    int_dtype: torch.dtype = getattr(torch, f"int{ele_bits}")
 
-    hf_indices = torch.arange(hf_numel, dtype=idx_dtype, device=hf_tensor.device)\
-        .view(int_dtype).reshape(*hf_tensor.shape, -1)
-    wk_indices = torch.zeros(wk_numel, dtype=idx_dtype, device=wk_tensor.device)\
-        .view(int_dtype).reshape(wk_numel, -1)
-        
+    hf_indices = torch.arange(hf_numel, dtype=idx_dtype, device=hf_tensor.device).view(
+        int_dtype
+    ).reshape(*hf_tensor.shape, -1)
+    wk_indices = torch.zeros(wk_numel, dtype=idx_dtype, device=wk_tensor.device).view(
+        int_dtype
+    ).reshape(wk_numel, -1)
+
     for k in range(hf_indices.shape[-1]):
         hf_tensor.copy_(hf_indices[..., k])
         lw(_sd_subset_iterator(hfsd, [hf_name]))
         wk_indices[..., k] = wk_tensor[wk_mask]
-        
+
     wk_indices = wk_indices.view(idx_dtype).view(-1)
     coords = torch.unravel_index(wk_indices, hf_tensor.shape)
-    
+
     shard = [
-        (coords[d].min().item(), coords[d].max().item() + 1, w) 
+        (coords[d].min().item(), coords[d].max().item() + 1, w)
         for d, w in enumerate(hf_tensor.shape)
     ]
     return shard
-    
-    
-def infer_shard_spec(
+
+
+def _infer_shard_spec_from_hfsd(
     hfsd: dict[str, torch.Tensor],
     wksd: dict[str, torch.Tensor],
     lw: LoadWeightsFn,
 ) -> ShardSpec:
-    """
-    Run the two-stage name / data matching procedure and build a
-    :class:`~wbridge.utils.data.ShardSpec` keyed by HuggingFace tensor names.
-
-    Modifies ``hfsd`` in place (stage 1 randomizes all HF tensors). ``wksd`` is
-    left all-zero after stage 1; each stage-2 pair restores the touched worker
-    tensor from a backup. Pass copies if you need original ``hfsd`` values
-    preserved.
-
-    Args:
-        hfsd: HuggingFace-style state dict (CPU tensors); each tensor is moved to
-            ``device`` only when ``lw`` iterates over that name.
-        wksd: Worker tensors that ``lw`` writes into (typically GPU), same keys
-            the loader targets.
-        lw: Same role as ``model.load_weights`` in SGLang (iterable of
-            ``(str, Tensor)``).
-        device: Device for tensors passed into ``lw``. Defaults to the device
-            of the first tensor in ``wksd``.
-
-    Returns:
-        ``ShardSpec`` describing, for each HF name with a detected mapping, the
-        shard rectangles and dtype (from ``hfsd``).
-    """
-    assert hfsd and wksd, "hfsd and wksd must be non-empty"
-    assert all(v.is_cpu for v in hfsd.values()), "hfsd must be on the CPU"
-    assert all(v.is_cuda for v in wksd.values()), "wksd must be on the GPU"
-
-    wk_dtypes = {k: v.dtype for k, v in wksd.items()}
-
+    """Single batch."""
+    
     name_map = _match_hf_to_worker_names(hfsd, wksd, lw)
 
-    entries: dict[str, dict] = {}
-    for hf_name, wk_names in name_map.items():
-        dtype = hfsd[hf_name].dtype
-        assert all(dtype == wk_dtypes[wk_name] for wk_name in wk_names), \
-            f"inconsistent dtypes for HF key {hf_name!r}"
-        shards = list({
-            tuple(_extract_shard(hf_name, wk_name, hfsd, wksd, lw))
-            for wk_name in sorted(wk_names)
-        })
-        entries[hf_name] = {"shard": shards, "dtype": dtype}
+    assert all(
+        hfsd[hf_name].dtype == wksd[wk_name].dtype 
+        for hf_name, wk_names in name_map.items() for wk_name in wk_names
+    ), "inconsistent dtypes for HF keys"
 
-    return ShardSpec(entries)
+    entries = {
+        hf_name: {
+            "shard": [
+                list(shard) for shard in {
+                    tuple(_extract_shard(hf_name, wk_name, hfsd, wksd, lw))
+                    for wk_name in sorted(wk_names)
+                }
+            ],
+            "dtype": hfsd[hf_name].dtype
+        }
+        for hf_name, wk_names in name_map.items()
+    }
+    return entries
 
 
-__all__ = ["LoadWeightsFn", "infer_shard_spec"]
+def infer_shard_spec(
+    hf_iterator: WeightsIterable,
+    wksd: dict[str, torch.Tensor],
+    lw: LoadWeightsFn,
+    *,
+    max_hf_bytes: int = DEFAULT_MAX_HF_BYTES,
+) -> ShardSpec:
+    """
+    Run the two-stage procedure on HuggingFace-named weights from *hf_iterator*.
+
+    Builds CPU placeholder dicts in chunks. *max_hf_bytes* is a **soft** cap:
+    flush the current chunk if it is non-empty and adding the next tensor would
+    push total placeholder size over the limit; always flush after the last
+    name. A single tensor may therefore exceed *max_hf_bytes* in its chunk.
+
+    Worker tensors in ``wksd`` are overwritten during probing; each chunk
+    snapshots CUDA tensors to CPU and restores them after that chunk.
+
+    Args:
+        hf_iterator: ``(name, tensor)`` pairs. Only shape/dtype are kept for
+            placeholders.
+        wksd: Worker tensors that ``lw`` writes into (CUDA).
+        lw: Same role as ``model.load_weights`` in SGLang.
+        max_hf_bytes: Soft cap on total bytes of CPU placeholders per chunk
+            (default 20 GiB).
+
+    Returns:
+        Merged :class:`~wbridge.utils.data.ShardSpec` over all iterator names.
+    """
+    assert wksd, "wksd must be non-empty"
+    assert all(v.is_cuda for v in wksd.values()), "wksd tensors must be on CUDA"
+    try:
+        backup = {k: v.detach().cpu() for k, v in wksd.items()}
+
+        merged: dict[str, dict] = {}
+        batch: dict[str, torch.Tensor] = {}
+        batch_bytes = 0      
+
+        for name, tensor in hf_iterator:
+            assert tensor.is_cpu, "tensor must be on CPU"
+            if name in batch or name in merged:
+                raise ValueError(f"duplicate HF tensor name in iterator: {name!r}")
+            batch[name] = tensor
+            batch_bytes += tensor.nbytes
+            if batch and batch_bytes + tensor.nbytes > max_hf_bytes:
+                merged |= _infer_shard_spec_from_hfsd(batch, wksd, lw)
+                batch, batch_bytes = {}, 0
+
+        if batch:
+            merged |= _infer_shard_spec_from_hfsd(batch, wksd, lw)
+
+        return ShardSpec(merged)
+    finally:
+        for k, v in backup.items():
+            wksd[k].copy_(v, non_blocking=True)
+
+
+__all__ = [
+    "DEFAULT_MAX_HF_BYTES",
+    "HFWeightsIterable",
+    "LoadWeightsFn",
+    "infer_shard_spec",
+]

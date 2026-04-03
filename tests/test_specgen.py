@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable
 import pytest
 import torch
 
-from wbridge.utils.specgen import infer_shard_spec
+from wbridge.utils.specgen import DEFAULT_MAX_HF_BYTES, infer_shard_spec
 
 
 @pytest.fixture(scope="module")
@@ -125,7 +125,7 @@ def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
         kv_dim=kv_dim,
     )
 
-    spec = infer_shard_spec(hfsd, wksd, lw)
+    spec = infer_shard_spec(iter(hfsd.items()), wksd, lw)
 
     assert "pp_skip.model.layers.0.mlp.fc.weight" not in spec.entries
 
@@ -146,3 +146,42 @@ def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
 
     for _name, shards, dtype in spec:
         assert dtype == torch.float32
+
+
+def test_infer_shard_spec_batched_merge_matches_single(device: torch.device) -> None:
+    """Small max_hf_bytes forces multiple batches; merged spec matches one-shot."""
+    V, H = 8, 4
+    hfsd = {
+        "a.weight": torch.randn(H, H),
+        "b.weight": torch.randn(H, H),
+        "c.weight": torch.randn(H, H),
+    }
+    wksd = {
+        "a.weight": torch.zeros(H, H, device=device),
+        "b.weight": torch.zeros(H, H, device=device),
+        "c.weight": torch.zeros(H, H, device=device),
+    }
+
+    def lw(weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        for name, t in weights:
+            short = name.replace("model.", "") if name.startswith("model.") else name
+            if short in wksd:
+                wksd[short].copy_(t)
+
+    # Rename keys to match wksd for trivial lw
+    hfsd_named = {
+        "a.weight": hfsd["a.weight"],
+        "b.weight": hfsd["b.weight"],
+        "c.weight": hfsd["c.weight"],
+    }
+
+    cap = 2 * hfsd_named["a.weight"].numel() * hfsd_named["a.weight"].element_size()
+    assert cap < DEFAULT_MAX_HF_BYTES
+
+    full = infer_shard_spec(iter(hfsd_named.items()), wksd, lw, max_hf_bytes=DEFAULT_MAX_HF_BYTES)
+    batched = infer_shard_spec(iter(hfsd_named.items()), wksd, lw, max_hf_bytes=cap)
+
+    assert set(full.entries.keys()) == set(batched.entries.keys())
+    for name in full.entries:
+        assert full[name]["shard"] == batched[name]["shard"]
+        assert full[name]["dtype"] == batched[name]["dtype"]
