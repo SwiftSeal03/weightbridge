@@ -98,17 +98,16 @@ class WeightReceiver:
         sender_world_size = int(data.pop("sender_world_size"))
         data["rank"] += self.rank
         is_nccl = data["backend"] == "nccl"
-        device_id = torch.device("cuda", torch.cuda.current_device()) if is_nccl else None
-        self.group = init_custom_process_group(**data, device_id=device_id)
+        self.group = init_custom_process_group(**data)
+        print(f"group initialized for rank {self.rank}")
         self.device = "cuda" if is_nccl else "cpu"
-        dist.barrier(group=self.group)
-        print(f"barrier passed for rank {self.rank}")
         
-        all_specs = [None] * data["world_size"]
-        dist.all_gather_object(all_specs, self.shard_spec, group=self.group)
+        tensors = [torch.zeros(1, dtype=torch.uint8, device=self.device) for _ in range(data["world_size"])]
+        dist.all_gather(tensors, torch.ones(1, dtype=torch.uint8, device=self.device), group=self.group)
+        print(f"all_gather done for rank {self.rank}")
         self.overlaps = {
-            rank: overlap for rank, peer_spec in enumerate(all_specs) 
-            if rank < sender_world_size and (overlap := ShardSpec.compute_overlap(peer_spec, self.shard_spec))
+            rank: overlap for rank, tensor in enumerate(tensors) 
+            if rank < sender_world_size and (overlap := ShardSpec.compute_overlap(self.shard_spec, tensor))
         }
             
         self._state = ReceiverState.CONNECTED

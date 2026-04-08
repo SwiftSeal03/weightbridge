@@ -72,17 +72,17 @@ class DirectSender:
                 resp.raise_for_status()
                 base_rank += num_workers
         
-        device_id = torch.device("cuda", torch.cuda.current_device()) if self.backend == "nccl" else None
-        self.group = init_custom_process_group(**pg_init_args, device_id=device_id)
-        dist.barrier(group=self.group)
-        print(f"barrier done for rank {self.rank}")
+        self.group = init_custom_process_group(**pg_init_args)
+        print(f"group initialized for rank {self.rank}")
         
-        all_specs = [None] * total_world_size
-        dist.all_gather_object(all_specs, self.shard_spec, group=self.group)
+        # all_specs = [None] * total_world_size
+        tensors = [torch.zeros(1, dtype=torch.uint8, device=self.device) for _ in range(total_world_size)]
+        dist.all_gather(tensors, torch.ones(1, dtype=torch.uint8, device=self.device), group=self.group)
+        print(f"all_gather done for rank {self.rank}")
         
         self.overlaps = {
-            rank: overlap for rank, peer_spec in enumerate(all_specs) 
-            if rank >= self.world_size and (overlap := ShardSpec.compute_overlap(self.shard_spec, peer_spec))
+            rank: overlap for rank, tensor in enumerate(tensors) 
+            if rank >= self.world_size and (overlap := ShardSpec.compute_overlap(self.shard_spec, tensor))
         }
         self.connected = True
 
