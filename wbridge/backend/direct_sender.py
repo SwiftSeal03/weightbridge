@@ -72,7 +72,8 @@ class DirectSender:
                 resp.raise_for_status()
                 base_rank += num_workers
         
-        self.group = init_custom_process_group(**pg_init_args)
+        device_id = torch.device("cuda", torch.cuda.current_device()) if self.backend == "nccl" else None
+        self.group = init_custom_process_group(**pg_init_args, device_id=device_id)
         dist.barrier(group=self.group)
         print(f"barrier done for rank {self.rank}")
         

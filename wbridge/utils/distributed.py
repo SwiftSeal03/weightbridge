@@ -34,6 +34,7 @@ def init_custom_process_group(
     store=None,
     group_name: str = None,
     pg_options: Any | None = None,
+    device_id: torch.device | None = None,
 ):
     """Create a named process group without touching the default group.
 
@@ -79,4 +80,6 @@ def init_custom_process_group(
     )
 
     _world.pg_group_ranks[pg] = {i: i for i in range(world_size)}
+    if device_id is not None:
+        pg.bound_device_id = device_id
     return pg

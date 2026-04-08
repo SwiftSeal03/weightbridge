@@ -97,8 +97,10 @@ class WeightReceiver:
         # Initialize the process group (pop keys not accepted by init_custom_process_group)
         sender_world_size = int(data.pop("sender_world_size"))
         data["rank"] += self.rank
-        self.group = init_custom_process_group(**data)
-        self.device = "cuda" if data["backend"] == "nccl" else "cpu"
+        is_nccl = data["backend"] == "nccl"
+        device_id = torch.device("cuda", torch.cuda.current_device()) if is_nccl else None
+        self.group = init_custom_process_group(**data, device_id=device_id)
+        self.device = "cuda" if is_nccl else "cpu"
         dist.barrier(group=self.group)
         print(f"barrier passed for rank {self.rank}")
         
