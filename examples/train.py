@@ -118,16 +118,16 @@ def main():
     )
 
     trainer_engine = TrainerEngine(engine_args)
-
     rollout_engine = RolloutEngine.options(scheduling_strategy=engine_args.rollout_scheduling_strategy).remote()
     ray.get(rollout_engine.init.remote(engine_args))
+    
     recv_future = rollout_engine.recv_weights.remote()
-
     trainer_engine.send_weights()
-
     ray.get(recv_future)
+    logger.info("Weights received")
+    
     results = ray.get(rollout_engine.verify_all.remote())
-    print(results)
+    logger.info(results)
     
     ray.shutdown()
 

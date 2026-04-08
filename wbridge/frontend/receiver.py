@@ -99,7 +99,9 @@ class WeightReceiver:
         data["rank"] += self.rank
         self.group = init_custom_process_group(**data)
         self.device = "cuda" if data["backend"] == "nccl" else "cpu"
-
+        dist.barrier(group=self.group)
+        print(f"barrier passed for rank {self.rank}")
+        
         all_specs = [None] * data["world_size"]
         dist.all_gather_object(all_specs, self.shard_spec, group=self.group)
         self.overlaps = {
