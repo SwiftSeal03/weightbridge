@@ -7,7 +7,11 @@ from collections.abc import Callable, Iterable
 import pytest
 import torch
 
-from wbridge.utils.specgen import DEFAULT_MAX_HF_BYTES, infer_shard_spec
+from wbridge.utils.specgen import (
+    DEFAULT_MAX_HF_BYTES,
+    infer_shard_spec,
+    verify_shard_spec_loader,
+)
 
 
 @pytest.fixture(scope="module")
@@ -125,7 +129,7 @@ def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
         kv_dim=kv_dim,
     )
 
-    spec = infer_shard_spec(iter(hfsd.items()), wksd, lw)
+    spec = infer_shard_spec(hfsd.items(), wksd, lw)
 
     assert "pp_skip.model.layers.0.mlp.fc.weight" not in spec.entries
 
@@ -178,10 +182,120 @@ def test_infer_shard_spec_batched_merge_matches_single(device: torch.device) -> 
     cap = 2 * hfsd_named["a.weight"].numel() * hfsd_named["a.weight"].element_size()
     assert cap < DEFAULT_MAX_HF_BYTES
 
-    full = infer_shard_spec(iter(hfsd_named.items()), wksd, lw, max_hf_bytes=DEFAULT_MAX_HF_BYTES)
-    batched = infer_shard_spec(iter(hfsd_named.items()), wksd, lw, max_hf_bytes=cap)
+    full = infer_shard_spec(hfsd_named.items(), wksd, lw, max_hf_bytes=DEFAULT_MAX_HF_BYTES)
+    batched = infer_shard_spec(hfsd_named.items(), wksd, lw, max_hf_bytes=cap)
 
     assert set(full.entries.keys()) == set(batched.entries.keys())
     for name in full.entries:
         assert full[name]["shard"] == batched[name]["shard"]
         assert full[name]["dtype"] == batched[name]["dtype"]
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+    reason="needs CUDA with bfloat16",
+)
+def test_infer_shard_spec_hf_worker_dtype_mismatch(device: torch.device) -> None:
+    """HF tensor bf16, worker fp32 (like SGLang e_score_correction_bias); spec + verify."""
+    hfsd = {
+        "model.layers.0.mlp.gate.e_score_correction_bias": torch.randn(
+            8, dtype=torch.bfloat16, device="cpu"
+        ),
+    }
+    wksd = {
+        "layers.0.mlp.gate.e_score_correction_bias": torch.zeros(8, dtype=torch.float32, device=device),
+    }
+
+    def lw(weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        for name, t in weights:
+            if name.endswith("e_score_correction_bias"):
+                wksd["layers.0.mlp.gate.e_score_correction_bias"].copy_(t)
+
+    spec = infer_shard_spec(hfsd.items(), wksd, lw)
+    name = "model.layers.0.mlp.gate.e_score_correction_bias"
+    assert spec[name]["dtype"] == torch.bfloat16
+    assert spec[name]["shard"] == [[(0, 8, 8)]]
+
+    hfsd_verify = {k: v.clone() for k, v in hfsd.items()}
+    lw(hfsd_verify.items())
+    verify_shard_spec_loader(hfsd_verify.items(), wksd, lw, spec)
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
+    reason="needs CUDA with bfloat16",
+)
+def test_infer_shard_spec_bfloat16(device: torch.device) -> None:
+    """``infer_shard_spec`` with bf16 HF + worker tensors at production-like sizes."""
+    dt = torch.bfloat16
+
+    # Large square weight (e.g. attention projection): 1024×1024, row-parallel TP2 on dim 1.
+    H = 1024
+    half_w = H // 2
+    tp_rank_o = 0
+    hfsd_o = {
+        "model.layers.0.self_attn.o_proj.weight": torch.randn(H, H, dtype=dt, device="cpu"),
+    }
+    wksd_o = {
+        "layers.0.self_attn.o_proj.weight": torch.zeros(H, half_w, dtype=dt, device=device),
+    }
+
+    def lw_o(weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        for name, t in weights:
+            if name.endswith("o_proj.weight"):
+                wksd_o["layers.0.self_attn.o_proj.weight"].copy_(
+                    t[:, tp_rank_o * half_w : (tp_rank_o + 1) * half_w]
+                )
+
+    spec_o = infer_shard_spec(hfsd_o.items(), wksd_o, lw_o)
+    assert spec_o["model.layers.0.self_attn.o_proj.weight"]["dtype"] == dt
+    assert spec_o["model.layers.0.self_attn.o_proj.weight"]["shard"] == [
+        [(0, H, H), (tp_rank_o * half_w, (tp_rank_o + 1) * half_w, H)]
+    ]
+
+    # Wide matrix 16×151936 (vocab-scale last dim): column-parallel TP2 on dim 1.
+    rows, cols = 16, 151_936
+    half_c = cols // 2
+    tp_rank_e = 1
+    hfsd_e = {
+        "model.embed_tokens.weight": torch.randn(rows, cols, dtype=dt, device="cpu"),
+    }
+    wksd_e = {
+        "model.embed_tokens.weight": torch.zeros(rows, half_c, dtype=dt, device=device),
+    }
+
+    def lw_e(weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        for name, t in weights:
+            if name.endswith("embed_tokens.weight"):
+                wksd_e["model.embed_tokens.weight"].copy_(
+                    t[:, tp_rank_e * half_c : (tp_rank_e + 1) * half_c]
+                )
+
+    spec_e = infer_shard_spec(hfsd_e.items(), wksd_e, lw_e)
+    assert spec_e["model.embed_tokens.weight"]["dtype"] == dt
+    assert spec_e["model.embed_tokens.weight"]["shard"] == [
+        [(0, rows, rows), (tp_rank_e * half_c, (tp_rank_e + 1) * half_c, cols)]
+    ]
+
+
+def test_verify_shard_spec_loader_1to1(device: torch.device) -> None:
+    """Sharded HF iterator + lw matches full load when spec covers exact read regions."""
+    H = 4
+    hfsd = {
+        "a.weight": torch.randn(H, H),
+        "b.weight": torch.randn(H, H),
+    }
+    wksd = {
+        "a.weight": torch.zeros(H, H, device=device),
+        "b.weight": torch.zeros(H, H, device=device),
+    }
+    
+    hfsd_verify = {k: v.clone() for k, v in hfsd.items()}
+
+    def lw(weights: Iterable[tuple[str, torch.Tensor]]) -> None:
+        for name, t in weights:
+            wksd[name].copy_(t)
+
+    lw(hfsd.items())
+    spec = infer_shard_spec(hfsd.items(), wksd, lw)
+    verify_shard_spec_loader(hfsd_verify.items(), wksd, lw, spec)
