@@ -4,8 +4,6 @@ from wbridge.frontend import WeightReceiver, WeightSender, WeightReceiverControl
 from wbridge.utils.data import (
     BoundShardSpec,
     ShardSpec,
-    dtype_str_to_torch,
-    dtype_to_str,
 )
 
 __all__ = [
@@ -14,6 +12,4 @@ __all__ = [
     "ShardSpec",
     "BoundShardSpec",
     "WeightReceiverController",
-    "dtype_str_to_torch",
-    "dtype_to_str",
 ]

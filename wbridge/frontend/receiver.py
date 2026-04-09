@@ -13,7 +13,7 @@ import zmq
 from fastapi import FastAPI, APIRouter
 from fastapi.responses import JSONResponse
 
-from wbridge.utils.data import ShardSpec
+from wbridge.utils.data import ShardSpec, shard_to_numel
 from wbridge.utils.distributed import init_custom_process_group
 
 logger = logging.getLogger(__name__)
@@ -99,15 +99,13 @@ class WeightReceiver:
         data["rank"] += self.rank
         is_nccl = data["backend"] == "nccl"
         self.group = init_custom_process_group(**data)
-        print(f"group initialized for rank {self.rank}")
         self.device = "cuda" if is_nccl else "cpu"
         
-        tensors = [torch.zeros(1, dtype=torch.uint8, device=self.device) for _ in range(data["world_size"])]
-        dist.all_gather(tensors, torch.ones(1, dtype=torch.uint8, device=self.device), group=self.group)
-        print(f"all_gather done for rank {self.rank}")
+        all_specs = [None] * data["world_size"]
+        dist.all_gather_object(all_specs, self.shard_spec, group=self.group)
         self.overlaps = {
-            rank: overlap for rank, tensor in enumerate(tensors) 
-            if rank < sender_world_size and (overlap := ShardSpec.compute_overlap(self.shard_spec, tensor))
+            rank: overlap for rank, spec in enumerate(all_specs) 
+            if rank < sender_world_size and (overlap := ShardSpec.compute_overlap(self.shard_spec, spec))
         }
             
         self._state = ReceiverState.CONNECTED
@@ -181,7 +179,7 @@ class WeightReceiver:
     def _receive_weights(self) -> None:
         """Receive overlap bytes from each sender, unpack into ``state_dict`` via :class:`BoundShardSpec`."""
         chunks = {
-            sender_rank: torch.zeros(overlap.total_nbytes(), dtype=torch.uint8, device=self.device)
+            sender_rank: torch.zeros(overlap.nbytes(self.state_dict), dtype=torch.uint8, device=self.device)
             for sender_rank, overlap in self.overlaps.items()
         }
         ops = [

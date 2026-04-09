@@ -31,18 +31,21 @@ def generate_local_tensors(
     into local shards.  When *seed* is ``None``, zero-filled tensors are
     returned.
     """
+    dtype = torch.float32
     full_tensors: dict[str, torch.Tensor] = {}
     if seed is not None:
         g = torch.Generator(device=device).manual_seed(seed)
-        for name, shards, dtype in shard_spec:
+        for name, shards in shard_spec:
             shape = tuple(w for _, _, w in shards[0])
             full_tensors[name] = torch.randn(*shape, dtype=dtype, device=device, generator=g)
 
     local_tensors: dict[str, torch.Tensor] = {}
-    for name, shards, dtype in shard_spec:
+    for name, shards in shard_spec:
         local_tensors[name] = torch.zeros(shards_to_numel(shards), dtype=dtype, device=device)
         if name in full_tensors:
-            for start, end, shard in shards_iterator(shard_spec[name]):
+            for start, end, shard in shards_iterator(
+                shard_spec[name], element_size=dtype.itemsize
+            ):
                 slices = tuple(slice(l, r) for l, r, _ in shard)
                 local_tensors[name][start:end] = full_tensors[name][slices].reshape(-1)
     return local_tensors

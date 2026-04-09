@@ -9,10 +9,10 @@ from wbridge.utils.data import ShardSpec, _check_shard_compatibility
 # Helpers
 # ---------------------------------------------------------------------------
 
-def _make_shard_spec(shard, dtype=torch.float32):
+def _make_shard_spec(shard):
     """Single-entry :class:`~wbridge.utils.data.ShardSpec` (one tensor name)."""
     return ShardSpec({
-        "weight": {"shard": shard, "dtype": dtype},
+        "weight": {"shard": shard},
     })
 
 
@@ -309,23 +309,21 @@ class TestCheckShardCompatibility:
 
 class TestComputeOverlap:
     def test_same_dims_partial_overlap(self):
-        dtype = torch.float32
         s_shard = [(1, 3, 4), (0, 6, 6)]
         r_shard = [(2, 4, 4), (2, 5, 6)]
-        sender = _make_shard_spec(s_shard, dtype)
-        receiver = _make_shard_spec(r_shard, dtype)
+        sender = _make_shard_spec(s_shard)
+        receiver = _make_shard_spec(r_shard)
         overlap = ShardSpec.compute_overlap(sender, receiver)
         assert "weight" in overlap.entries
-        o_shard = overlap["weight"]["shard"]
-        assert o_shard == [(2, 3, 4), (2, 5, 6)]
+        o_shard = overlap["weight"]
+        assert o_shard == [[(2, 3, 4), (2, 5, 6)]]
 
     def test_no_overlap(self):
         """Disjoint shards produce an empty result."""
-        dtype = torch.float32
         s_shard = [(0, 2, 4), (0, 6, 6)]
         r_shard = [(2, 4, 4), (0, 6, 6)]
-        sender = _make_shard_spec(s_shard, dtype)
-        receiver = _make_shard_spec(r_shard, dtype)
+        sender = _make_shard_spec(s_shard)
+        receiver = _make_shard_spec(r_shard)
         overlap = ShardSpec.compute_overlap(sender, receiver)
         assert len(overlap.entries) == 0
 
@@ -336,10 +334,9 @@ class TestComputeOverlap:
 
 class TestPackFor:
     def test_full_shard_roundtrip(self):
-        dtype = torch.float32
         shard = [(0, 4, 4), (0, 6, 6)]
-        sender = _make_shard_spec(shard, dtype)
-        receiver = _make_shard_spec(shard, dtype)
+        sender = _make_shard_spec(shard)
+        receiver = _make_shard_spec(shard)
         overlap = ShardSpec.compute_overlap(sender, receiver)
         t = _tensor_for_shard(shard, dtype)
         packed = sender({"weight": t})[{0: overlap}][0]

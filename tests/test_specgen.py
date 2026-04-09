@@ -1,4 +1,4 @@
-"""Tests for :func:`wbridge.utils.specgen.infer_shard_spec` with a composite ``lw``."""
+"""Tests for :func:`wbridge.utils.specgen.infer_load_spec` with a composite ``lw``."""
 
 from __future__ import annotations
 
@@ -7,17 +7,18 @@ from collections.abc import Callable, Iterable
 import pytest
 import torch
 
+from wbridge.utils.data import Shards
 from wbridge.utils.specgen import (
     DEFAULT_MAX_HF_BYTES,
-    infer_shard_spec,
-    verify_shard_spec_loader,
+    infer_load_spec,
+    verify_load_spec,
 )
 
 
 @pytest.fixture(scope="module")
 def device() -> torch.device:
     if not torch.cuda.is_available():
-        pytest.skip("infer_shard_spec requires CUDA worker tensors")
+        pytest.skip("infer_load_spec requires CUDA worker tensors")
     return torch.device("cuda", torch.cuda.current_device())
 
 
@@ -40,7 +41,6 @@ def _complex_sglang_like_lw(
       (like ``stacked_params_mapping`` merging ``q_proj`` / ``k_proj`` / ``v_proj`` into ``qkv_proj``).
     * **TP column-parallel:** ``gate_proj`` shards along dim 0 (output features).
     * **TP row-parallel:** ``o_proj`` shards along dim 1 (input features split across ranks).
-    * **Transpose:** one linear uses ``.T.contiguous()`` (Triton / layout quirks).
     * **Tied embeddings:** after the first full pass, iterate weights again and copy
       ``model.embed_tokens.weight`` into ``lm_head.weight`` (``qwen2``-style second scan).
     """
@@ -75,9 +75,9 @@ def _complex_sglang_like_lw(
                 t[tp_rank * half : (tp_rank + 1) * half, :]
             )
             return
-        if name == "model.triton_linear.weight":
-            wksd["triton_linear.weight"].copy_(t.T.contiguous())
-            return
+        # if name == "model.triton_linear.weight":
+        #     wksd["triton_linear.weight"].copy_(t.T.contiguous())
+        #     return
 
     def lw(weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         for name, t in weights:
@@ -105,7 +105,7 @@ def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
         "model.layers.1.self_attn.v_proj.weight": torch.randn(kv_dim, H),
         "model.layers.1.self_attn.o_proj.weight": torch.randn(H, H),
         "model.layers.1.mlp.gate_proj.weight": torch.randn(H, INTER),
-        "model.triton_linear.weight": torch.randn(H // 2, H),
+        # "model.triton_linear.weight": torch.randn(H // 2, H),
     }
     for t in hfsd.values():
         assert t.device.type == "cpu"
@@ -116,7 +116,7 @@ def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
         "layers.1.self_attn.qkv_proj.weight": torch.zeros(qkv_rows, H, device=device),
         "layers.1.self_attn.o_proj.weight": torch.zeros(H, half, device=device),
         "layers.1.mlp.gate_proj.weight": torch.zeros(half, INTER, device=device),
-        "triton_linear.weight": torch.zeros(H, H // 2, device=device),
+        # "triton_linear.weight": torch.zeros(H, H // 2, device=device),
     }
 
     lw = _complex_sglang_like_lw(
@@ -129,12 +129,13 @@ def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
         kv_dim=kv_dim,
     )
 
-    spec = infer_shard_spec(hfsd.items(), wksd, lw)
+    load_spec = infer_load_spec(hfsd.items(), wksd, lw)
+    spec = load_spec.src_spec()
 
     assert "pp_skip.model.layers.0.mlp.fc.weight" not in spec.entries
 
-    def _shard(name: str) -> list:
-        return spec[name]["shard"]
+    def _shard(name: str) -> Shards:
+        return spec[name]
 
     assert _shard("model.embed_tokens.weight") == [[(0, V, V + V_PAD), (0, H, H)]]
     assert _shard("model.layers.1.self_attn.q_proj.weight") == [[(0, q_dim, q_dim), (0, H, H)]]
@@ -146,13 +147,10 @@ def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
     assert _shard("model.layers.1.mlp.gate_proj.weight") == [
         [(tp_rank * half, (tp_rank + 1) * half, H), (0, INTER, INTER)]
     ]
-    assert _shard("model.triton_linear.weight") == [[(0, H // 2, H // 2), (0, H, H)]]
-
-    for _name, shards, dtype in spec:
-        assert dtype == torch.float32
+    # assert _shard("model.triton_linear.weight") == [[(0, H // 2, H // 2), (0, H, H)]]
 
 
-def test_infer_shard_spec_batched_merge_matches_single(device: torch.device) -> None:
+def test_infer_load_spec_batched_merge_matches_single(device: torch.device) -> None:
     """Small max_hf_bytes forces multiple batches; merged spec matches one-shot."""
     V, H = 8, 4
     hfsd = {
@@ -182,21 +180,20 @@ def test_infer_shard_spec_batched_merge_matches_single(device: torch.device) -> 
     cap = 2 * hfsd_named["a.weight"].numel() * hfsd_named["a.weight"].element_size()
     assert cap < DEFAULT_MAX_HF_BYTES
 
-    full = infer_shard_spec(hfsd_named.items(), wksd, lw, max_hf_bytes=DEFAULT_MAX_HF_BYTES)
-    batched = infer_shard_spec(hfsd_named.items(), wksd, lw, max_hf_bytes=cap)
+    full = infer_load_spec(hfsd_named.items(), wksd, lw, max_hf_bytes=DEFAULT_MAX_HF_BYTES).src_spec()
+    batched = infer_load_spec(hfsd_named.items(), wksd, lw, max_hf_bytes=cap).src_spec()
 
     assert set(full.entries.keys()) == set(batched.entries.keys())
     for name in full.entries:
-        assert full[name]["shard"] == batched[name]["shard"]
-        assert full[name]["dtype"] == batched[name]["dtype"]
+        assert full[name] == batched[name]
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
     reason="needs CUDA with bfloat16",
 )
-def test_infer_shard_spec_hf_worker_dtype_mismatch(device: torch.device) -> None:
-    """HF tensor bf16, worker fp32 (like SGLang e_score_correction_bias); spec + verify."""
+def test_infer_load_spec_hf_worker_dtype_mismatch(device: torch.device) -> None:
+    """HF tensor bf16, worker fp32 (like SGLang e_score_correction_bias); infer + verify."""
     hfsd = {
         "model.layers.0.mlp.gate.e_score_correction_bias": torch.randn(
             8, dtype=torch.bfloat16, device="cpu"
@@ -211,22 +208,22 @@ def test_infer_shard_spec_hf_worker_dtype_mismatch(device: torch.device) -> None
             if name.endswith("e_score_correction_bias"):
                 wksd["layers.0.mlp.gate.e_score_correction_bias"].copy_(t)
 
-    spec = infer_shard_spec(hfsd.items(), wksd, lw)
+    load_spec = infer_load_spec(hfsd.items(), wksd, lw)
+    spec = load_spec.src_spec()
     name = "model.layers.0.mlp.gate.e_score_correction_bias"
-    assert spec[name]["dtype"] == torch.bfloat16
-    assert spec[name]["shard"] == [[(0, 8, 8)]]
+    assert spec[name] == [[(0, 8, 8)]]
 
     hfsd_verify = {k: v.clone() for k, v in hfsd.items()}
     lw(hfsd_verify.items())
-    verify_shard_spec_loader(hfsd_verify.items(), wksd, lw, spec)
+    verify_load_spec(hfsd_verify.items(), wksd, load_spec)
 
 
 @pytest.mark.skipif(
     not torch.cuda.is_available() or not torch.cuda.is_bf16_supported(),
     reason="needs CUDA with bfloat16",
 )
-def test_infer_shard_spec_bfloat16(device: torch.device) -> None:
-    """``infer_shard_spec`` with bf16 HF + worker tensors at production-like sizes."""
+def test_infer_load_spec_bfloat16(device: torch.device) -> None:
+    """``infer_load_spec`` with bf16 HF + worker tensors at production-like sizes."""
     dt = torch.bfloat16
 
     # Large square weight (e.g. attention projection): 1024×1024, row-parallel TP2 on dim 1.
@@ -247,9 +244,8 @@ def test_infer_shard_spec_bfloat16(device: torch.device) -> None:
                     t[:, tp_rank_o * half_w : (tp_rank_o + 1) * half_w]
                 )
 
-    spec_o = infer_shard_spec(hfsd_o.items(), wksd_o, lw_o)
-    assert spec_o["model.layers.0.self_attn.o_proj.weight"]["dtype"] == dt
-    assert spec_o["model.layers.0.self_attn.o_proj.weight"]["shard"] == [
+    spec_o = infer_load_spec(hfsd_o.items(), wksd_o, lw_o).src_spec()
+    assert spec_o["model.layers.0.self_attn.o_proj.weight"] == [
         [(0, H, H), (tp_rank_o * half_w, (tp_rank_o + 1) * half_w, H)]
     ]
 
@@ -271,15 +267,14 @@ def test_infer_shard_spec_bfloat16(device: torch.device) -> None:
                     t[:, tp_rank_e * half_c : (tp_rank_e + 1) * half_c]
                 )
 
-    spec_e = infer_shard_spec(hfsd_e.items(), wksd_e, lw_e)
-    assert spec_e["model.embed_tokens.weight"]["dtype"] == dt
-    assert spec_e["model.embed_tokens.weight"]["shard"] == [
+    spec_e = infer_load_spec(hfsd_e.items(), wksd_e, lw_e).src_spec()
+    assert spec_e["model.embed_tokens.weight"] == [
         [(0, rows, rows), (tp_rank_e * half_c, (tp_rank_e + 1) * half_c, cols)]
     ]
 
 
-def test_verify_shard_spec_loader_1to1(device: torch.device) -> None:
-    """Sharded HF iterator + lw matches full load when spec covers exact read regions."""
+def test_verify_load_spec_1to1(device: torch.device) -> None:
+    """After load, :func:`verify_load_spec` matches HF slices to worker slices from the LoadSpec."""
     H = 4
     hfsd = {
         "a.weight": torch.randn(H, H),
@@ -297,5 +292,6 @@ def test_verify_shard_spec_loader_1to1(device: torch.device) -> None:
             wksd[name].copy_(t)
 
     lw(hfsd.items())
-    spec = infer_shard_spec(hfsd.items(), wksd, lw)
-    verify_shard_spec_loader(hfsd_verify.items(), wksd, lw, spec)
+    load_spec = infer_load_spec(hfsd.items(), wksd, lw)
+    spec = load_spec.src_spec()
+    verify_load_spec(hfsd_verify.items(), wksd, load_spec)

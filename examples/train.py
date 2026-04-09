@@ -102,35 +102,78 @@ def _build_receiver_shard_spec(rank: int) -> ShardSpec:
 def main():
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(filename)s:%(lineno)d - %(message)s")
     
-    rollout_ip, trainer_ip, rollout_node_id, trainer_node_id = get_ray_nodes()
-    engine_args = EngineArgs(
-        rollout_host=rollout_ip,
-        rollout_port=15000,
-        rollout_scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=rollout_node_id, soft=False),
-        num_rollout_workers=2,
-        rollout_shard_spec_generator=_build_receiver_shard_spec,
-        trainer_host=trainer_ip,
-        trainer_pg_port=60010,
-        trainer_scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=trainer_node_id, soft=False),
-        num_trainer_workers=2,
-        trainer_shard_spec_generator=_build_sender_shard_spec,
-        tensor_generator=partial(generate_local_tensors, device="cuda", seed=42),
-    )
+    # rollout_ip, trainer_ip, rollout_node_id, trainer_node_id = get_ray_nodes()
+    # engine_args = EngineArgs(
+    #     rollout_host=rollout_ip,
+    #     rollout_port=15000,
+    #     rollout_scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=rollout_node_id, soft=False),
+    #     num_rollout_workers=2,
+    #     rollout_shard_spec_generator=_build_receiver_shard_spec,
+    #     trainer_host=trainer_ip,
+    #     trainer_pg_port=60010,
+    #     trainer_scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=trainer_node_id, soft=False),
+    #     num_trainer_workers=2,
+    #     trainer_shard_spec_generator=_build_sender_shard_spec,
+    #     tensor_generator=partial(generate_local_tensors, device="cuda", seed=42),
+    # )
 
-    trainer_engine = TrainerEngine(engine_args)
-    rollout_engine = RolloutEngine.options(scheduling_strategy=engine_args.rollout_scheduling_strategy).remote()
-    ray.get(rollout_engine.init.remote(engine_args))
+    # trainer_engine = TrainerEngine(engine_args)
+    # rollout_engine = RolloutEngine.options(scheduling_strategy=engine_args.rollout_scheduling_strategy).remote()
+    # ray.get(rollout_engine.init.remote(engine_args))
     
-    recv_future = rollout_engine.recv_weights.remote()
-    trainer_engine.send_weights()
-    ray.get(recv_future)
-    logger.info("Weights received")
+    # recv_future = rollout_engine.recv_weights.remote()
+    # trainer_engine.send_weights()
+    # ray.get(recv_future)
+    # logger.info("Weights received")
     
-    results = ray.get(rollout_engine.verify_all.remote())
-    logger.info(results)
+    # results = ray.get(rollout_engine.verify_all.remote())
+    # logger.info(results)
     
+    # ray.shutdown()
+    
+    ip, _, id1, id2 = get_ray_nodes()
+    ids = [id1, id2]
+    
+    @ray.remote(num_gpus=1)
+    class NodeManager:
+        def init(self, rank: int, world_size: int, master_ip: str):
+            self.rank = rank
+            self.world_size = world_size
+            self.master_ip = master_ip
+            
+        def run(self):
+            import torch.distributed as dist
+            import socket
+            
+            import os
+            # from wbridge.utils.distributed import init_custom_process_group
+            ip = ray._private.services.get_node_ip_address()
+            print(f"ip: {ip}")
+            
+            os.environ["NCCL_SOCKET_IFNAME"] = "eno1"
+                
+            group = dist.init_process_group(
+                backend="nccl", 
+                init_method=f"tcp://{self.master_ip}:60011", 
+                world_size=self.world_size,
+                rank=self.rank, 
+                group_name="test"
+            )
+            print(f"Group {self.rank} initialized")
+            
+            tensor = torch.ones(1, dtype=torch.uint8, device="cuda:0")
+            dist.broadcast(tensor, src=0, group=group)
+            print(f"Tensor {self.rank} broadcasted")
+
+    nodes = [
+        NodeManager.options(scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=i, soft=False)).remote() 
+        for i in ids
+    ]
+    ray.get([node.init.remote(i, 2, ip) for i, node in enumerate(nodes)])
+    print("Nodes initialized")
+    ray.get([node.run.remote() for node in nodes])
+    print("Nodes ran")
     ray.shutdown()
-
 
 if __name__ == "__main__":
     main()

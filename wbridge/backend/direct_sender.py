@@ -76,12 +76,12 @@ class DirectSender:
         print(f"group initialized for rank {self.rank}")
         
         # all_specs = [None] * total_world_size
-        tensors = [torch.zeros(1, dtype=torch.uint8, device=self.device) for _ in range(total_world_size)]
-        dist.all_gather(tensors, torch.ones(1, dtype=torch.uint8, device=self.device), group=self.group)
+        all_specs = [None] * total_world_size
+        dist.all_gather_object(all_specs, self.shard_spec, group=self.group)
         print(f"all_gather done for rank {self.rank}")
         
         self.overlaps = {
-            rank: overlap for rank, tensor in enumerate(tensors) 
+            rank: overlap for rank, tensor in enumerate(all_specs) 
             if rank >= self.world_size and (overlap := ShardSpec.compute_overlap(self.shard_spec, tensor))
         }
         self.connected = True
