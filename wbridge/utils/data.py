@@ -7,6 +7,8 @@ import torch
 
 Shard: TypeAlias = list[tuple[int, int, int]]
 Shards: TypeAlias = list[Shard]
+# One HF↔worker region pair: source box and destination box (same flattened numel).
+ShardMapping: TypeAlias = tuple[Shard, Shard]
 
 def _normalize_shards(
     shard: Shard | Shards,
@@ -242,7 +244,7 @@ class BoundShardSpec:
                 name: dst_tensor[start:end]
                 for start, end, name in dst_spec.iter_with_intv(self._tensors)
             }
-            BoundShardSpec.slice_copy(self, dst_spec(state_dict), l2s=True)
+            BoundShardSpec.slice_copy(self, dst_spec(state_dict), big2small=True)
             dst_tensors[rank] = dst_tensor
         return dst_tensors
 
@@ -257,7 +259,7 @@ class BoundShardSpec:
                 name: src_tensor[start:end]
                 for start, end, name in src_spec.iter_with_intv(self._tensors)
             }
-            BoundShardSpec.slice_copy(self, src_spec(state_dict), l2s=False)
+            BoundShardSpec.slice_copy(self, src_spec(state_dict), big2small=False)
 
 
 def _check_shard_compatibility(
@@ -327,44 +329,55 @@ def _check_shard_compatibility(
 class LoadSpec:
     """
     A transfer spec describes the correspondence between 2 sets of tensors.
-    
-    The format is:
-    {
-        "src_name": {
-            "dst_name": (
-                [(l, r, w), ...], # src shard
-                [(l, r, w), ...], # dst shard
-            ),
+
+    The format is::
+
+        {
+            "src_name": {
+                "dst_name": [
+                    (src_shard, dst_shard),  # each is a :class:`Shard`
+                    ...
+                ],
+                ...
+            },
             ...
-        },
-        ...
-    }
-    
-    NOTE: only 1 shard mapping is allowed between 1 pair of names
+        }
+
+    Each ``(src_shard, dst_shard)`` pair maps one axis-aligned box in the source
+    tensor to one box in the destination; ``shard_to_numel`` must match on both
+    sides. Multiple pairs per ``(src_name, dst_name)`` are allowed (e.g. split
+    QKV blocks).
     """
-    def __init__(self, entries: dict[str, dict[str, tuple[Shard, Shard]]]):
+
+    def __init__(self, entries: dict[str, dict[str, list[ShardMapping]]]) -> None:
         self.entries = entries
-        for sname, dname, sshard, dshard in self:
-            _sanity_check(sname, [sshard])
-            _sanity_check(dname, [dshard])
-            assert len(sshard) == len(dshard), f"Shard length mismatch for {sname}->{dname}"
-            assert all(
-                s_shard[1] - s_shard[0] == d_shard[1] - d_shard[0]
-                for s_shard, d_shard in zip(sshard, dshard)
-            ), f"Shard length mismatch for {sname}->{dname}"
+        for sname, dname, s_shard, d_shard in self:
+            _sanity_check(sname, [s_shard])
+            _sanity_check(dname, [d_shard])
+            assert shard_to_numel(s_shard) == shard_to_numel(d_shard), (
+                f"numel mismatch for {sname}->{dname}: "
+                f"{shard_to_numel(s_shard)} vs {shard_to_numel(d_shard)}"
+            )
 
     def __len__(self) -> int:
         return len(self.entries)
-    
+
     def src_spec(self) -> ShardSpec:
-        return ShardSpec({
-            src_name: [v[0] for v in entry.values()]
-            for src_name, entry in self.entries.items()
-        })
-    
+        def _unique_shards_for_src(entry: dict[str, list[ShardMapping]]) -> Shards:
+            seen: set[tuple[tuple[int, int, int], ...]] = set()
+            out: Shards = []
+            for mappings in entry.values():
+                for s_shard, _ in mappings:
+                    key = tuple(s_shard)
+                    if key not in seen:
+                        seen.add(key)
+                        out.append(list(s_shard))
+            return out
+
+        return ShardSpec({src_name: _unique_shards_for_src(entry) for src_name, entry in self.entries.items()})
+
     def __iter__(self) -> Iterator[tuple[str, str, Shard, Shard]]:
-        return iter([
-            (sname, dname, sshard, dshard)
-            for sname, entry in self.entries.items() 
-            for dname, (sshard, dshard) in entry.items()
-        ])
+        for sname, entry in self.entries.items():
+            for dname, mappings in entry.items():
+                for s_shard, d_shard in mappings:
+                    yield sname, dname, s_shard, d_shard

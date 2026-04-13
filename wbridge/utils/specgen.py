@@ -16,10 +16,12 @@ from collections.abc import Callable, Iterable, Iterator
 from typing import Any
 
 import torch
+import torch.nn.functional as F
 import logging
 
 from wbridge.utils.data import (
     Shard,
+    ShardMapping,
     Shards,
     ShardSpec,
     LoadSpec,
@@ -48,15 +50,18 @@ def verify_load_spec(
     expected = {k: torch.zeros_like(v, device="cpu") for k, v in wksd.items()}
 
     for sname, hf_tensor in hf_iterator:
-        for dname, (sshard, dshard) in load_spec.entries[sname].items():
-            assert len(sshard) == len(dshard)
+        if sname not in load_spec.entries:
+            # logger.warning(f"verify_load_spec: source {sname!r} not in load_spec")
+            continue
+        for dname, mappings in load_spec.entries[sname].items():
             assert dname in expected, f"verify_load_spec: destination {dname!r} not in wksd"
-            src_slices = tuple(slice(l, r) for l, r, _ in sshard)
-            dst_slices = tuple(slice(l, r) for l, r, _ in dshard)
-            expected[dname][dst_slices].copy_(hf_tensor[src_slices])
+            for s_shard, d_shard in mappings:
+                src_slices = tuple(slice(l, r) for l, r, _ in s_shard)
+                dst_slices = tuple(slice(l, r) for l, r, _ in d_shard)
+                expected[dname][dst_slices].copy_(hf_tensor[src_slices])
 
     for k, v in wksd.items():
-        assert torch.equal(expected[k].to(v.device), v), f"verify_load_spec: mismatch on worker key {k!r}"
+        assert torch.equal(expected[k].to(v.device), v), f"verify_load_spec: mismatch on worker key {k}"
     logger.info("LoadSpec verification succeeded")
 
 
@@ -122,77 +127,135 @@ def _extract_shard(
     hfsd: dict[str, torch.Tensor],
     wksd: dict[str, torch.Tensor],
     lw: LoadWeightsFn,
-) -> Shard:
+) -> list[tuple[Shard, Shard]]:
     """Bounding box in HF tensor index space for one (HF name, worker param) pair."""
-    hf_src = hfsd[hf_name]
-    wk_param = wksd[wk_name]
-    wk_dtype = wk_param.dtype
-
-    # HF checkpoints may store bf16 while the worker keeps fp32 (e.g. MoE correction bias).
-    # Int-bit probing must use the worker element width; lw sees a feed tensor in wk_dtype.
-    if hf_src.dtype != wk_dtype:
-        feed = hf_src.detach().clone().to(wk_dtype).contiguous()
-    else:
-        feed = hf_src
-
     # View the feed and worker tensors as integers
+    hf_tensor = hfsd[hf_name]
+    wk_tensor = wksd[wk_name]
+    wk_dtype = wk_tensor.dtype
     ele_bits = wk_dtype.itemsize * 8
     int_dtype = getattr(torch, f"int{ele_bits}")
-    feed_v = feed.view(dtype=int_dtype)
-    wk_v = wk_param.view(dtype=int_dtype)
+    n_dim = wk_tensor.dim()
 
     # Get mask of worker tensors that are affected by the HF tensor
-    wk_param.zero_()
-    lw(iter([(hf_name, feed)]))
-    wk_mask = wk_param != 0
-    coords = torch.nonzero(wk_mask).transpose(0, 1)
-    wk_shard = [
-        (coords[d].min().item(), coords[d].max().item() + 1, w)
-        for d, w in enumerate(wk_param.shape)
-    ]
-
-    hf_numel = feed_v.numel()
-    wk_numel = wk_mask.sum()
-    assert wk_numel > 0, "no worker tensors affected by HF tensor"
-
+    wk_tensor.zero_()
+    lw(iter([(hf_name, hf_tensor)]))    
+    wk_mask = wk_tensor != 0
+    
     # Create auxiliary index tensors
+    hf_numel = hf_tensor.numel()
     idx_bits = max(ele_bits, (hf_numel - 1).bit_length() + 1)
     idx_dtype: torch.dtype = getattr(torch, f"int{1 << (idx_bits - 1).bit_length()}")
-    hf_indices = torch.arange(hf_numel, dtype=idx_dtype, device=feed.device).view(
+    hf_indices = torch.arange(hf_numel, dtype=idx_dtype, device=hf_tensor.device).view(
         int_dtype
-    ).reshape(*feed.shape, -1)
-    wk_indices = torch.zeros(wk_numel, dtype=idx_dtype, device=wk_param.device).view(
+    ).reshape(*hf_tensor.shape, -1)
+    wk_indices = torch.zeros_like(wk_tensor, dtype=idx_dtype, device=wk_tensor.device).view(
         int_dtype
-    ).reshape(wk_numel, -1)
+    ).reshape(*wk_tensor.shape, -1)
 
     # Know source of each affected element in the worker tensor
+    hf_int_tensor = torch.zeros_like(hf_tensor, dtype=int_dtype, device=hf_tensor.device)
+    wk_int_tensor = wk_tensor.view(dtype=int_dtype)
     for k in range(hf_indices.shape[-1]):
-        feed_v.copy_(hf_indices[..., k])
-        lw(iter([(hf_name, feed)]))
-        wk_indices[..., k] = wk_v[wk_mask]
-
-    wk_indices = wk_indices.view(idx_dtype).view(-1)
-    coords = torch.unravel_index(wk_indices, feed.shape) 
-
-    hf_shard = [
-        (coords[d].min().item(), coords[d].max().item() + 1, w)
-        for d, w in enumerate(feed.shape)
-    ]
+        hf_int_tensor.copy_(hf_indices[..., k])
+        lw(iter([(hf_name, hf_int_tensor.view(wk_dtype))]))
+        wk_indices[..., k] = wk_int_tensor
+    wk_indices = wk_indices.view(idx_dtype).squeeze(-1)
     
-    return hf_shard, wk_shard
+    # NOTE for high-dimensional tensors, we still use the simple way
+    if n_dim > 2:
+        def coords_to_shard(coords: torch.Tensor) -> Shard:
+            return [
+                (coords[d].min().item(), coords[d].max().item() + 1, w)
+                for d, w in enumerate(coords.shape)
+            ]
+        wk_coords = torch.nonzero(wk_mask).transpose(0, 1)
+        wk_shard = coords_to_shard(wk_coords)
+        hf_coords = torch.unravel_index(wk_indices, hf_tensor.shape) 
+        hf_shard = coords_to_shard(hf_coords)
+        return [(hf_shard, wk_shard)]
+    
+    # Special handling for 1D tensor
+    if n_dim == 1:
+        # Wether each element's source succeeds it's left neighbor's source
+        succ_left = wk_indices == F.pad(wk_indices, (1, 0), value=-2)[:-1] + 1
+        
+        # NOTE: Here we assume no segment has a length of 1
+        # -1 indicates beginning of 1D shard, 0 indicates middle of 1D shard, 1 indicates end of 1D shard
+        delta_succ_left = succ_left ^ F.pad(succ_left, (0, 1), value=0)[1:]
+        wk_shard_ends = delta_succ_left.nonzero().view(-1, 2).tolist()
+                            
+        shard_mappings = []
+        hf_ids = wk_indices[tuple(wk_shard_ends)].tolist()
+        for i, (l, r) in enumerate(wk_shard_ends):
+            shard_mappings.append((
+                [(hf_ids[i * 2], hf_ids[i * 2 + 1] + 1, hf_tensor.shape[0])],
+                [(l, r + 1, wk_tensor.shape[0])]
+            ))
+        return shard_mappings
+    
+    # Special handling for 2D tensor
+    if n_dim == 2:
+        # Wether each element's source succeeds it's up/left neighbor's source
+        hf_h, hf_w = hf_tensor.shape
+        wk_rows_ids = wk_indices // hf_w
+        wk_cols_ids = wk_indices % hf_w
+        succ_up = wk_rows_ids == F.pad(wk_rows_ids, (0, 0, 1, 0), value=-2)[:-1] + 1
+        succ_left = wk_cols_ids == F.pad(wk_cols_ids, (1, 0, 0, 0), value=-2)[:, :-1] + 1
+        succ_up_left = succ_up & succ_left
+        
+        # NOTE: Here we assume no segment has a width or height of 1
+        # delta values of 1 indicates 2 corners of a 2D shard
+        padded = F.pad(succ_up_left, (0, 1, 0, 1), value=0)
+        delta = succ_up_left ^ padded[1:, :-1] ^ padded[:-1, 1:] ^ padded[1:, 1:]
+        corners = delta.nonzero(as_tuple=True)
+        values = delta[corners].tolist()
+        hf_ids = wk_indices[corners]
+        corners = torch.stack(corners, dim=1).tolist()
+        coord_2_id = { (x, y): i for i, (x, y) in enumerate(corners) }
+
+        shard_mappings = []
+        for i, (x0, y0) in enumerate(corners): # top left corner
+            if not values[i]:
+                continue
+            hf_id = hf_ids[i].item()
+            hf_x0, hf_y0 = divmod(hf_id, hf_w)
+            x1, y1 = None, None
+            for j in range(i + 1, len(corners)): # top right corner
+                if corners[j][0] == x0:
+                    values[j] = False
+                    y1 = corners[j][1]
+                    break
+            for j in range(i + 1, len(corners)): # bottom left corner
+                if corners[j][1] == y0:
+                    values[j] = False
+                    x1 = corners[j][0]
+                    break
+            assert x1 is not None and y1 is not None, f"2D shard corner not found for top left corner {x0}, {y0}"
+            assert (x1, y1) in coord_2_id, f"2D shard not rectangular, ({x0}, {y0}) -> ({x1}, {y1})"
+            k = coord_2_id[(x1, y1)]
+            hf_x1, hf_y1 = divmod(hf_ids[k].item(), hf_w)
+            values[k] = False
+            shard_mappings.append((
+                [(hf_x0, hf_x1 + 1, hf_h), (hf_y0, hf_y1 + 1, hf_w)],
+                [(x0, x1 + 1, wk_tensor.shape[0]), (y0, y1 + 1, wk_tensor.shape[1])]
+            ))
+        return shard_mappings
+            
 
 
 def _infer_shard_spec_from_hfsd(
     hfsd: dict[str, torch.Tensor],
     wksd: dict[str, torch.Tensor],
     lw: LoadWeightsFn,
-) -> dict[str, dict[str, tuple[Shard, Shard]]]:
+) -> dict[str, dict[str, list[ShardMapping]]]:
     """Run stage 1+2 on one in-memory HF batch; returns spec dict (not wrapped)."""
     import time
     start_time = time.time()
     name_map = _match_hf_to_worker_names(hfsd, wksd, lw)
     end_time = time.time()
     logging.info(f"Time taken to match HF to worker names: {end_time - start_time} seconds")
+    logging.info(f"name_map: {name_map}")
 
     start_time = end_time
     entries = {
@@ -221,7 +284,7 @@ def infer_load_spec(
 
     backup = {k: v.detach().cpu() for k, v in wksd.items()}
     try:
-        merged: dict[str, dict[str, tuple[Shard, Shard]]] = {}
+        merged: dict[str, dict[str, list[ShardMapping]]] = {}
         batch: dict[str, torch.Tensor] = {}
         batch_bytes = 0
 

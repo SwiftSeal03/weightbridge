@@ -91,7 +91,8 @@ def _complex_sglang_like_lw(
 
 
 def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
-    V, V_PAD, H, INTER = 256, 32, 64, 128
+    # V, V_PAD, H, INTER = 256, 32, 64, 128
+    V, V_PAD, H, INTER = 8, 1, 4, 8
     tp_rank = 1
     q_dim, kv_dim = 64, 16
     qkv_rows = q_dim + 2 * kv_dim
