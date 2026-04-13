@@ -7,7 +7,7 @@ from collections.abc import Callable, Iterable
 import pytest
 import torch
 
-from wbridge.utils.data import Shards
+from wbridge.utils.data import LoadSpec, Shards
 from wbridge.utils.specgen import (
     DEFAULT_MAX_HF_BYTES,
     infer_load_spec,
@@ -296,3 +296,110 @@ def test_verify_load_spec_1to1(device: torch.device) -> None:
     load_spec = infer_load_spec(hfsd.items(), wksd, lw)
     spec = load_spec.src_spec()
     verify_load_spec(hfsd_verify.items(), wksd, load_spec)
+
+
+def test_load_spec_src_spec_multi_mapping_merge_and_split() -> None:
+    """Multiple :class:`ShardMapping` for one (src, dst) pair; :meth:`LoadSpec.src_spec` lists source shards.
+
+    Cases 1–4 use **2D** tensors (axis-aligned boxes). Cases 5–6 are separate **1D** tensors with scattered
+    index ranges.
+    """
+    H, C = 4, 16
+
+    # --- Case 1 (2D): full row span, two non-adjacent column windows → two src shards ---
+    split_entries = {
+        "hf_split": {
+            "wk_split": [
+                ([(0, H, H), (0, 4, C)], [(0, H, H), (0, 4, C)]),
+                ([(0, H, H), (8, 12, C)], [(0, H, H), (4, 8, C)]),
+            ]
+        }
+    }
+    spec_split = LoadSpec(split_entries).src_spec()
+    assert sorted(spec_split["hf_split"], key=lambda s: (s[1][0], s[1][1])) == [
+        [(0, H, H), (0, 4, C)],
+        [(0, H, H), (8, 12, C)],
+    ]
+
+    # --- Case 2 (2D): full rows, two column bands separated by a gap (distinct from case 1) ---
+    gap_entries = {
+        "hf_gap": {
+            "wk_gap": [
+                ([(0, H, H), (0, 3, C)], [(0, H, H), (0, 3, C)]),
+                ([(0, H, H), (10, 14, C)], [(0, H, H), (3, 7, C)]),
+            ]
+        }
+    }
+    spec_gap = LoadSpec(gap_entries).src_spec()
+    assert sorted(spec_gap["hf_gap"], key=lambda s: (s[1][0], s[1][1])) == [
+        [(0, H, H), (0, 3, C)],
+        [(0, H, H), (10, 14, C)],
+    ]
+
+    # --- Case 3 (2D): scattered column intervals (gaps), three src shards ---
+    scattered_entries = {
+        "hf_scatter": {
+            "wk_scatter": [
+                ([(0, H, H), (0, 2, C)], [(0, H, H), (0, 2, C)]),
+                ([(0, H, H), (5, 7, C)], [(0, H, H), (2, 4, C)]),
+                ([(0, H, H), (10, 12, C)], [(0, H, H), (4, 6, C)]),
+            ]
+        }
+    }
+    spec_scatter = LoadSpec(scattered_entries).src_spec()
+    assert sorted(spec_scatter["hf_scatter"], key=lambda s: s[1][0]) == [
+        [(0, H, H), (0, 2, C)],
+        [(0, H, H), (5, 7, C)],
+        [(0, H, H), (10, 12, C)],
+    ]
+
+    # --- Case 4 (2D): two disjoint rectangles (different row *and* column ranges), no overlap ---
+    disjoint_entries = {
+        "hf_disjoint": {
+            "wk_disjoint": [
+                ([(0, 2, H), (0, 4, C)], [(0, 2, H), (0, 4, C)]),
+                ([(2, H, H), (8, 12, C)], [(2, H, H), (4, 8, C)]),
+            ]
+        }
+    }
+    spec_disjoint = LoadSpec(disjoint_entries).src_spec()
+    assert sorted(spec_disjoint["hf_disjoint"], key=lambda s: (s[0][0], s[1][0])) == [
+        [(0, 2, H), (0, 4, C)],
+        [(2, H, H), (8, 12, C)],
+    ]
+
+    # --- Case 5 (1D): pseudo-random non-adjacent intervals on one axis ---
+    W1 = 32
+    random_1d = {
+        "hf_rand1d": {
+            "wk_rand1d": [
+                ([(1, 3, W1)], [(0, 2, W1)]),
+                ([(11, 15, W1)], [(2, 6, W1)]),
+                ([(20, 24, W1)], [(6, 10, W1)]),
+            ]
+        }
+    }
+    spec_1d = LoadSpec(random_1d).src_spec()
+    assert sorted(spec_1d["hf_rand1d"], key=lambda s: s[0][0]) == [
+        [(1, 3, W1)],
+        [(11, 15, W1)],
+        [(20, 24, W1)],
+    ]
+
+    # --- Case 6 (1D): second 1D tensor, different width and scattered ranges ---
+    W2 = 48
+    random_1d_b = {
+        "hf_rand1d_b": {
+            "wk_rand1d_b": [
+                ([(0, 5, W2)], [(0, 5, W2)]),
+                ([(7, 11, W2)], [(5, 9, W2)]),
+                ([(30, 36, W2)], [(9, 15, W2)]),
+            ]
+        }
+    }
+    spec_1d_b = LoadSpec(random_1d_b).src_spec()
+    assert sorted(spec_1d_b["hf_rand1d_b"], key=lambda s: s[0][0]) == [
+        [(0, 5, W2)],
+        [(7, 11, W2)],
+        [(30, 36, W2)],
+    ]

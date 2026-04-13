@@ -22,10 +22,7 @@ import logging
 from wbridge.utils.data import (
     Shard,
     ShardMapping,
-    Shards,
-    ShardSpec,
     LoadSpec,
-    _normalize_shards,
 )
 
 WeightsIterable = Iterable[tuple[str, torch.Tensor]]
@@ -121,7 +118,7 @@ def _match_hf_to_worker_names(
     return dict(mapping)
 
 
-def _extract_shard(
+def _extract_shard_mapping(
     hf_name: str,
     wk_name: str,
     hfsd: dict[str, torch.Tensor],
@@ -260,7 +257,7 @@ def _infer_shard_spec_from_hfsd(
     start_time = end_time
     entries = {
         hf_name: { 
-            wk_name: _extract_shard(hf_name, wk_name, hfsd, wksd, lw)
+            wk_name: _extract_shard_mapping(hf_name, wk_name, hfsd, wksd, lw)
             for wk_name in wk_names
         } for hf_name, wk_names in name_map.items()
     }

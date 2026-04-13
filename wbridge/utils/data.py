@@ -326,6 +326,66 @@ def _check_shard_compatibility(
     return aligned
 
 
+def _shard_contained_in(inner: Shard, outer: Shard) -> bool:
+    """True if *inner*'s box lies inside *outer* (same dimensionality and width metadata)."""
+    if len(inner) != len(outer):
+        return False
+    for (li, ri, wi), (lo, ro, wo) in zip(inner, outer):
+        if wi != wo:
+            return False
+        if not (lo <= li < ri <= ro):
+            return False
+    return True
+
+
+def _try_merge_two_shards(a: Shard, b: Shard) -> Shard | None:
+    """If *a* and *b* match on all but one axis, and on that axis the intervals touch or overlap, return the union."""
+    if len(a) != len(b):
+        return None
+    diff_dim: int | None = None
+    for d, ((la, ra, wa), (lb, rb, wb)) in enumerate(zip(a, b)):
+        if wa != wb:
+            return None
+        if (la, ra) != (lb, rb):
+            if diff_dim is not None:
+                return None
+            diff_dim = d
+    if diff_dim is None:
+        return None
+    la, ra, w = a[diff_dim]
+    lb, rb, _ = b[diff_dim]
+    if ra < lb or rb < la:
+        return None
+    ml, mr = min(la, lb), max(ra, rb)
+    if ml >= mr:
+        return None
+    out = list(a)
+    out[diff_dim] = (ml, mr, w)
+    return out
+
+
+def _merge_shards_for_src_spec(shards: Shards) -> Shards:
+    """Collapse duplicate / contained shards and merge axis-aligned neighbors that differ on one axis only."""
+    work: list[Shard] = [list(s) for s in shards]
+    n = len(work)
+    keep = [True] * n
+    all_pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
+    while all_pairs:
+        i, j = all_pairs.pop()
+        if not keep[i] or not keep[j]:
+            continue
+        a, b = work[i], work[j]
+        if _shard_contained_in(b, a) and _shard_contained_in(a, b):
+            keep[j] = False
+            continue
+        if c:=_try_merge_two_shards(a, b):
+            work.append(c)
+            keep.append(True)
+            all_pairs.extend([(k, n) for k in range(n) if keep[k]])
+            n += 1            
+    return work
+
+
 class LoadSpec:
     """
     A transfer spec describes the correspondence between 2 sets of tensors.
@@ -372,7 +432,7 @@ class LoadSpec:
                     if key not in seen:
                         seen.add(key)
                         out.append(list(s_shard))
-            return out
+            return _merge_shards_for_src_spec(out)
 
         return ShardSpec({src_name: _unique_shards_for_src(entry) for src_name, entry in self.entries.items()})
 
