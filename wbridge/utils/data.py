@@ -366,24 +366,29 @@ def _try_merge_two_shards(a: Shard, b: Shard) -> Shard | None:
 
 def _merge_shards_for_src_spec(shards: Shards) -> Shards:
     """Collapse duplicate / contained shards and merge axis-aligned neighbors that differ on one axis only."""
-    work: list[Shard] = [list(s) for s in shards]
-    n = len(work)
-    keep = [True] * n
-    all_pairs = [(i, j) for i in range(n) for j in range(i + 1, n)]
-    while all_pairs:
-        i, j = all_pairs.pop()
-        if not keep[i] or not keep[j]:
+    keep = [True] * len(shards)
+    i = 0
+    while i < len(keep):
+        if not keep[i]:
+            i += 1
             continue
-        a, b = work[i], work[j]
-        if _shard_contained_in(b, a) and _shard_contained_in(a, b):
-            keep[j] = False
-            continue
-        if c:=_try_merge_two_shards(a, b):
-            work.append(c)
-            keep.append(True)
-            all_pairs.extend([(k, n) for k in range(n) if keep[k]])
-            n += 1            
-    return work
+        cur_shard = shards[i]
+        for j in range(0, i):
+            if keep[j]:
+                shard = shards[j]
+                if _shard_contained_in(shard, cur_shard):
+                    keep[j] = False
+                elif _shard_contained_in(cur_shard, shard):
+                    keep[i] = False
+                    break
+                elif c:=_try_merge_two_shards(shard, cur_shard):
+                    shards.append(c)
+                    keep.append(True)
+                    keep[i] = False
+                    keep[j] = False
+                    break
+        i += 1
+    return [shard for i, shard in enumerate(shards) if keep[i]]
 
 
 class LoadSpec:
@@ -441,3 +446,15 @@ class LoadSpec:
             for dname, mappings in entry.items():
                 for s_shard, d_shard in mappings:
                     yield sname, dname, s_shard, d_shard
+        
+    def from_jsonable(self, jsonable: dict[str, dict[str, list[list[list[int]]]]]) -> "LoadSpec":
+        return LoadSpec({
+            sname: {
+                dname: [
+                    (
+                        [tuple(t) for t in s_shard],
+                        [tuple(t) for t in d_shard]
+                    ) for s_shard, d_shard in mappings
+                ] for dname, mappings in entry.items()
+            } for sname, entry in jsonable.items()
+        })

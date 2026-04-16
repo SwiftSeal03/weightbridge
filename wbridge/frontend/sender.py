@@ -7,10 +7,10 @@ from wbridge.utils.data import ShardSpec
 class WeightSender:
     def __init__(
         self,
-        transfer_mode: str,
-        receiver_urls: list[str],
         rank: int,
         world_size: int,
+        transfer_mode: str,
+        receiver_urls: list[str],
         master_addr: str,
         master_port: int,
     ):

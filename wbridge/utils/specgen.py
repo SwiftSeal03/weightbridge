@@ -59,7 +59,7 @@ def verify_load_spec(
 
     for k, v in wksd.items():
         assert torch.equal(expected[k].to(v.device), v), f"verify_load_spec: mismatch on worker key {k}"
-    logger.info("LoadSpec verification succeeded")
+    logger.info("verify_load_spec: LoadSpec verification succeeded")
 
 
 def _sd_subset_iterator(
@@ -252,7 +252,6 @@ def _infer_shard_spec_from_hfsd(
     name_map = _match_hf_to_worker_names(hfsd, wksd, lw)
     end_time = time.time()
     logging.info(f"Time taken to match HF to worker names: {end_time - start_time} seconds")
-    logging.info(f"name_map: {name_map}")
 
     start_time = end_time
     entries = {
@@ -261,6 +260,8 @@ def _infer_shard_spec_from_hfsd(
             for wk_name in wk_names
         } for hf_name, wk_names in name_map.items()
     }
+    end_time = time.time()
+    logging.info(f"Time taken to extract shard mappings: {end_time - start_time} seconds")
     return entries
 
 
