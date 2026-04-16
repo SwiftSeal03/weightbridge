@@ -46,16 +46,7 @@ def verify_load_spec(
     assert wksd, "wksd must be non-empty"
     expected = {k: torch.zeros_like(v, device="cpu") for k, v in wksd.items()}
 
-    for sname, hf_tensor in hf_iterator:
-        if sname not in load_spec.entries:
-            # logger.warning(f"verify_load_spec: source {sname!r} not in load_spec")
-            continue
-        for dname, mappings in load_spec.entries[sname].items():
-            assert dname in expected, f"verify_load_spec: destination {dname!r} not in wksd"
-            for s_shard, d_shard in mappings:
-                src_slices = tuple(slice(l, r) for l, r, _ in s_shard)
-                dst_slices = tuple(slice(l, r) for l, r, _ in d_shard)
-                expected[dname][dst_slices].copy_(hf_tensor[src_slices])
+    load_spec.load_from_full(hf_iterator, expected)
 
     for k, v in wksd.items():
         assert torch.equal(expected[k].to(v.device), v), f"verify_load_spec: mismatch on worker key {k}"

@@ -3,7 +3,7 @@
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
-from wbridge.frontend import WeightReceiverController
+from wbridge.backend import WeightReceiverController
 
 
 def test_receiver_world_route():

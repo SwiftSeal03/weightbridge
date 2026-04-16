@@ -1,7 +1,7 @@
 import ray
 
 import torch
-from wbridge.utils.data import ShardSpec, shards_iterator, shards_to_numel
+from wbridge.utils.data import ShardSpec, shards_iterator, shards_numel
 
 
 def get_ray_nodes():
@@ -41,7 +41,7 @@ def generate_local_tensors(
 
     local_tensors: dict[str, torch.Tensor] = {}
     for name, shards in shard_spec:
-        local_tensors[name] = torch.zeros(shards_to_numel(shards), dtype=dtype, device=device)
+        local_tensors[name] = torch.zeros(shards_numel(shards), dtype=dtype, device=device)
         if name in full_tensors:
             for start, end, shard in shards_iterator(
                 shard_spec[name], element_size=dtype.itemsize

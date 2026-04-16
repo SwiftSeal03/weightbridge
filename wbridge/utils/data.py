@@ -24,36 +24,38 @@ def _normalize_shards(
         return [shard]
     return shard
 
-def shard_to_shape(shard: Shard) -> tuple[int, ...]:
+
+def shard_shape(shard: Shard) -> tuple[int, ...]:
     return tuple(r - l for l, r, _ in shard)
 
 
-def shard_to_numel(shard: Shard) -> int:
-    return math.prod(r - l for l, r, _ in shard)
+def shard_numel(shard: Shard) -> int:
+    return math.prod(shard_shape(shard))
 
 
-def shards_to_numel(shards: Shards) -> int:
-    return sum(shard_to_numel(shard) for shard in shards)
-
-
-def original_total_numel(shards: Shards) -> int:
-    return math.prod(w for _, _, w in shards[0])
+def shards_numel(shards: Shards) -> int:
+    return sum(shard_numel(shard) for shard in shards)
         
 
 def _sanity_check(name: str, shards: Shards) -> None:
-    numel = original_total_numel(shards)
+    numel = None
     assert len(shards) > 0, f"Empty shard list for {name}"
     for shard in shards:
         assert len(shard) > 0, f"Empty shard in list for {name}"
         for l, r, w in shard:
             assert 0 <= l < r <= w, f"Invalid shard: {l, r, w} for {name}"
-    assert original_total_numel([shard]) == numel, f"Shard {shard} does not match original total numel: {numel}"
+        cur_numel = math.prod(w for _, _, w in shard)
+        if numel is None:
+            numel = cur_numel
+        else:
+            assert numel == cur_numel, f"Shard {shard} does not match original total numel: {numel} != {cur_numel}!"
 
-def shards_iterator(shards: Shards) -> Iterator[tuple[int, int, Shard]]:
+def shards_iterator(shards: Shards, tensor: torch.Tensor) -> Iterator[tuple[int, int, Shard]]:
+    """Iterate over shards and yield the corresponding tensor slices."""
     offset = 0
     for shard in shards:
-        length = shard_to_numel(shard)
-        yield offset, offset + length, shard
+        length = shard_numel(shard)
+        yield shard, tensor[offset:offset+length].view(shard_shape(shard))
         offset += length
 
 class ShardSpec:
@@ -116,12 +118,12 @@ class ShardSpec:
         self.entries[key] = shards
         
     def nbytes(self, tensors: dict[str, torch.Tensor]) -> int:
-        return sum(shard_to_numel(shards) * tensors[name].element_size() for name, shards in self)
+        return sum(shards_numel(shards) * tensors[name].element_size() for name, shards in self)
     
     def iter_with_intv(self, tensors: dict[str, torch.Tensor]) -> Iterator[tuple[int, int, str]]:
         offset = 0
         for name, shards in self:
-            length = shard_to_numel(shards) * tensors[name].element_size()
+            length = shards_numel(shards) * tensors[name].element_size()
             yield offset, offset + length, name
             offset += length
         
@@ -182,8 +184,8 @@ class BoundShardSpec:
             tensor = self._tensors[name]
             assert tensor.is_contiguous(), f"Tensor {name} is not contiguous"
             assert tensor.dim() == 1, f"Tensor {name} must be 1D"
-            assert shards_to_numel(shards) == tensor.numel(), \
-                f"spec and tensor numel mismatch for {name}, {shards_to_numel(shards)} vs {tensor.numel()}"
+            assert shards_numel(shards) == tensor.numel(), \
+                f"spec and tensor numel mismatch for {name}, {shards_numel(shards)} vs {tensor.numel()}"
             self._tensors[name] = tensor.flatten().view(torch.uint8)
             assert tensor.device == self.device, f"Tensor {name} is not on the same device as other tensors"
             
@@ -211,8 +213,8 @@ class BoundShardSpec:
             assert b_tensor.dtype == s_tensor.dtype, \
                 f"Tensor dtype mismatch for {name}: {b_tensor.dtype} vs {s_tensor.dtype}"
             
-            for s_start, s_end, s_shard in shards_iterator(small._shard_spec[name]):
-                for b_start, b_end, b_shard in shards_iterator(large._shard_spec[name]):
+            for s_shard, s_tensor in shards_iterator(small._shard_spec[name], small._tensors[name]):
+                for b_shard, b_tensor in shards_iterator(large._shard_spec[name], large._tensors[name]):
                     alignment = _check_shard_compatibility(b_shard, s_shard)
                     
                     if not alignment or not all(
@@ -225,13 +227,10 @@ class BoundShardSpec:
                         slice(sl - bl, sr - bl)
                         for bl, _, sl, sr, _ in alignment
                     )
-                    b_nd = b_tensor[b_start:b_end].view(shard_to_shape(b_shard))
-                    s_nd = s_tensor[s_start:s_end].view(shard_to_shape(s_shard))
-
                     if big2small:
-                        s_nd.copy_(b_nd[slices])
+                        s_tensor.copy_(b_tensor[slices])
                     else:
-                        b_nd[slices] = s_nd
+                        b_tensor[slices] = s_tensor
                     break
 
     def __getitem__(
@@ -409,7 +408,7 @@ class LoadSpec:
         }
 
     Each ``(src_shard, dst_shard)`` pair maps one axis-aligned box in the source
-    tensor to one box in the destination; ``shard_to_numel`` must match on both
+    tensor to one box in the destination; ``shard_numel`` must match on both
     sides. Multiple pairs per ``(src_name, dst_name)`` are allowed (e.g. split
     QKV blocks).
     """
@@ -419,9 +418,9 @@ class LoadSpec:
         for sname, dname, s_shard, d_shard in self:
             _sanity_check(sname, [s_shard])
             _sanity_check(dname, [d_shard])
-            assert shard_to_numel(s_shard) == shard_to_numel(d_shard), (
+            assert shard_numel(s_shard) == shard_numel(d_shard), (
                 f"numel mismatch for {sname}->{dname}: "
-                f"{shard_to_numel(s_shard)} vs {shard_to_numel(d_shard)}"
+                f"{shard_numel(s_shard)} vs {shard_numel(d_shard)}"
             )
 
     def __len__(self) -> int:
@@ -458,3 +457,43 @@ class LoadSpec:
                 ] for dname, mappings in entry.items()
             } for sname, entry in jsonable.items()
         })
+        
+    def load_from_full(
+        self, 
+        src_iter: Iterator[tuple[str, torch.Tensor]],
+        dst_tensors: dict[str, torch.Tensor],
+    ) -> None:
+        for sname, src_tensor in src_iter:
+            if sname not in self.entries:
+                continue
+            for dname, mappings in self.entries[sname].items():
+                assert dname in dst_tensors, f"Missing tensor {dname} for load"
+                dst_tensor = dst_tensors[dname]
+                for s_shard, d_shard in mappings:
+                    src_slices = tuple(slice(l, r) for l, r, _ in s_shard)
+                    dst_slices = tuple(slice(l, r) for l, r, _ in d_shard)
+                    dst_tensor[dst_slices].copy_(src_tensor[src_slices])
+                    
+    def copy_fromto_sharded(
+        self,
+        shard_spec: ShardSpec,
+        src_tensors: dict[str, torch.Tensor], # Flattened and concatenated source tensors
+        dst_tensors: dict[str, torch.Tensor], # Destination tensors
+        *,
+        src_to_dst: bool
+    ) -> None:
+        """
+        Load weights from sharded, flattened and concatenated source tensors to destination tensors.
+        """
+        for sname, dname, s_shard, d_shard in self:
+            assert dname in dst_tensors, f"Missing tensor {dname} for load"
+            dst_tensor = dst_tensors[dname]
+            for shard, src_tensor in shards_iterator(shard_spec[sname], src_tensors[sname]):
+                if _shard_contained_in(s_shard, shard):
+                    src_slices = tuple(slice(l - l0, r - l0) for (l, r, _), (l0, _, _) in zip(s_shard, shard))
+                    dst_slices = tuple(slice(l, r) for l, r, _ in d_shard)
+                    if src_to_dst:
+                        dst_tensor[dst_slices].copy_(src_tensor[src_slices])
+                    else:
+                        src_tensor[src_slices].copy_(dst_tensor[dst_slices])
+                    break

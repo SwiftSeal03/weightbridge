@@ -11,6 +11,6 @@ Usage:
 ```python
 from wbridge import WeightReceiver, WeightSender
 
-# Or from the frontend submodule:
-from wbridge.frontend import WeightReceiver, WeightSender
+# Or from the backend submodule:
+from wbridge.backend import WeightReceiver, WeightSender
 ```

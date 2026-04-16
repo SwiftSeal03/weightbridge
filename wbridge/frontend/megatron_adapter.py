@@ -1,7 +1,7 @@
 """
 Megatron-Bridge helpers for WeightBridge: build or load a :class:`~wbridge.utils.data.LoadSpec`
 that maps HuggingFace checkpoint tensors onto Megatron parameters, and expose a
-:class:`~wbridge.frontend.sender.WeightSender` for pushing shards to receivers.
+:class:`~wbridge.backend.sender.WeightSender` for pushing shards to receivers.
 
 The LoadSpec is cached per process rank under ``~/.cache/megatron/loadspec_rank{RANK}.json`` to
 avoid repeating expensive inference. Callers that only need inference should still construct
@@ -24,8 +24,9 @@ from megatron.bridge import AutoBridge
 
 
 from wbridge.utils.data import LoadSpec
-from wbridge.frontend.sender import WeightSender
+from wbridge.backend.sender import WeightSender
 from wbridge.utils.specgen import infer_load_spec, verify_load_spec
+from wbridge.utils.data import shards_numel
 
 logger = logging.getLogger(__name__)
 
@@ -117,7 +118,7 @@ class WBMegatronAdapter:
     """Tie a loaded Megatron ``model`` to HF weights and a :class:`~wbridge.utils.data.LoadSpec`.
 
     On construction, builds Megatron-Bridge conversion tasks, loads or infers a LoadSpec (see
-    :meth:`_get_load_spec_and_verify`), and creates a :class:`~wbridge.frontend.sender.WeightSender`
+    :meth:`_get_load_spec_and_verify`), and creates a :class:`~wbridge.backend.sender.WeightSender`
     with ``*args`` (``world_size``, ``transfer_mode``, ``receiver_urls``, ``master_addr``,
     ``master_port``).
     """
@@ -131,6 +132,11 @@ class WBMegatronAdapter:
     ) -> None:
         self.hf_checkpoint = hf_checkpoint
         self.model = model
+        self.chunks = _megatron_model_chunks(model)
+        self.bridge = AutoBridge.from_hf_pretrained(hf_checkpoint)
+        with patch_megatron_model(model):
+            self.conv_tasks = list(self.bridge.get_conversion_tasks(self.chunks))
+        self.wksd = _wksd_from_conversion_tasks(self.conv_tasks)
         self.load_spec_path = Path.home() / ".cache" / "megatron" / f"loadspec_rank{rank}.json"
         
         self.load_spec = self._get_load_spec_and_verify()
@@ -164,17 +170,11 @@ class WBMegatronAdapter:
         The decorator applies ``torch.inference_mode()`` because specgen probing uses in-place writes
         on Megatron tensors and must not build autograd graphs.
         """
-        megatron_chunks = _megatron_model_chunks(self.model)
-        bridge = AutoBridge.from_hf_pretrained(self.hf_checkpoint)
-        with patch_megatron_model(self.model):
-            conv_tasks = list(bridge.get_conversion_tasks(megatron_chunks))
-        wksd = _wksd_from_conversion_tasks(conv_tasks)
-        
         # Try to load LoadSpec from cache and verify it
         try:
             with open(self.load_spec_path, encoding="utf-8") as f:
                 self.load_spec = LoadSpec(json.load(f))
-            verify_load_spec(self._get_hf_iter(), wksd, self.load_spec)
+            verify_load_spec(self._get_hf_iter(), self.wksd, self.load_spec)
             return
         except Exception as e:
             logger.error(f"{type(e).__name__}: {e}")
@@ -189,7 +189,7 @@ class WBMegatronAdapter:
             hf_cache: dict[str, Any] = {}
 
             with patch_megatron_model(self.model):
-                for task in conv_tasks:
+                for task in self.conv_tasks:
                     if task is None or getattr(task, "megatron_module", None) is None:
                         continue
                     pw = getattr(task, "param_weight", None)
@@ -212,7 +212,7 @@ class WBMegatronAdapter:
                         if is_grouped and hf_param_key in hf_cache:
                             hf_weights = hf_cache[hf_param_key]
                         else:
-                            hf_weights = bridge._model_bridge.maybe_modify_loaded_hf_weight(hf_param, hf_chunk)
+                            hf_weights = self.bridge._model_bridge.maybe_modify_loaded_hf_weight(hf_param, hf_chunk)
                         if is_grouped:
                             hf_cache[hf_param_key] = hf_weights
                     except (KeyError, TypeError, ValueError, AttributeError):
@@ -221,13 +221,14 @@ class WBMegatronAdapter:
                         continue
                     converted = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
                     pw.copy_(converted)
-                bcast = getattr(bridge._model_bridge, "_broadcast_shared_embeddings", None)
+                bcast = getattr(self.bridge._model_bridge, "_broadcast_shared_embeddings", None)
                 if bcast is not None:
-                    bcast(megatron_chunks)
+                    bcast(self.chunks)
 
-        self.load_spec = infer_load_spec(self._get_hf_iter(), wksd, lw)
+        self.load_spec = infer_load_spec(self._get_hf_iter(), self.wksd, lw)
+        self.shard_spec = self.load_spec.src_spec()
         try:
-            verify_load_spec(self._get_hf_iter(), wksd, self.load_spec)
+            verify_load_spec(self._get_hf_iter(), self.wksd, self.load_spec)
         except Exception as e:
             logger.error(f"wbridge: Inferred LoadSpec verification failed. This is likely a bug in the LoadSpec inference logic. Please report this to the developers.")
             raise e
@@ -237,8 +238,17 @@ class WBMegatronAdapter:
         with open(self.load_spec_path, "w", encoding="utf-8") as f:
             json.dump(self.load_spec.entries, f, indent=2, sort_keys=True)
         logger.info("wbridge: wrote LoadSpec to %s", self.load_spec_path)
-
-__all__ = [
-    "WBMegatronAdapter",
-    "patch_megatron_model",
-]
+        
+        
+    def connect(self) -> None:
+        self.sender.connect(self.shard_spec)
+        self.dtype_spec = self.sender.dtype_spec
+        
+        
+    def send_weights(self) -> None:
+        self.sender_buffer = {
+            name: torch.empty(shards_numel(self.shard_spec[name]), dtype=self.dtype_spec[name], device="cuda")
+            for name in self.shard_spec
+        }
+        self.load_spec.copy_fromto_sharded(self.shard_spec, self.sender_buffer, self.wksd, src_to_dst=False)
+        self.sender.send(self.sender_buffer)

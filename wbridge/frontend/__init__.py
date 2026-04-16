@@ -1,6 +1,6 @@
-"""Frontend API for weight transfer."""
+"""Framework frontends (Megatron-Bridge, SGLang integration)."""
 
-from wbridge.frontend.receiver import WeightReceiver, WeightReceiverController
-from wbridge.frontend.sender import WeightSender
+from wbridge.frontend.megatron_adapter import WBMegatronAdapter
+from wbridge.frontend.sglang_adapter import WBSGLangAdapter
 
-__all__ = ["WeightReceiver", "WeightSender", "WeightReceiverController"]
+__all__ = ["WBMegatronAdapter", "WBSGLangAdapter"]

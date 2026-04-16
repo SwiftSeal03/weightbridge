@@ -16,7 +16,7 @@ from sglang.srt.model_executor.model_runner import ModelRunner
 
 from wbridge.utils.data import LoadSpec
 from wbridge.utils.specgen import infer_load_spec, verify_load_spec
-from wbridge.frontend.receiver import WeightReceiver
+from wbridge.backend.receiver import WeightReceiver
 
 logger = logging.getLogger(__name__)
 
@@ -32,13 +32,18 @@ class WBSGLangAdapter:
         self.loader = model_runner.loader
         self.load_spec_path = Path.home() / ".cache" / "sglang" / f"loadspec_rank{rank}.json"
         
-        self._get_load_spec_and_verify()
-        self.receiver = WeightReceiver(controller_ipc_name, rank, self.load_spec.src_spec())
+        self._get_specs_and_verify()
+        self.receiver = WeightReceiver(
+            controller_ipc_name, 
+            rank, 
+            self.shard_spec,
+            self.dtype_spec
+        )
         
     def _get_hf_iter(self) -> Iterator[tuple[str, torch.Tensor]]:
         return self.loader._get_all_weights(self.model_config, self.model)
 
-    def _get_load_spec_and_verify(self) -> None:
+    def _get_specs_and_verify(self) -> None:
         """Load or infer ``self.load_spec`` and verify it against HF tensors and SGLang weights.
 
         Steps:
@@ -67,8 +72,18 @@ class WBSGLangAdapter:
         with open(self.load_spec_path, "w", encoding="utf-8") as f:
             json.dump(self.load_spec.entries, f, indent=2, sort_keys=True)
         logger.info("wbridge: wrote LoadSpec to %s", self.load_spec_path)
+        
+        # Compute dtype spec, aligns to model.state_dict(), for src with multiple dsts, pick the largest dtype
+        self.dtype_spec = {
+            hf_name: max([wksd[wk_name].dtype for wk_name in entry.keys()], key=lambda d: d.itemsize)
+            for hf_name, entry in self.load_spec.entries.items()
+        }
+        self.shard_spec = self.load_spec.src_spec()
         return
     
-    def is_weights_ready(self) -> bool:
-        return self.receiver.is_weights_ready()
+    def try_receive_weights(self) -> None:
+        if not self.receiver.is_weights_ready:
+            return
+        self.receiver.request_update()
+        self.load_spec.copy_fromto_sharded(self.shard_spec, self.receiver.recv_buffer, self.model.state_dict(), src_to_dst=True)
     

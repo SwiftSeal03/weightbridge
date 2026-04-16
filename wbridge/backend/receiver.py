@@ -13,7 +13,7 @@ import zmq
 from fastapi import FastAPI, APIRouter
 from fastapi.responses import JSONResponse
 
-from wbridge.utils.data import ShardSpec, shard_to_numel
+from wbridge.utils.data import ShardSpec, shards_numel
 from wbridge.utils.distributed import init_custom_process_group
 
 logger = logging.getLogger(__name__)
@@ -39,12 +39,14 @@ class WeightReceiver:
         controller_ipc_name: str,
         rank: int,
         shard_spec: ShardSpec,
+        dtype_spec: dict[str, torch.dtype]
     ):
         self.controller_ipc_name = controller_ipc_name
         self.scheduler_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
         self.rank = rank
         self.shard_spec = shard_spec
-        self.state_dict = None
+        self.dtype_spec = dtype_spec
+        
         self._state = ReceiverState.DISCONNECTED
         self.ready_event = threading.Event()
         self.receiver_thread = threading.Thread(
@@ -66,14 +68,13 @@ class WeightReceiver:
             proc.terminate()
             proc.join()
 
-
+    @property
     def is_weights_ready(self) -> bool:
         """True after the trainer has POSTed ``/wbridge/receive``; then call :meth:`request_update`."""
         return self._state == ReceiverState.AWAITING_SCHEDULER_UPDATE
 
-    def request_update(self, state_dict: dict[str, torch.Tensor]) -> bool:
+    def request_update(self) -> bool:
         """Scheduler REQ/REP: trigger weight receive when state is AWAITING_SCHEDULER_UPDATE."""
-        self.state_dict = state_dict # Receive to this state_dict
         self.socket.send_string(UPDATE_REQUEST)
         return json.loads(self.socket.recv_string())["success"]
 
@@ -101,12 +102,25 @@ class WeightReceiver:
         self.group = init_custom_process_group(**data)
         self.device = "cuda" if is_nccl else "cpu"
         
-        all_specs = [None] * data["world_size"]
-        dist.all_gather_object(all_specs, self.shard_spec, group=self.group)
+        all_shard_specs = [None] * data["world_size"]
+        dist.all_gather_object(all_shard_specs, self.shard_spec, group=self.group)
         self.overlaps = {
-            rank: overlap for rank, spec in enumerate(all_specs) 
+            rank: overlap for rank, spec in enumerate(all_shard_specs) 
             if rank < sender_world_size and (overlap := ShardSpec.compute_overlap(self.shard_spec, spec))
         }
+        
+        # Gather dtype specs from all ranks
+        all_dtype_specs = [None] * data["world_size"]
+        dist.all_gather_object(all_dtype_specs, self.dtype_spec, group=self.group)
+        
+        # Verify dtype spec consistency
+        for dtype_spec in all_dtype_specs:
+            if dtype_spec is not None:
+                for name, dtype in dtype_spec.items():
+                    if name in self.dtype_spec:
+                        assert self.dtype_spec[name] == dtype, f"Dtype mismatch for {name} on rollout rank {data['rank']}"
+                    else:
+                        self.dtype_spec[name] = dtype
             
         self._state = ReceiverState.CONNECTED
 
@@ -118,6 +132,8 @@ class WeightReceiver:
             )
             return
         controller_socket.send_string(json.dumps({"status": "ack"}))
+        if self.device == "cpu":
+            self._receive_weights()
         self._state = ReceiverState.AWAITING_SCHEDULER_UPDATE
 
 
@@ -129,7 +145,8 @@ class WeightReceiver:
                 json.dumps({"success": False, "message": "no pending weights"})
             )
             return
-        self._receive_weights()
+        if self.device == "cuda":
+            self._receive_weights()
         self._state = ReceiverState.CONNECTED
         scheduler_socket.send_string(json.dumps({"success": True}))
 
@@ -177,9 +194,14 @@ class WeightReceiver:
 
 
     def _receive_weights(self) -> None:
-        """Receive overlap bytes from each sender, unpack into ``state_dict`` via :class:`BoundShardSpec`."""
+        """Receive overlap bytes from each sender, unpack into ``gpu_tensors`` via :class:`BoundShardSpec`."""
+        # TODO: use pinned memory for CPU recv_buffer
+        self.recv_buffer = {
+            name: torch.empty(shards_numel(self.shard_spec[name]), dtype=self.dtype_spec[name], device=self.device)
+            for name in self.shard_spec
+        }
         chunks = {
-            sender_rank: torch.zeros(overlap.nbytes(self.state_dict), dtype=torch.uint8, device=self.device)
+            sender_rank: torch.zeros(overlap.nbytes(self.recv_buffer), dtype=torch.uint8, device=self.device)
             for sender_rank, overlap in self.overlaps.items()
         }
         ops = [
@@ -189,7 +211,7 @@ class WeightReceiver:
         for h in dist.batch_isend_irecv(ops):
             h.wait()
         
-        self.shard_spec(self.state_dict)[self.overlaps] = chunks
+        self.shard_spec(self.recv_buffer)[self.overlaps] = chunks
 
 
 class WeightReceiverController:
