@@ -446,7 +446,9 @@ class LoadSpec:
                 for s_shard, d_shard in mappings:
                     yield sname, dname, s_shard, d_shard
         
-    def from_jsonable(self, jsonable: dict[str, dict[str, list[list[list[int]]]]]) -> "LoadSpec":
+    @staticmethod
+    def from_jsonable(jsonable: dict[str, dict[str, list[list[list[int]]]]]) -> "LoadSpec":
+        """Rebuild a :class:`LoadSpec` from :func:`json.load` output (nested tuples become lists)."""
         return LoadSpec({
             sname: {
                 dname: [

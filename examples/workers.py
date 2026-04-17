@@ -1,13 +1,19 @@
 """Reusable Ray actor definitions for WeightBridge sender / receiver pipelines.
 
-Configuration is passed as a single :class:`EngineArgs` instance to every
-engine and worker ``init`` path.
+Configuration is passed as a single :class:`EngineArgs` instance. HF weights are not serialized in
+``EngineArgs``; each worker calls ``build_checkpoint()`` locally so checkpoints are identical across
+nodes without shipping CPU tensors through Ray. Trainer (**actor**) workers use a TP shard of HF
+names in ``wksd``; **rollout** workers use merged names (``qkv_proj``, ``gate_up_proj``, …).
+Wire :class:`~wbridge.ShardSpec` layouts (per-rank HF boxes) are built here from
+:class:`~qwen_tiny.QwenTinyConfig`.
 """
+
+from __future__ import annotations
 
 import threading
 import time
-from dataclasses import dataclass, field
-from typing import Callable
+from collections.abc import Callable
+from dataclasses import dataclass
 
 import ray
 import torch
@@ -15,75 +21,165 @@ import uvicorn
 from fastapi import FastAPI
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-from wbridge import ShardSpec, WeightReceiver, WeightReceiverController, WeightSender
+from wbridge import ShardSpec, WeightReceiverController
 
-ShardSpecGenerator = Callable[[int], ShardSpec]
-TensorGenerator = Callable[[ShardSpec], dict[str, torch.Tensor]]
+from adapters import ExampleReceiverAdapter, ExampleSenderAdapter
+from qwen_tiny import (
+    QwenTinyConfig,
+    actor_load_spec_path,
+    build_actor_wksd,
+    build_rollout_wksd,
+    make_actor_load_weights,
+    make_rollout_load_weights,
+    rollout_load_spec_path,
+)
+from utils import make_hf_iter_factory
+
+CheckpointBuilder = Callable[[], dict[str, torch.Tensor]]
+
+
+def _shard_col_major(rows: int, cols: int, tp_rank: int, tp_size: int) -> list[tuple[int, int, int]]:
+    part = rows // tp_size
+    lo = tp_rank * part
+    hi = lo + part
+    return [(lo, hi, rows), (0, cols, cols)]
+
+
+def _shard_row_major(rows: int, cols: int, tp_rank: int, tp_size: int) -> list[tuple[int, int, int]]:
+    part = cols // tp_size
+    lo = tp_rank * part
+    hi = lo + part
+    return [(0, rows, rows), (lo, hi, cols)]
+
+
+def _shard_full_2d(rows: int, cols: int) -> list[tuple[int, int, int]]:
+    return [(0, rows, rows), (0, cols, cols)]
+
+
+def _shard_1d(n: int) -> list[tuple[int, int, int]]:
+    return [(0, n, n)]
+
+
+def _shard_embed_rows(cfg: QwenTinyConfig, rank: int, world: int) -> list[tuple[int, int, int]]:
+    part = cfg.vocab_size // world
+    lo = rank * part
+    hi = lo + part
+    return [(lo, hi, cfg.vocab_size), (0, cfg.hidden_size, cfg.hidden_size)]
+
+
+def actor_wire_shard_spec(cfg: QwenTinyConfig, tp_rank: int, tp_size: int) -> ShardSpec:
+    """HF regions this actor rank sends (split Q/K/V on the wire; packing is in ``actor_load_weights``)."""
+    h, qo, kvo, iq = cfg.hidden_size, cfg.q_out, cfg.kv_out, cfg.intermediate_size
+    entries = {
+        "model.embed_tokens.weight": _shard_embed_rows(cfg, tp_rank, tp_size),
+        "self_attn.q_proj.weight": _shard_col_major(qo, h, tp_rank, tp_size),
+        "self_attn.k_proj.weight": _shard_col_major(kvo, h, tp_rank, tp_size),
+        "self_attn.v_proj.weight": _shard_col_major(kvo, h, tp_rank, tp_size),
+        "self_attn.o_proj.weight": _shard_row_major(h, qo, tp_rank, tp_size),
+        "mlp.gate_proj.weight": _shard_col_major(iq, h, tp_rank, tp_size),
+        "mlp.up_proj.weight": _shard_col_major(iq, h, tp_rank, tp_size),
+        "mlp.down_proj.weight": _shard_row_major(h, iq, tp_rank, tp_size),
+        "input_layernorm.weight": _shard_1d(h),
+        "post_attention_layernorm.weight": _shard_1d(h),
+    }
+    return ShardSpec(entries)
+
+
+def rollout_wire_shard_spec(cfg: QwenTinyConfig, rollout_rank: int, rollout_size: int) -> ShardSpec:
+    h, qo, kvo, iq = cfg.hidden_size, cfg.q_out, cfg.kv_out, cfg.intermediate_size
+    full = _shard_full_2d
+    entries = {
+        "model.embed_tokens.weight": _shard_embed_rows(cfg, rollout_rank, rollout_size),
+        "self_attn.q_proj.weight": full(qo, h),
+        "self_attn.k_proj.weight": full(kvo, h),
+        "self_attn.v_proj.weight": full(kvo, h),
+        "self_attn.o_proj.weight": full(h, qo),
+        "mlp.gate_proj.weight": full(iq, h),
+        "mlp.up_proj.weight": full(iq, h),
+        "mlp.down_proj.weight": full(h, iq),
+        "input_layernorm.weight": _shard_1d(h),
+        "post_attention_layernorm.weight": _shard_1d(h),
+    }
+    return ShardSpec(entries)
 
 
 @dataclass
 class EngineArgs:
+    """``build_checkpoint`` must be picklable (e.g. ``functools.partial`` of a module-level function)."""
+
     rollout_host: str
     rollout_port: int
     rollout_scheduling_strategy: NodeAffinitySchedulingStrategy
     num_rollout_workers: int
-    rollout_shard_spec_generator: ShardSpecGenerator
 
     trainer_host: str
     trainer_pg_port: int
     trainer_scheduling_strategy: NodeAffinitySchedulingStrategy
     num_trainer_workers: int
-    trainer_shard_spec_generator: ShardSpecGenerator
 
-    tensor_generator: TensorGenerator
-    rollout_controller_ipc_name: str = field(init=False)
+    model_config: QwenTinyConfig
+    build_checkpoint: CheckpointBuilder
+    load_spec_dir: str
+    dtype: torch.dtype = torch.float32
+
+    rollout_controller_ipc_name: str = ""
 
 
 @ray.remote(num_gpus=1, num_cpus=1)
 class RolloutWorker:
-    """One per receiver GPU.  Receives weights via NCCL and optionally
-    verifies them against ground-truth tensors."""
+    """One per receiver GPU. Receives weights via NCCL and optionally verifies."""
 
     def init(self, rank: int, args: EngineArgs):
         self.rank = rank
         self.args = args
-        self.shard_spec = args.rollout_shard_spec_generator(rank)
-        self.state_dict = args.tensor_generator(self.shard_spec)
-        self.receiver = WeightReceiver(
-            controller_ipc_name=args.rollout_controller_ipc_name,
-            rank=rank,
-            shard_spec=self.shard_spec,
+        cfg = args.model_config
+        hf_cpu = args.build_checkpoint()
+        self.hf_iter_factory = make_hf_iter_factory(hf_cpu)
+        self.shard_spec = rollout_wire_shard_spec(cfg, rank, args.num_rollout_workers)
+        self.state_dict = build_rollout_wksd(cfg, device="cuda", dtype=args.dtype)
+        self.load_weights = make_rollout_load_weights(
+            self.state_dict, cfg, device="cuda", dtype=args.dtype
         )
-        
+        self.load_weights(self.hf_iter_factory())
+        self.adapter = ExampleReceiverAdapter(
+            self.hf_iter_factory,
+            self.state_dict,
+            self.load_weights,
+            self.shard_spec,
+            rollout_load_spec_path(args.load_spec_dir, rank),
+            rank=rank,
+        )
+        self.receiver = self.adapter.make_receiver(args.rollout_controller_ipc_name)
+
     def recv_weights(self) -> None:
-        self.recv_state_dict = {name: torch.zeros_like(t) for name, t in self.state_dict.items()}
-        for _ in range(100):
-            if self.receiver.request_update(self.recv_state_dict):
+        for _ in range(500):
+            if self.receiver.is_weights_ready:
                 break
-            time.sleep(0.2)
+            time.sleep(0.05)
+        else:
+            raise TimeoutError("receiver never became ready for weights")
+        self.recv_state_dict = {name: torch.zeros_like(t) for name, t in self.state_dict.items()}
+        self.receiver.request_update()
+        self.adapter.apply_recv_buffer(self.receiver.recv_buffer, self.recv_state_dict)
 
     def verify(self) -> dict:
-        """Block until weights arrive, then verify against expected shard."""
         if all(
-            torch.allclose(exp, got, rtol=1e-5, atol=1e-6) 
+            torch.allclose(exp, got, rtol=1e-5, atol=1e-6)
             for exp, got in zip(self.state_dict.values(), self.recv_state_dict.values(), strict=True)
         ):
             return {"rank": self.rank, "ok": True, "detail": "all tensors match"}
-        else:
-            return {"rank": self.rank, "ok": False, "detail": "some tensors do not match"}
+        return {"rank": self.rank, "ok": False, "detail": "some tensors do not match"}
 
 
 @ray.remote(num_cpus=1)
 class RolloutEngine:
-    """Hosts the receiver-side HTTP server and spawns :class:`RolloutWorker`
-    actors on the same node."""
+    """Hosts the receiver-side HTTP server and spawns :class:`RolloutWorker` actors."""
 
     def init(self, args: EngineArgs):
         app = FastAPI()
         self.controller = WeightReceiverController(app)
         args.rollout_controller_ipc_name = self.controller.ipc_name
 
-        # Start the HTTP server
         config = uvicorn.Config(app, host=args.rollout_host, port=args.rollout_port)
         server = uvicorn.Server(config)
         threading.Thread(target=server.run, daemon=True).start()
@@ -91,11 +187,12 @@ class RolloutEngine:
             time.sleep(0.1)
         print(f"RolloutEngine started on {args.rollout_host}:{args.rollout_port}")
 
-        # Spawn RolloutWorkers
         n = args.num_rollout_workers
-        self._workers = [RolloutWorker.options(scheduling_strategy=args.rollout_scheduling_strategy).remote() for _ in range(n)]
-        ray.get([w.init.remote(rank, args)for rank, w in enumerate(self._workers)])
-        
+        self._workers = [
+            RolloutWorker.options(scheduling_strategy=args.rollout_scheduling_strategy).remote() for _ in range(n)
+        ]
+        ray.get([w.init.remote(rank, args) for rank, w in enumerate(self._workers)])
+
         self.controller.set_worker_num(n)
 
     def recv_weights(self) -> None:
@@ -112,35 +209,55 @@ class RolloutEngine:
 
 @ray.remote(num_gpus=1, num_cpus=1)
 class TrainerWorker:
-    """One per sender GPU.  Sends its weight shard via WeightBridge
-    (no default ``torch.distributed`` group required)."""
+    """One per sender GPU. Sends shards via :class:`~adapters.ExampleSenderAdapter`."""
 
     def init(self, rank: int, args: EngineArgs):
         self.args = args
         self.rank = rank
-        self.shard_spec = args.trainer_shard_spec_generator(rank)
-        self.state_dict = args.tensor_generator(self.shard_spec)
-        self.sender = WeightSender(
-            transfer_mode="gpu_direct",
-            receiver_urls=[f"http://{args.rollout_host}:{args.rollout_port}"],
+        cfg = args.model_config
+        hf_cpu = args.build_checkpoint()
+        self.hf_iter_factory = make_hf_iter_factory(hf_cpu)
+        self.shard_spec = actor_wire_shard_spec(cfg, rank, args.num_trainer_workers)
+        self.state_dict = build_actor_wksd(
+            cfg, rank, args.num_trainer_workers, device="cuda", dtype=args.dtype
+        )
+        self.load_weights = make_actor_load_weights(
+            self.state_dict,
+            cfg,
+            device="cuda",
+            dtype=args.dtype,
+            tp_rank=rank,
+            tp_size=args.num_trainer_workers,
+        )
+        self.load_weights(self.hf_iter_factory())
+        self.adapter = ExampleSenderAdapter(
+            self.hf_iter_factory,
+            self.state_dict,
+            self.load_weights,
+            self.shard_spec,
+            actor_load_spec_path(args.load_spec_dir, rank),
             rank=rank,
-            world_size=args.num_trainer_workers,
-            master_addr=args.trainer_host,
-            master_port=args.trainer_pg_port,
         )
 
     def send_weights(self):
-        self.sender.connect(self.shard_spec)
-        self.sender.send(self.state_dict)
+        self.adapter.connect(
+            transfer_mode="gpu_direct",
+            receiver_urls=[f"http://{self.args.rollout_host}:{self.args.rollout_port}"],
+            world_size=self.args.num_trainer_workers,
+            master_addr=self.args.trainer_host,
+            master_port=self.args.trainer_pg_port,
+        )
+        self.adapter.send()
 
 
 class TrainerEngine:
-    """Non-Ray manager that creates and drives :class:`TrainerWorker` actors."""
+    """Spawns :class:`TrainerWorker` actors (must run before rollout so LoadSpec exists on disk)."""
 
     def __init__(self, args: EngineArgs):
-        # Spawn TrainerWorkers
         n = args.num_trainer_workers
-        self._workers = [TrainerWorker.options(scheduling_strategy=args.trainer_scheduling_strategy).remote() for _ in range(n)]
+        self._workers = [
+            TrainerWorker.options(scheduling_strategy=args.trainer_scheduling_strategy).remote() for _ in range(n)
+        ]
         ray.get([w.init.remote(rank, args) for rank, w in enumerate(self._workers)])
         print(f"TrainerEngine started on {args.trainer_host}:{args.trainer_pg_port}")
 

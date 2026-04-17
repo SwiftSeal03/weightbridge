@@ -1,7 +1,6 @@
 import ray
-
 import torch
-from wbridge.utils.data import ShardSpec, shards_iterator, shards_numel
+from collections.abc import Callable, Iterator
 
 
 def get_ray_nodes():
@@ -21,31 +20,14 @@ def get_ray_nodes():
         str(trainer["NodeID"]),
     )
 
-def generate_local_tensors(
-    shard_spec: ShardSpec, device: str, seed: int | None = None,
-) -> dict[str, torch.Tensor]:
-    """Create flattened shard tensors described by *shard_spec*.
 
-    When *seed* is given, full tensors are generated deterministically
-    (shape inferred from the ``w`` values of each shard spec) and sliced
-    into local shards.  When *seed* is ``None``, zero-filled tensors are
-    returned.
-    """
-    dtype = torch.float32
-    full_tensors: dict[str, torch.Tensor] = {}
-    if seed is not None:
-        g = torch.Generator(device=device).manual_seed(seed)
-        for name, shards in shard_spec:
-            shape = tuple(w for _, _, w in shards[0])
-            full_tensors[name] = torch.randn(*shape, dtype=dtype, device=device, generator=g)
+def make_hf_iter_factory(
+    full_cpu: dict[str, torch.Tensor],
+) -> Callable[[], Iterator[tuple[str, torch.Tensor]]]:
+    """Factory of CPU tensor iterators (each call is a fresh pass for verify / infer)."""
 
-    local_tensors: dict[str, torch.Tensor] = {}
-    for name, shards in shard_spec:
-        local_tensors[name] = torch.zeros(shards_numel(shards), dtype=dtype, device=device)
-        if name in full_tensors:
-            for start, end, shard in shards_iterator(
-                shard_spec[name], element_size=dtype.itemsize
-            ):
-                slices = tuple(slice(l, r) for l, r, _ in shard)
-                local_tensors[name][start:end] = full_tensors[name][slices].reshape(-1)
-    return local_tensors
+    def factory() -> Iterator[tuple[str, torch.Tensor]]:
+        for name, t in full_cpu.items():
+            yield name, t.contiguous()
+
+    return factory

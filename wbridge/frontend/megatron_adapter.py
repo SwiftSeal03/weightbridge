@@ -138,8 +138,8 @@ class WBMegatronAdapter:
             self.conv_tasks = list(self.bridge.get_conversion_tasks(self.chunks))
         self.wksd = _wksd_from_conversion_tasks(self.conv_tasks)
         self.load_spec_path = Path.home() / ".cache" / "megatron" / f"loadspec_rank{rank}.json"
-        
-        self.load_spec = self._get_load_spec_and_verify()
+
+        self._get_load_spec_and_verify()
         self.sender = WeightSender(rank, *args)
             
 
@@ -175,6 +175,7 @@ class WBMegatronAdapter:
             with open(self.load_spec_path, encoding="utf-8") as f:
                 self.load_spec = LoadSpec(json.load(f))
             verify_load_spec(self._get_hf_iter(), self.wksd, self.load_spec)
+            self.shard_spec = self.load_spec.src_spec()
             return
         except Exception as e:
             logger.error(f"{type(e).__name__}: {e}")
