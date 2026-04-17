@@ -1,27 +1,39 @@
 """
-Single-layer Qwen2-style HF checkpoint and loaders (no ``model.layers.N`` prefix).
+One decoder-block Qwen2-style toy (no ``model.layers.N`` in HF keys).
 
-HF tensors use split Q/K/V and gate/up (HuggingFace names). **Actor** ``wksd`` uses Megatron-Core
-names/layout from ``slime/backends/megatron_utils/megatron_to_hf/qwen2.py`` (inverse of
-``convert_qwen2_to_hf``):
+**HF checkpoint** — split ``q_proj`` / ``k_proj`` / ``v_proj``, ``gate_proj`` / ``up_proj``, etc.
 
-* ``self_attention.linear_qkv.weight`` is **not** ``torch.cat([q,k,v], dim=0)``. It is packed as
-  ``view(num_query_groups, -1, head_dim, hidden)`` with dim=1 split
-  ``[value_num_per_group, 1, 1]`` where ``value_num_per_group = num_attention_heads // num_query_groups``
-  (``num_query_groups == num_kv_heads`` for GQA).
-* ``mlp.linear_fc1.weight`` is gate and up **row-stacked** (``chunk(2, dim=0)`` in the converter).
+**Actor (trainer)** — Megatron ``linear_qkv`` packing (GQA): per group, Q heads then K then V
+(see ``slime/.../megatron_to_hf/qwen2.py``). TP splits output rows of each parameter.
 
-**Rollout** ``wksd`` keeps a runtime-friendly merged layout (``qkv_proj`` = Q||K||V along rows).
+**Rollout** — SGLang-style stacked tensors (same idea as ``Qwen2ForCausalLM.load_weights`` in
+``sglang/srt/models/qwen2.py``): ``qkv_proj`` holds ``[Q_shard; K_shard; V_shard]`` on dim 0;
+``gate_up_proj`` holds ``[gate; up]`` with column-parallel-style row sharding. TP matches
+``QKVParallelLinear`` / ``MergedColumnParallelLinear`` / ``RowParallelLinear`` when ``num_heads``
+and ``num_kv_heads`` divide ``tp_size``.
 
-Wire :class:`~wbridge.ShardSpec` layouts live in ``workers.py``.
+Loaders only **narrow + copy** for keys present in the iterable (``infer_load_spec`` subsets).
 """
 
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable
 from dataclasses import dataclass
+from pathlib import Path
 
 import torch
+
+__all__ = [
+    "DEFAULT_QWEN_TINY_CONFIG",
+    "QwenTinyConfig",
+    "actor_load_spec_path",
+    "build_actor_wksd",
+    "build_qwen_tiny_hf_checkpoint",
+    "build_rollout_wksd",
+    "make_actor_load_weights",
+    "make_rollout_load_weights",
+    "rollout_load_spec_path",
+]
 
 
 @dataclass(frozen=True)
@@ -34,7 +46,7 @@ class QwenTinyConfig:
 
     def __post_init__(self) -> None:
         if self.num_attn_heads % self.num_kv_heads != 0:
-            raise ValueError("num_attn_heads must be divisible by num_kv_heads (GQA)")
+            raise ValueError("num_attn_heads must be divisible by num_kv_heads")
 
     @property
     def head_dim(self) -> int:
@@ -50,36 +62,79 @@ class QwenTinyConfig:
 
     @property
     def num_query_groups(self) -> int:
-        """Megatron ``num_query_groups`` (KV head groups)."""
         return self.num_kv_heads
 
     @property
     def value_num_per_group(self) -> int:
-        """Queries per group: ``num_attention_heads // num_query_groups`` (see ``convert_qwen2_to_hf``)."""
         return self.num_attn_heads // self.num_query_groups
 
     @property
-    def megatron_linear_qkv_rows(self) -> int:
-        """Total output rows of ``self_attention.linear_qkv.weight`` (= ``q_out + 2 * kv_out``)."""
-        return self.num_query_groups * (self.value_num_per_group + 2) * self.head_dim
+    def megatron_qkv_rows(self) -> int:
+        g, v, d = self.num_query_groups, self.value_num_per_group, self.head_dim
+        return g * (v + 2) * d
 
 
 DEFAULT_QWEN_TINY_CONFIG = QwenTinyConfig()
 
 
-def hf_weight_keys() -> list[str]:
-    return [
-        "model.embed_tokens.weight",
-        "self_attn.q_proj.weight",
-        "self_attn.k_proj.weight",
-        "self_attn.v_proj.weight",
-        "self_attn.o_proj.weight",
-        "mlp.gate_proj.weight",
-        "mlp.up_proj.weight",
-        "mlp.down_proj.weight",
-        "input_layernorm.weight",
-        "post_attention_layernorm.weight",
-    ]
+def _assert_tp(cfg: QwenTinyConfig, tp: int) -> None:
+    assert cfg.vocab_size % tp == 0
+    assert cfg.q_out % tp == 0
+    assert cfg.kv_out % tp == 0
+    assert cfg.intermediate_size % tp == 0
+    assert cfg.megatron_qkv_rows % tp == 0
+    assert (2 * cfg.intermediate_size) % tp == 0
+
+
+def _scatter_rows(
+    dst_shard: torch.Tensor,
+    shard_global_lo: int,
+    shard_nrows: int,
+    src: torch.Tensor,
+    src_row_offset: int,
+    block_global_lo: int,
+    block_nrows: int,
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    a = max(shard_global_lo, block_global_lo)
+    b = min(shard_global_lo + shard_nrows, block_global_lo + block_nrows)
+    if a >= b:
+        return
+    sr = src_row_offset + (a - block_global_lo)
+    dr = a - shard_global_lo
+    dst_shard[dr : dr + (b - a)].copy_(src[sr : sr + (b - a)].to(device=device, dtype=dtype))
+
+
+def _actor_scatter_megatron_qkv(
+    dst: torch.Tensor,
+    cfg: QwenTinyConfig,
+    tp_rank: int,
+    tp_size: int,
+    w: dict[str, torch.Tensor],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+) -> None:
+    R, part = cfg.megatron_qkv_rows, cfg.megatron_qkv_rows // tp_size
+    lo, n_g = tp_rank * part, cfg.num_query_groups
+    vpg, d = cfg.value_num_per_group, cfg.head_dim
+    if "self_attn.q_proj.weight" in w:
+        q = w["self_attn.q_proj.weight"]
+        for g in range(n_g):
+            gr = g * (vpg + 2) * d
+            _scatter_rows(dst, lo, part, q, g * vpg * d, gr, vpg * d, device=device, dtype=dtype)
+    if "self_attn.k_proj.weight" in w:
+        k = w["self_attn.k_proj.weight"]
+        for g in range(n_g):
+            gr = g * (vpg + 2) * d + vpg * d
+            _scatter_rows(dst, lo, part, k, g * d, gr, d, device=device, dtype=dtype)
+    if "self_attn.v_proj.weight" in w:
+        v = w["self_attn.v_proj.weight"]
+        for g in range(n_g):
+            gr = g * (vpg + 2) * d + (vpg + 1) * d
+            _scatter_rows(dst, lo, part, v, g * d, gr, d, device=device, dtype=dtype)
 
 
 def build_qwen_tiny_hf_checkpoint(
@@ -89,14 +144,12 @@ def build_qwen_tiny_hf_checkpoint(
     seed: int = 42,
     device: str = "cpu",
 ) -> dict[str, torch.Tensor]:
-    """Full in-memory HF checkpoint (CPU)."""
     g = torch.Generator(device=device).manual_seed(seed)
     h, iq, ikv = cfg.hidden_size, cfg.intermediate_size, cfg.kv_out
-    qo = cfg.q_out
-    v = cfg.vocab_size
+    qo, v = cfg.q_out, cfg.vocab_size
 
-    def R(*shape: int) -> torch.Tensor:
-        return torch.randn(*shape, dtype=dtype, device=device, generator=g)
+    def R(*s: int) -> torch.Tensor:
+        return torch.randn(*s, dtype=dtype, device=device, generator=g)
 
     return {
         "model.embed_tokens.weight": R(v, h),
@@ -112,59 +165,16 @@ def build_qwen_tiny_hf_checkpoint(
     }
 
 
-def hf_qkv_weights_to_megatron_linear_qkv(
-    q: torch.Tensor,
-    k: torch.Tensor,
-    v: torch.Tensor,
-    cfg: QwenTinyConfig,
-) -> torch.Tensor:
-    """Inverse of ``convert_qwen2_to_hf`` for ``self_attention.linear_qkv.weight`` (2D weight)."""
-    h = cfg.hidden_size
-    n_g = cfg.num_query_groups
-    vpg = cfg.value_num_per_group
-    d = cfg.head_dim
-    q_grp = q.view(n_g, vpg, d, h)
-    k_grp = k.view(n_g, 1, d, h)
-    v_grp = v.view(n_g, 1, d, h)
-    stacked = torch.cat([q_grp, k_grp, v_grp], dim=1)
-    return stacked.reshape(cfg.megatron_linear_qkv_rows, h)
-
-
-def megatron_linear_qkv_to_hf_qkv(
-    param: torch.Tensor,
-    cfg: QwenTinyConfig,
-) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Same split as ``convert_qwen2_to_hf`` (for tests / debugging)."""
-    h = cfg.hidden_size
-    d = cfg.head_dim
-    n_g = cfg.num_query_groups
-    vpg = cfg.value_num_per_group
-    p = param.view(n_g, vpg + 2, d, h)
-    q_param, k_param, v_param = torch.split(p, split_size_or_sections=[vpg, 1, 1], dim=1)
-    q_param = q_param.reshape(-1, h)
-    k_param = k_param.reshape(-1, h)
-    v_param = v_param.reshape(-1, h)
-    return q_param, k_param, v_param
-
-
-def actor_param_shapes(cfg: QwenTinyConfig, tp_size: int) -> dict[str, tuple[int, ...]]:
-    """Per-rank actor TP shard shapes (Megatron parameter names)."""
-    assert cfg.vocab_size % tp_size == 0
-    assert cfg.megatron_linear_qkv_rows % tp_size == 0
-    assert cfg.q_out % tp_size == 0
-    assert cfg.intermediate_size % tp_size == 0
-    assert (2 * cfg.intermediate_size) % tp_size == 0
-    v0 = cfg.vocab_size // tp_size
-    qkv0 = cfg.megatron_linear_qkv_rows // tp_size
-    q0 = cfg.q_out // tp_size
-    i0 = cfg.intermediate_size // tp_size
-    h = cfg.hidden_size
-    iq2 = 2 * cfg.intermediate_size
+def _actor_shapes(cfg: QwenTinyConfig, tp: int) -> dict[str, tuple[int, ...]]:
+    _assert_tp(cfg, tp)
+    h, iq = cfg.hidden_size, cfg.intermediate_size
+    v0, qkv0 = cfg.vocab_size // tp, cfg.megatron_qkv_rows // tp
+    q0, i0 = cfg.q_out // tp, cfg.intermediate_size // tp
     return {
         "embedding.word_embeddings.weight": (v0, h),
         "self_attention.linear_qkv.weight": (qkv0, h),
         "self_attention.linear_proj.weight": (h, q0),
-        "mlp.linear_fc1.weight": (iq2 // tp_size, h),
+        "mlp.linear_fc1.weight": (2 * iq // tp, h),
         "mlp.linear_fc2.weight": (h, i0),
         "self_attention.linear_qkv.layer_norm_weight": (h,),
         "mlp.linear_fc1.layer_norm_weight": (h,),
@@ -173,15 +183,14 @@ def actor_param_shapes(cfg: QwenTinyConfig, tp_size: int) -> dict[str, tuple[int
 
 def build_actor_wksd(
     cfg: QwenTinyConfig,
-    tp_rank: int,
-    tp_size: int,
     *,
     device: str,
     dtype: torch.dtype = torch.float32,
+    tp_rank: int = 0,
+    tp_size: int = 1,
 ) -> dict[str, torch.Tensor]:
-    del tp_rank  # symmetric shards; rank unused for allocation
-    shapes = actor_param_shapes(cfg, tp_size)
-    return {k: torch.empty(shapes[k], dtype=dtype, device=device) for k in shapes}
+    del tp_rank
+    return {k: torch.empty(s, dtype=dtype, device=device) for k, s in _actor_shapes(cfg, tp_size).items()}
 
 
 def actor_load_weights(
@@ -194,43 +203,41 @@ def actor_load_weights(
     tp_rank: int,
     tp_size: int,
 ) -> None:
-    wdict = dict(weights)
-    for t in wksd.values():
-        t.zero_()
+    _assert_tp(cfg, tp_size)
+    w = dict(weights)
+    iq, h = cfg.intermediate_size, cfg.hidden_size
+    q0, i0 = cfg.q_out // tp_size, cfg.intermediate_size // tp_size
+    fc1_part = 2 * iq // tp_size
+    fc1_lo = tp_rank * fc1_part
 
-    v_part = cfg.vocab_size // tp_size
-    emb_rows = wdict["model.embed_tokens.weight"][tp_rank * v_part : (tp_rank + 1) * v_part]
-    wksd["embedding.word_embeddings.weight"].copy_(emb_rows.to(device=device, dtype=dtype))
+    if "model.embed_tokens.weight" in w:
+        vp = cfg.vocab_size // tp_size
+        sl = slice(tp_rank * vp, (tp_rank + 1) * vp)
+        wksd["embedding.word_embeddings.weight"].copy_(w["model.embed_tokens.weight"][sl].to(device=device, dtype=dtype))
 
-    qkv_full = hf_qkv_weights_to_megatron_linear_qkv(
-        wdict["self_attn.q_proj.weight"],
-        wdict["self_attn.k_proj.weight"],
-        wdict["self_attn.v_proj.weight"],
-        cfg,
-    )
-    wksd["self_attention.linear_qkv.weight"].copy_(
-        torch.chunk(qkv_full, tp_size, dim=0)[tp_rank].to(device=device, dtype=dtype)
-    )
+    if any(k in w for k in ("self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight")):
+        _actor_scatter_megatron_qkv(
+            wksd["self_attention.linear_qkv.weight"], cfg, tp_rank, tp_size, w, device=device, dtype=dtype
+        )
 
-    o = wdict["self_attn.o_proj.weight"]
-    wksd["self_attention.linear_proj.weight"].copy_(
-        torch.chunk(o, tp_size, dim=1)[tp_rank].to(device=device, dtype=dtype)
-    )
+    if "self_attn.o_proj.weight" in w:
+        o = w["self_attn.o_proj.weight"]
+        c0, c1 = tp_rank * q0, (tp_rank + 1) * q0
+        wksd["self_attention.linear_proj.weight"].copy_(o[:, c0:c1].to(device=device, dtype=dtype))
 
-    gate = wdict["mlp.gate_proj.weight"]
-    up = wdict["mlp.up_proj.weight"]
-    fc1 = torch.cat([gate, up], dim=0)
-    wksd["mlp.linear_fc1.weight"].copy_(torch.chunk(fc1, tp_size, dim=0)[tp_rank].to(device=device, dtype=dtype))
+    if "mlp.gate_proj.weight" in w:
+        _scatter_rows(wksd["mlp.linear_fc1.weight"], fc1_lo, fc1_part, w["mlp.gate_proj.weight"], 0, 0, iq, device=device, dtype=dtype)
+    if "mlp.up_proj.weight" in w:
+        _scatter_rows(wksd["mlp.linear_fc1.weight"], fc1_lo, fc1_part, w["mlp.up_proj.weight"], 0, iq, iq, device=device, dtype=dtype)
 
-    d = wdict["mlp.down_proj.weight"]
-    wksd["mlp.linear_fc2.weight"].copy_(torch.chunk(d, tp_size, dim=1)[tp_rank].to(device=device, dtype=dtype))
+    if "mlp.down_proj.weight" in w:
+        c0, c1 = tp_rank * i0, (tp_rank + 1) * i0
+        wksd["mlp.linear_fc2.weight"].copy_(w["mlp.down_proj.weight"][:, c0:c1].to(device=device, dtype=dtype))
 
-    wksd["self_attention.linear_qkv.layer_norm_weight"].copy_(
-        wdict["input_layernorm.weight"].to(device=device, dtype=dtype)
-    )
-    wksd["mlp.linear_fc1.layer_norm_weight"].copy_(
-        wdict["post_attention_layernorm.weight"].to(device=device, dtype=dtype)
-    )
+    if "input_layernorm.weight" in w:
+        wksd["self_attention.linear_qkv.layer_norm_weight"].copy_(w["input_layernorm.weight"].to(device=device, dtype=dtype))
+    if "post_attention_layernorm.weight" in w:
+        wksd["mlp.linear_fc1.layer_norm_weight"].copy_(w["post_attention_layernorm.weight"].to(device=device, dtype=dtype))
 
 
 def make_actor_load_weights(
@@ -244,21 +251,23 @@ def make_actor_load_weights(
 ) -> Callable[[Iterable[tuple[str, torch.Tensor]]], None]:
     dev = torch.device(device)
 
-    def lw(weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        actor_load_weights(weights, wksd, cfg, device=dev, dtype=dtype, tp_rank=tp_rank, tp_size=tp_size)
+    def lw(it: Iterable[tuple[str, torch.Tensor]]) -> None:
+        actor_load_weights(it, wksd, cfg, device=dev, dtype=dtype, tp_rank=tp_rank, tp_size=tp_size)
 
     return lw
 
 
-def rollout_wksd_shapes(cfg: QwenTinyConfig) -> dict[str, tuple[int, ...]]:
+def _rollout_shapes(cfg: QwenTinyConfig, tp: int) -> dict[str, tuple[int, ...]]:
+    _assert_tp(cfg, tp)
     h, iq = cfg.hidden_size, cfg.intermediate_size
-    qkv_r = cfg.megatron_linear_qkv_rows
+    q_loc, kv_loc = cfg.q_out // tp, cfg.kv_out // tp
+    qkv_r = q_loc + 2 * kv_loc
     return {
-        "model.embed_tokens.weight": (cfg.vocab_size, h),
+        "model.embed_tokens.weight": (cfg.vocab_size // tp, h),
         "self_attn.qkv_proj.weight": (qkv_r, h),
-        "self_attn.o_proj.weight": (h, cfg.q_out),
-        "mlp.gate_up_proj.weight": (2 * iq, h),
-        "mlp.down_proj.weight": (h, iq),
+        "self_attn.o_proj.weight": (h, q_loc),
+        "mlp.gate_up_proj.weight": (2 * iq // tp, h),
+        "mlp.down_proj.weight": (h, iq // tp),
         "input_layernorm.weight": (h,),
         "post_attention_layernorm.weight": (h,),
     }
@@ -269,9 +278,11 @@ def build_rollout_wksd(
     *,
     device: str,
     dtype: torch.dtype = torch.float32,
+    tp_rank: int = 0,
+    tp_size: int = 1,
 ) -> dict[str, torch.Tensor]:
-    shapes = rollout_wksd_shapes(cfg)
-    return {k: torch.empty(v, dtype=dtype, device=device) for k, v in shapes.items()}
+    del tp_rank
+    return {k: torch.empty(s, dtype=dtype, device=device) for k, s in _rollout_shapes(cfg, tp_size).items()}
 
 
 def rollout_load_weights(
@@ -281,27 +292,51 @@ def rollout_load_weights(
     *,
     device: torch.device,
     dtype: torch.dtype,
+    tp_rank: int,
+    tp_size: int,
 ) -> None:
-    wdict = dict(weights)
-    for t in wksd.values():
-        t.zero_()
+    """Map HF shards into SGLang-like per-rank ``wksd`` (stacked qkv / gate_up, TP on outputs or inputs)."""
+    _assert_tp(cfg, tp_size)
+    w = dict(weights)
+    iq, h = cfg.intermediate_size, cfg.hidden_size
+    q_loc, kv_loc = cfg.q_out // tp_size, cfg.kv_out // tp_size
+    i0 = iq // tp_size
 
-    wksd["model.embed_tokens.weight"].copy_(wdict["model.embed_tokens.weight"].to(device=device, dtype=dtype))
+    if "model.embed_tokens.weight" in w:
+        vp = cfg.vocab_size // tp_size
+        sl = slice(tp_rank * vp, (tp_rank + 1) * vp)
+        wksd["model.embed_tokens.weight"].copy_(w["model.embed_tokens.weight"][sl].to(device=device, dtype=dtype))
 
-    q_w = wdict["self_attn.q_proj.weight"]
-    k_w = wdict["self_attn.k_proj.weight"]
-    v_w = wdict["self_attn.v_proj.weight"]
-    packed = hf_qkv_weights_to_megatron_linear_qkv(q_w, k_w, v_w, cfg)
-    wksd["self_attn.qkv_proj.weight"].copy_(packed.to(device=device, dtype=dtype))
+    qkv = wksd["self_attn.qkv_proj.weight"]
+    if "self_attn.q_proj.weight" in w:
+        sl = slice(tp_rank * q_loc, (tp_rank + 1) * q_loc)
+        qkv[:q_loc].copy_(w["self_attn.q_proj.weight"][sl].to(device=device, dtype=dtype))
+    if "self_attn.k_proj.weight" in w:
+        sl = slice(tp_rank * kv_loc, (tp_rank + 1) * kv_loc)
+        qkv[q_loc : q_loc + kv_loc].copy_(w["self_attn.k_proj.weight"][sl].to(device=device, dtype=dtype))
+    if "self_attn.v_proj.weight" in w:
+        sl = slice(tp_rank * kv_loc, (tp_rank + 1) * kv_loc)
+        qkv[q_loc + kv_loc :].copy_(w["self_attn.v_proj.weight"][sl].to(device=device, dtype=dtype))
 
-    g_w = wdict["mlp.gate_proj.weight"]
-    u_w = wdict["mlp.up_proj.weight"]
-    wksd["mlp.gate_up_proj.weight"].copy_(torch.cat([g_w, u_w], dim=0).to(device=device, dtype=dtype))
+    if "self_attn.o_proj.weight" in w:
+        c0, c1 = tp_rank * q_loc, (tp_rank + 1) * q_loc
+        wksd["self_attn.o_proj.weight"].copy_(w["self_attn.o_proj.weight"][:, c0:c1].to(device=device, dtype=dtype))
 
-    wksd["self_attn.o_proj.weight"].copy_(wdict["self_attn.o_proj.weight"].to(device=device, dtype=dtype))
-    wksd["mlp.down_proj.weight"].copy_(wdict["mlp.down_proj.weight"].to(device=device, dtype=dtype))
-    wksd["input_layernorm.weight"].copy_(wdict["input_layernorm.weight"].to(device=device, dtype=dtype))
-    wksd["post_attention_layernorm.weight"].copy_(wdict["post_attention_layernorm.weight"].to(device=device, dtype=dtype))
+    part = 2 * iq // tp_size
+    glo = tp_rank * part
+    if "mlp.gate_proj.weight" in w:
+        _scatter_rows(wksd["mlp.gate_up_proj.weight"], glo, part, w["mlp.gate_proj.weight"], 0, 0, iq, device=device, dtype=dtype)
+    if "mlp.up_proj.weight" in w:
+        _scatter_rows(wksd["mlp.gate_up_proj.weight"], glo, part, w["mlp.up_proj.weight"], 0, iq, iq, device=device, dtype=dtype)
+
+    if "mlp.down_proj.weight" in w:
+        c0, c1 = tp_rank * i0, (tp_rank + 1) * i0
+        wksd["mlp.down_proj.weight"].copy_(w["mlp.down_proj.weight"][:, c0:c1].to(device=device, dtype=dtype))
+
+    if "input_layernorm.weight" in w:
+        wksd["input_layernorm.weight"].copy_(w["input_layernorm.weight"].to(device=device, dtype=dtype))
+    if "post_attention_layernorm.weight" in w:
+        wksd["post_attention_layernorm.weight"].copy_(w["post_attention_layernorm.weight"].to(device=device, dtype=dtype))
 
 
 def make_rollout_load_weights(
@@ -310,22 +345,20 @@ def make_rollout_load_weights(
     *,
     device: str,
     dtype: torch.dtype,
+    tp_rank: int,
+    tp_size: int,
 ) -> Callable[[Iterable[tuple[str, torch.Tensor]]], None]:
     dev = torch.device(device)
 
-    def lw(weights: Iterable[tuple[str, torch.Tensor]]) -> None:
-        rollout_load_weights(weights, wksd, cfg, device=dev, dtype=dtype)
+    def lw(it: Iterable[tuple[str, torch.Tensor]]) -> None:
+        rollout_load_weights(it, wksd, cfg, device=dev, dtype=dtype, tp_rank=tp_rank, tp_size=tp_size)
 
     return lw
 
 
 def actor_load_spec_path(load_spec_dir: str, rank: int) -> str:
-    from pathlib import Path
-
     return str(Path(load_spec_dir) / f"actor_tp_rank{rank}.json")
 
 
 def rollout_load_spec_path(load_spec_dir: str, rank: int) -> str:
-    from pathlib import Path
-
     return str(Path(load_spec_dir) / f"rollout_rank{rank}.json")

@@ -52,10 +52,6 @@ def _shard_row_major(rows: int, cols: int, tp_rank: int, tp_size: int) -> list[t
     return [(0, rows, rows), (lo, hi, cols)]
 
 
-def _shard_full_2d(rows: int, cols: int) -> list[tuple[int, int, int]]:
-    return [(0, rows, rows), (0, cols, cols)]
-
-
 def _shard_1d(n: int) -> list[tuple[int, int, int]]:
     return [(0, n, n)]
 
@@ -86,21 +82,8 @@ def actor_wire_shard_spec(cfg: QwenTinyConfig, tp_rank: int, tp_size: int) -> Sh
 
 
 def rollout_wire_shard_spec(cfg: QwenTinyConfig, rollout_rank: int, rollout_size: int) -> ShardSpec:
-    h, qo, kvo, iq = cfg.hidden_size, cfg.q_out, cfg.kv_out, cfg.intermediate_size
-    full = _shard_full_2d
-    entries = {
-        "model.embed_tokens.weight": _shard_embed_rows(cfg, rollout_rank, rollout_size),
-        "self_attn.q_proj.weight": full(qo, h),
-        "self_attn.k_proj.weight": full(kvo, h),
-        "self_attn.v_proj.weight": full(kvo, h),
-        "self_attn.o_proj.weight": full(h, qo),
-        "mlp.gate_proj.weight": full(iq, h),
-        "mlp.up_proj.weight": full(iq, h),
-        "mlp.down_proj.weight": full(h, iq),
-        "input_layernorm.weight": _shard_1d(h),
-        "post_attention_layernorm.weight": _shard_1d(h),
-    }
-    return ShardSpec(entries)
+    """HF regions per rollout rank (TP-aligned, same box pattern as :func:`actor_wire_shard_spec`)."""
+    return actor_wire_shard_spec(cfg, rollout_rank, rollout_size)
 
 
 @dataclass
@@ -136,9 +119,20 @@ class RolloutWorker:
         hf_cpu = args.build_checkpoint()
         self.hf_iter_factory = make_hf_iter_factory(hf_cpu)
         self.shard_spec = rollout_wire_shard_spec(cfg, rank, args.num_rollout_workers)
-        self.state_dict = build_rollout_wksd(cfg, device="cuda", dtype=args.dtype)
+        self.state_dict = build_rollout_wksd(
+            cfg,
+            device="cuda",
+            dtype=args.dtype,
+            tp_rank=rank,
+            tp_size=args.num_rollout_workers,
+        )
         self.load_weights = make_rollout_load_weights(
-            self.state_dict, cfg, device="cuda", dtype=args.dtype
+            self.state_dict,
+            cfg,
+            device="cuda",
+            dtype=args.dtype,
+            tp_rank=rank,
+            tp_size=args.num_rollout_workers,
         )
         self.load_weights(self.hf_iter_factory())
         self.adapter = ExampleReceiverAdapter(
@@ -219,7 +213,11 @@ class TrainerWorker:
         self.hf_iter_factory = make_hf_iter_factory(hf_cpu)
         self.shard_spec = actor_wire_shard_spec(cfg, rank, args.num_trainer_workers)
         self.state_dict = build_actor_wksd(
-            cfg, rank, args.num_trainer_workers, device="cuda", dtype=args.dtype
+            cfg,
+            device="cuda",
+            dtype=args.dtype,
+            tp_rank=rank,
+            tp_size=args.num_trainer_workers,
         )
         self.load_weights = make_actor_load_weights(
             self.state_dict,

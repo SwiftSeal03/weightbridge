@@ -70,8 +70,13 @@ class _ExampleAdapterBase:
                 verify_load_spec(self.hf_iter_factory(), self.wksd, self.load_spec)
                 loaded = True
             except Exception as e:
+                self.load_spec = None
+                try:
+                    self.load_spec_path.unlink()
+                except OSError:
+                    pass
                 logger.info(
-                    "example adapter rank %s: cached LoadSpec invalid or unreadable (%s); inferring",
+                    "example adapter rank %s: cached LoadSpec invalid (%s); removed file and inferring",
                     self.rank,
                     e,
                 )

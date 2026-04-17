@@ -24,10 +24,14 @@ def get_ray_nodes():
 def make_hf_iter_factory(
     full_cpu: dict[str, torch.Tensor],
 ) -> Callable[[], Iterator[tuple[str, torch.Tensor]]]:
-    """Factory of CPU tensor iterators (each call is a fresh pass for verify / infer)."""
+    """Factory of CPU tensor iterators (each call is a fresh pass for verify / infer).
+
+    Yields **clones** so :func:`~wbridge.utils.specgen.infer_load_spec` can mutate probe tensors
+    (``fill_``, etc.) without corrupting the shared *full_cpu* checkpoint dict.
+    """
 
     def factory() -> Iterator[tuple[str, torch.Tensor]]:
         for name, t in full_cpu.items():
-            yield name, t.contiguous()
+            yield name, t.clone().contiguous()
 
     return factory

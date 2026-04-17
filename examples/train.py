@@ -39,7 +39,8 @@ def main() -> None:
     )
 
     rollout_ip, trainer_ip, rollout_node_id, trainer_node_id = get_ray_nodes()
-    load_spec_dir = str(Path(tempfile.gettempdir()) / "wbridge_example_qwen_loadspec")
+    # Bump dirname if layout / LoadSpec format changes (stale JSON under old dirs still hurts until deleted).
+    load_spec_dir = str(Path(tempfile.gettempdir()) / "wbridge_example_qwen_loadspec_v3")
     Path(load_spec_dir).mkdir(parents=True, exist_ok=True)
 
     cfg = DEFAULT_QWEN_TINY_CONFIG
