@@ -61,11 +61,9 @@ def _sd_subset_iterator(
         yield name, hfsd[name]
 
 
-def _worker_nonzero(t: torch.Tensor) -> bool:
-    ret = bool(torch.any(t != 0).item())
-    if ret:
-        t.zero_()
-    return ret
+def zero_wk_tensors(wk_keys: list[str], wksd: dict[str, torch.Tensor]) -> None:
+    for wk in wk_keys:
+        wksd[wk].zero_()
 
 
 def _match_hf_to_worker_names(
@@ -84,7 +82,8 @@ def _match_hf_to_worker_names(
         wksd[wk].zero_()
         
     lw(_sd_subset_iterator(hfsd, hf_keys))
-    wk_candidates = {wk for wk in wk_keys if _worker_nonzero(wksd[wk])}
+    wk_candidates = {wk for wk in wk_keys if torch.count_nonzero(wksd[wk]) > 0}
+    zero_wk_tensors(wk_candidates, wksd)
 
     def recurse(h_subset: list[str], wk_candidates: list[str]) -> None:
         if not h_subset or not wk_candidates:
@@ -97,10 +96,12 @@ def _match_hf_to_worker_names(
         left, right = h_subset[:mid], h_subset[mid:]
 
         lw(_sd_subset_iterator(hfsd, left))
-        w_left = {wk for wk in wk_candidates if _worker_nonzero(wksd[wk])}
+        w_left = {wk for wk in wk_candidates if torch.count_nonzero(wksd[wk]) > 0}
+        zero_wk_tensors(w_left, wksd)
 
         lw(_sd_subset_iterator(hfsd, right))
-        w_right = {wk for wk in wk_candidates if _worker_nonzero(wksd[wk])}
+        w_right = {wk for wk in wk_candidates if torch.count_nonzero(wksd[wk]) > 0}
+        zero_wk_tensors(w_right, wksd)
 
         recurse(left, w_left)
         recurse(right, w_right)
