@@ -2,7 +2,8 @@
 
 Uses a single-layer Qwen2-style HF checkpoint built on each worker via ``build_checkpoint``.
 Trainer (**actor**) workers hold TP shards
-of HF names in ``wksd``; rollout workers hold merged weights (``qkv_proj``, ``gate_up_proj``, …). :class:`~adapters.ExampleSenderAdapter` / :class:`~adapters.ExampleReceiverAdapter`
+of HF names in ``wksd``; rollout workers hold merged weights (``qkv_proj``, ``gate_up_proj``, ...).
+:class:`~wbridge.frontend.adapters.SenderAdapter` / :class:`~wbridge.frontend.adapters.ReceiverAdapter`
 infer per-rank :class:`~wbridge.utils.data.LoadSpec` JSON under *load_spec_dir*.
 
 Usage::

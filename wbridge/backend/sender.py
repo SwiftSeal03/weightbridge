@@ -1,3 +1,5 @@
+from dataclasses import dataclass
+
 import requests
 import torch
 import torch.distributed as dist
@@ -6,23 +8,35 @@ from wbridge.utils.data import ShardSpec
 from wbridge.utils.distributed import init_custom_process_group
 
 
-class WeightSender:
-    def __init__(
-        self,
-        rank: int,
-        world_size: int,
-        transfer_mode: str,
-        receiver_urls: list[str],
-        master_addr: str,
-        master_port: int,
-    ):
-        self.transfer_mode = transfer_mode
-        self.receiver_urls = receiver_urls
-        self.rank = rank
-        self.world_size = world_size
-        self.init_method = f"tcp://{master_addr}:{master_port}"
+@dataclass
+class SenderArgs:
+    """Transport args forwarded to :class:`WeightSender`.
 
-        if transfer_mode == "gpu_direct":
+    Attributes:
+        world_size: Number of sender ranks participating in the process group.
+        transfer_mode: ``"gpu_direct"`` (NCCL/cuda) or any other mode supported by
+            :class:`WeightSender`.
+        receiver_urls: HTTP base URLs of the receiver controllers, one per receiver engine.
+        master_addr: Host/IP of the sender-side rank-0 process used for rendezvous.
+        master_port: TCP port for the rendezvous group.
+    """
+
+    world_size: int
+    transfer_mode: str
+    receiver_urls: list[str]
+    master_addr: str
+    master_port: int
+
+
+class WeightSender:
+    def __init__(self, rank: int, args: SenderArgs):
+        self.rank = rank
+        self.transfer_mode = args.transfer_mode
+        self.receiver_urls = args.receiver_urls
+        self.world_size = args.world_size
+        self.init_method = f"tcp://{args.master_addr}:{args.master_port}"
+
+        if args.transfer_mode == "gpu_direct":
             self.device = "cuda"
             self.backend = "nccl"
         else:

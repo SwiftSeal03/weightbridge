@@ -1,19 +1,17 @@
-"""
-Megatron-Bridge helpers for WeightBridge: build or load a :class:`~wbridge.utils.data.LoadSpec`
-that maps HuggingFace checkpoint tensors onto Megatron parameters, and expose a
-:class:`~wbridge.backend.sender.WeightSender` for pushing shards to receivers.
+"""Megatron-Bridge frontend for WeightBridge.
 
-The LoadSpec is cached per process rank under ``~/.cache/megatron/loadspec_rank{RANK}.json`` to
-avoid repeating expensive inference. Callers that only need inference should still construct
-:class:`WBMegatronAdapter` when appropriate; this module does not read ``WBRIDGE_INFER_LOAD_SPEC`` or
-``SLIME_WBRIDGE_INFER_LOAD_SPEC`` (conventions for scripts or orchestration layers).
+Builds the HF tensor iterator, CUDA ``wksd`` (mapped from Megatron-Bridge conversion tasks), and
+``load_weights`` closure that mirrors HF \u2192 Megatron loading, then reuses
+:class:`~wbridge.frontend.adapters.SenderAdapter` for the LoadSpec lifecycle and the
+:class:`~wbridge.backend.sender.WeightSender` plumbing.
+
+The LoadSpec is cached under ``~/.cache/megatron/loadspec_rank{RANK}.json`` to avoid repeating
+expensive inference across runs.
 """
 
 from __future__ import annotations
 
-import json
 import logging
-import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,13 +20,11 @@ from typing import Any
 import torch
 from megatron.bridge import AutoBridge
 
-
-from wbridge.utils.data import LoadSpec
-from wbridge.backend.sender import WeightSender
-from wbridge.utils.specgen import infer_load_spec, verify_load_spec
-from wbridge.utils.data import shards_numel
+from wbridge.backend.sender import SenderArgs
+from wbridge.frontend.adapters import AdapterContext, SenderAdapter
 
 logger = logging.getLogger(__name__)
+
 
 @contextmanager
 def patch_megatron_model(model):
@@ -98,7 +94,7 @@ def _megatron_model_chunks(model: list[Any]) -> list[Any]:
     return [inner]
 
 
-def _wksd_from_conversion_tasks(tasks: list[Any]) -> dict[str, Any]:
+def _wksd_from_conversion_tasks(tasks: list[Any]) -> dict[str, torch.Tensor]:
     """Map Megatron parameter names to CUDA tensors referenced by Bridge conversion tasks."""
     wksd: dict[str, torch.Tensor] = {}
     for task in tasks:
@@ -114,13 +110,14 @@ def _wksd_from_conversion_tasks(tasks: list[Any]) -> dict[str, Any]:
     return wksd
 
 
-class WBMegatronAdapter:
-    """Tie a loaded Megatron ``model`` to HF weights and a :class:`~wbridge.utils.data.LoadSpec`.
+class WBMegatronAdapter(SenderAdapter):
+    """Tie a loaded Megatron ``model`` to HF weights and send shards via
+    :class:`~wbridge.frontend.adapters.SenderAdapter`.
 
-    On construction, builds Megatron-Bridge conversion tasks, loads or infers a LoadSpec (see
-    :meth:`_get_load_spec_and_verify`), and creates a :class:`~wbridge.backend.sender.WeightSender`
-    with ``*args`` (``world_size``, ``transfer_mode``, ``receiver_urls``, ``master_addr``,
-    ``master_port``).
+    ``connect()`` and ``send_weights()`` are inherited directly from
+    :class:`~wbridge.frontend.adapters.SenderAdapter`; ``sender_args`` is forwarded opaquely to
+    :class:`~wbridge.backend.sender.WeightSender`, which is the only place the dataclass is
+    unpacked.
     """
 
     def __init__(
@@ -128,7 +125,7 @@ class WBMegatronAdapter:
         hf_checkpoint: str,
         model: list[torch.nn.Module],
         rank: int,
-        *args: Any,
+        sender_args: SenderArgs,
     ) -> None:
         self.hf_checkpoint = hf_checkpoint
         self.model = model
@@ -136,120 +133,74 @@ class WBMegatronAdapter:
         self.bridge = AutoBridge.from_hf_pretrained(hf_checkpoint)
         with patch_megatron_model(model):
             self.conv_tasks = list(self.bridge.get_conversion_tasks(self.chunks))
-        self.wksd = _wksd_from_conversion_tasks(self.conv_tasks)
-        self.load_spec_path = Path.home() / ".cache" / "megatron" / f"loadspec_rank{rank}.json"
+        wksd = _wksd_from_conversion_tasks(self.conv_tasks)
 
-        self._get_load_spec_and_verify()
-        self.sender = WeightSender(rank, *args)
-            
+        self._hf_tensor_meta: dict[str, tuple[tuple[int, ...], torch.dtype]] | None = None
+
+        ctx = AdapterContext(
+            hf_iter_factory=self._get_hf_iter,
+            wksd=wksd,
+            load_weights=self._load_weights,
+            load_spec_path=Path.home() / ".cache" / "megatron" / f"loadspec_rank{rank}.json",
+            rank=rank,
+        )
+        super().__init__(ctx, sender_args)
 
     def _get_hf_iter(self) -> Iterator[tuple[str, Any]]:
-        """Iterator over HF checkpoint tensors (same tree as ``self.hf_checkpoint``)."""
+        """Fresh iterator over HF checkpoint tensors."""
         return _iter_hf_checkpoint_cpu_tensors(self.hf_checkpoint)
 
     @torch.inference_mode()
-    def _get_load_spec_and_verify(self) -> None:
-        """Load or infer ``self.load_spec`` and verify it against HF tensors and Megatron weights.
+    def _load_weights(self, weights: Iterator[tuple[str, torch.Tensor]]) -> None:
+        """Mirror HF \u2192 Megatron loading (including grouped HF params and shared-embedding broadcast).
 
-        Steps:
-
-        1. ``AutoBridge.from_hf_pretrained(self.hf_checkpoint)`` and
-           ``get_conversion_tasks(megatron_chunks)`` to obtain CUDA parameter tensors (*wksd*).
-        2. If ``self.load_spec_path`` exists, parse it as a :class:`~wbridge.utils.data.LoadSpec` and
-           :func:`~wbridge.utils.specgen.verify_load_spec`; return on success.
-        3. On any failure (missing file, bad JSON, verification mismatch), log and infer a new spec:
-           stream HF tensors, run a ``lw`` closure that mirrors HF→Megatron loading (including
-           optional grouped HF params and shared-embedding broadcast), then call
-           :func:`~wbridge.utils.specgen.infer_load_spec` and verify again. Persist the result to
-           ``self.load_spec_path``.
-
-        Inference can be very slow on large models and reads the HF tree multiple times. In
-        distributed runs, keep cache files consistent across ranks (same path visibility and valid
-        spec); otherwise ranks can diverge and later collectives may deadlock.
-
-        The decorator applies ``torch.inference_mode()`` because specgen probing uses in-place writes
-        on Megatron tensors and must not build autograd graphs.
+        ``torch.inference_mode`` is required because specgen probing does in-place writes on
+        Megatron tensors and must not build autograd graphs.
         """
-        # Try to load LoadSpec from cache and verify it
-        try:
-            with open(self.load_spec_path, encoding="utf-8") as f:
-                self.load_spec = LoadSpec(json.load(f))
-            verify_load_spec(self._get_hf_iter(), self.wksd, self.load_spec)
-            self.shard_spec = self.load_spec.src_spec()
-            return
-        except Exception as e:
-            logger.error(f"{type(e).__name__}: {e}")
-            
-        logger.info("wbridge: Loading LoadSpec from cache failed, will infer a new LoadSpec")
+        if self._hf_tensor_meta is None:
+            self._hf_tensor_meta = {
+                k: (tuple(t.shape), t.dtype) for k, t in self._get_hf_iter()
+            }
+        hf_tensor_meta = self._hf_tensor_meta
 
-        # Infer a new LoadSpec
-        hf_tensor_meta = {k: (tuple(t.shape), t.dtype) for k, t in self._get_hf_iter()}
-        
-        def lw(weights: Any) -> None:
-            hf_chunk = dict(weights)
-            hf_cache: dict[str, Any] = {}
+        hf_chunk = dict(weights)
+        hf_cache: dict[str, Any] = {}
 
-            with patch_megatron_model(self.model):
-                for task in self.conv_tasks:
-                    if task is None or getattr(task, "megatron_module", None) is None:
-                        continue
-                    pw = getattr(task, "param_weight", None)
-                    if pw is None:
-                        continue
-                    try:
-                        hf_param = task.mapping.hf_param
-                        is_grouped = getattr(task.mapping, "is_grouped_export", False)
-                        hf_param_key = str(hf_param)
-                        if hf_tensor_meta is not None and isinstance(hf_param, dict):
-                            if all(v not in hf_chunk for v in hf_param.values()):
+        with patch_megatron_model(self.model):
+            for task in self.conv_tasks:
+                if task is None or getattr(task, "megatron_module", None) is None:
+                    continue
+                pw = getattr(task, "param_weight", None)
+                if pw is None:
+                    continue
+                try:
+                    hf_param = task.mapping.hf_param
+                    is_grouped = getattr(task.mapping, "is_grouped_export", False)
+                    hf_param_key = str(hf_param)
+                    if isinstance(hf_param, dict):
+                        if all(v not in hf_chunk for v in hf_param.values()):
+                            continue
+                        for _logical, ckpt_name in hf_param.items():
+                            if ckpt_name in hf_chunk:
                                 continue
-                            for _logical, ckpt_name in hf_param.items():
-                                if ckpt_name in hf_chunk:
-                                    continue
-                                if ckpt_name not in hf_tensor_meta:
-                                    continue
-                                sh, dt = hf_tensor_meta[ckpt_name]
-                                hf_chunk[ckpt_name] = torch.zeros(sh, dtype=dt, device="cpu")
-                        if is_grouped and hf_param_key in hf_cache:
-                            hf_weights = hf_cache[hf_param_key]
-                        else:
-                            hf_weights = self.bridge._model_bridge.maybe_modify_loaded_hf_weight(hf_param, hf_chunk)
-                        if is_grouped:
-                            hf_cache[hf_param_key] = hf_weights
-                    except (KeyError, TypeError, ValueError, AttributeError):
-                        continue
-                    if hf_weights is None:
-                        continue
-                    converted = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
-                    pw.copy_(converted)
-                bcast = getattr(self.bridge._model_bridge, "_broadcast_shared_embeddings", None)
-                if bcast is not None:
-                    bcast(self.chunks)
-
-        self.load_spec = infer_load_spec(self._get_hf_iter(), self.wksd, lw)
-        self.shard_spec = self.load_spec.src_spec()
-        try:
-            verify_load_spec(self._get_hf_iter(), self.wksd, self.load_spec)
-        except Exception as e:
-            logger.error(f"wbridge: Inferred LoadSpec verification failed. This is likely a bug in the LoadSpec inference logic. Please report this to the developers.")
-            raise e
-
-        # Save the LoadSpec to cache
-        os.makedirs(self.load_spec_path.parent, exist_ok=True)
-        with open(self.load_spec_path, "w", encoding="utf-8") as f:
-            json.dump(self.load_spec.entries, f, indent=2, sort_keys=True)
-        logger.info("wbridge: wrote LoadSpec to %s", self.load_spec_path)
-        
-        
-    def connect(self) -> None:
-        self.sender.connect(self.shard_spec)
-        self.dtype_spec = self.sender.dtype_spec
-        
-        
-    def send_weights(self) -> None:
-        self.sender_buffer = {
-            name: torch.empty(shards_numel(self.shard_spec[name]), dtype=self.dtype_spec[name], device=self.sender.device)
-            for name, _ in self.shard_spec
-        }
-        self.load_spec.copy_fromto_sharded(self.shard_spec, self.sender_buffer, self.wksd, src_to_dst=False)
-        self.sender.send(self.sender_buffer)
+                            if ckpt_name not in hf_tensor_meta:
+                                continue
+                            sh, dt = hf_tensor_meta[ckpt_name]
+                            hf_chunk[ckpt_name] = torch.zeros(sh, dtype=dt, device="cpu")
+                    if is_grouped and hf_param_key in hf_cache:
+                        hf_weights = hf_cache[hf_param_key]
+                    else:
+                        hf_weights = self.bridge._model_bridge.maybe_modify_loaded_hf_weight(
+                            hf_param, hf_chunk
+                        )
+                    if is_grouped:
+                        hf_cache[hf_param_key] = hf_weights
+                except (KeyError, TypeError, ValueError, AttributeError):
+                    continue
+                if hf_weights is None:
+                    continue
+                converted = task.mapping.hf_to_megatron(hf_weights, task.megatron_module)
+                pw.copy_(converted)
+            bcast = getattr(self.bridge._model_bridge, "_broadcast_shared_embeddings", None)
+            if bcast is not None:
+                bcast(self.chunks)

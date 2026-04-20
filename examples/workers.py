@@ -3,9 +3,10 @@
 Configuration is passed as a single :class:`EngineArgs` instance. HF weights are not serialized in
 ``EngineArgs``; each worker calls ``build_checkpoint()`` locally so checkpoints are identical across
 nodes without shipping CPU tensors through Ray. Trainer (**actor**) workers use a TP shard of HF
-names in ``wksd``; **rollout** workers use merged names (``qkv_proj``, ``gate_up_proj``, …).
+names in ``wksd``; **rollout** workers use merged names (``qkv_proj``, ``gate_up_proj``, ...).
 HF shard layout on the wire is defined by :meth:`~wbridge.utils.data.LoadSpec.src_spec` after
-LoadSpec inference in :mod:`adapters`.
+LoadSpec inference inside :class:`~wbridge.frontend.adapters.SenderAdapter` /
+:class:`~wbridge.frontend.adapters.ReceiverAdapter`.
 """
 
 from __future__ import annotations
@@ -23,8 +24,9 @@ from fastapi import FastAPI
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
 from wbridge import WeightReceiverController
+from wbridge.backend.sender import SenderArgs
+from wbridge.frontend.adapters import AdapterContext, ReceiverAdapter, SenderAdapter
 
-from adapters import ExampleReceiverAdapter, ExampleSenderAdapter
 from qwen_tiny import (
     QwenTinyConfig,
     actor_load_spec_path,
@@ -71,7 +73,7 @@ class EngineArgs:
 
 @ray.remote(num_gpus=1, num_cpus=1)
 class RolloutWorker:
-    """One per receiver GPU. Receives weights via NCCL and optionally verifies."""
+    """One per receiver GPU. Receives weights via NCCL and verifies against a pre-recv backup."""
 
     def init(self, rank: int, args: EngineArgs):
         _apply_network_interface_for_process_group(args.network_interface)
@@ -79,7 +81,7 @@ class RolloutWorker:
         self.args = args
         cfg = args.model_config
         hf_cpu = args.build_checkpoint()
-        self.hf_iter_factory = make_hf_iter_factory(hf_cpu)
+        hf_iter_factory = make_hf_iter_factory(hf_cpu)
         self.state_dict = build_rollout_wksd(
             cfg,
             device="cuda",
@@ -87,7 +89,7 @@ class RolloutWorker:
             tp_rank=rank,
             tp_size=args.num_rollout_workers,
         )
-        self.load_weights = make_rollout_load_weights(
+        load_weights = make_rollout_load_weights(
             self.state_dict,
             cfg,
             device="cuda",
@@ -95,32 +97,38 @@ class RolloutWorker:
             tp_rank=rank,
             tp_size=args.num_rollout_workers,
         )
-        self.load_weights(self.hf_iter_factory())
-        self.adapter = ExampleReceiverAdapter(
-            self.hf_iter_factory,
-            self.state_dict,
-            self.load_weights,
-            rollout_load_spec_path(args.load_spec_dir, rank),
+        load_weights(hf_iter_factory())
+        ctx = AdapterContext(
+            hf_iter_factory=hf_iter_factory,
+            wksd=self.state_dict,
+            load_weights=load_weights,
+            load_spec_path=rollout_load_spec_path(args.load_spec_dir, rank),
             rank=rank,
         )
-        self.receiver = self.adapter.make_receiver(args.rollout_controller_ipc_name)
+        self.adapter = ReceiverAdapter(ctx, args.rollout_controller_ipc_name)
+        # Snapshot the loaded weights before the first recv so verify() can diff backup vs received.
+        self.state_dict_backup = {name: t.detach().clone() for name, t in self.state_dict.items()}
 
     def recv_weights(self) -> None:
         for _ in range(500):
-            if self.receiver.is_weights_ready:
-                break
+            if self.adapter.try_receive_weights():
+                return
             time.sleep(0.05)
-        else:
-            raise TimeoutError("receiver never became ready for weights")
-        self.recv_state_dict = {name: torch.zeros_like(t) for name, t in self.state_dict.items()}
-        self.receiver.request_update()
-        self.adapter.apply_recv_buffer(self.receiver.recv_buffer, self.recv_state_dict)
+        raise TimeoutError("receiver never became ready for weights")
 
     def verify(self) -> dict:
-        for name, t in self.recv_state_dict.items():
-            if not torch.allclose(t, self.state_dict[name]):
-                return {"rank": self.rank, "name": name, "ok": False, "detail": f"value mismatch for {name} on rank {self.rank}, \
-                    expected: {self.state_dict[name][:, :1].view(-1)}, got: {t[:, :1].view(-1)}"}
+        for name, backup in self.state_dict_backup.items():
+            received = self.state_dict[name]
+            if not torch.allclose(backup, received):
+                return {
+                    "rank": self.rank,
+                    "name": name,
+                    "ok": False,
+                    "detail": (
+                        f"value mismatch for {name} on rank {self.rank}, "
+                        f"expected: {backup[:, :1].view(-1)}, got: {received[:, :1].view(-1)}"
+                    ),
+                }
         return {"rank": self.rank, "ok": True, "detail": "all values match"}
 
 
@@ -162,7 +170,7 @@ class RolloutEngine:
 
 @ray.remote(num_gpus=1, num_cpus=1)
 class TrainerWorker:
-    """One per sender GPU. Sends shards via :class:`~adapters.ExampleSenderAdapter`."""
+    """One per sender GPU. Sends shards via :class:`~wbridge.frontend.adapters.SenderAdapter`."""
 
     def init(self, rank: int, args: EngineArgs):
         _apply_network_interface_for_process_group(args.network_interface)
@@ -170,7 +178,7 @@ class TrainerWorker:
         self.rank = rank
         cfg = args.model_config
         hf_cpu = args.build_checkpoint()
-        self.hf_iter_factory = make_hf_iter_factory(hf_cpu)
+        hf_iter_factory = make_hf_iter_factory(hf_cpu)
         self.state_dict = build_actor_wksd(
             cfg,
             device="cuda",
@@ -178,7 +186,7 @@ class TrainerWorker:
             tp_rank=rank,
             tp_size=args.num_trainer_workers,
         )
-        self.load_weights = make_actor_load_weights(
+        load_weights = make_actor_load_weights(
             self.state_dict,
             cfg,
             device="cuda",
@@ -186,24 +194,26 @@ class TrainerWorker:
             tp_rank=rank,
             tp_size=args.num_trainer_workers,
         )
-        self.load_weights(self.hf_iter_factory())
-        self.adapter = ExampleSenderAdapter(
-            self.hf_iter_factory,
-            self.state_dict,
-            self.load_weights,
-            actor_load_spec_path(args.load_spec_dir, rank),
+        load_weights(hf_iter_factory())
+        ctx = AdapterContext(
+            hf_iter_factory=hf_iter_factory,
+            wksd=self.state_dict,
+            load_weights=load_weights,
+            load_spec_path=actor_load_spec_path(args.load_spec_dir, rank),
             rank=rank,
         )
+        sender_args = SenderArgs(
+            world_size=args.num_trainer_workers,
+            transfer_mode="gpu_direct",
+            receiver_urls=[f"http://{args.rollout_host}:{args.rollout_port}"],
+            master_addr=args.trainer_host,
+            master_port=args.trainer_pg_port,
+        )
+        self.adapter = SenderAdapter(ctx, sender_args)
 
     def send_weights(self):
-        self.adapter.connect(
-            transfer_mode="gpu_direct",
-            receiver_urls=[f"http://{self.args.rollout_host}:{self.args.rollout_port}"],
-            world_size=self.args.num_trainer_workers,
-            master_addr=self.args.trainer_host,
-            master_port=self.args.trainer_pg_port,
-        )
-        self.adapter.send()
+        self.adapter.connect()
+        self.adapter.send_weights()
 
 
 class TrainerEngine:
