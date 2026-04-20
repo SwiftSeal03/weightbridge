@@ -117,12 +117,11 @@ class RolloutWorker:
         self.adapter.apply_recv_buffer(self.receiver.recv_buffer, self.recv_state_dict)
 
     def verify(self) -> dict:
-        if all(
-            torch.allclose(exp, got, rtol=1e-5, atol=1e-6)
-            for exp, got in zip(self.state_dict.values(), self.recv_state_dict.values(), strict=True)
-        ):
-            return {"rank": self.rank, "ok": True, "detail": "all tensors match"}
-        return {"rank": self.rank, "ok": False, "detail": "some tensors do not match"}
+        for name, t in self.recv_state_dict.items():
+            if not torch.allclose(t, self.state_dict[name]):
+                print(f"value mismatch for {name} on rank {self.rank}, expected: {self.state_dict[name]}, got: {t}")
+                return {"rank": self.rank, "name": name, "ok": False, "detail": "value mismatch"}
+        return {"rank": self.rank, "ok": True, "detail": "all values match"}
 
 
 @ray.remote(num_cpus=1)
