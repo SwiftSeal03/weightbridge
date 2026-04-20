@@ -137,7 +137,7 @@ class ExampleSenderAdapter(_ExampleAdapterBase):
             name: torch.empty(
                 shards_numel(self.src_shard_spec[name]),
                 dtype=self.dtype_spec[name],
-                device=self.wksd[name].device,
+                device=self._sender.device
             )
             for name, _ in self.src_shard_spec
         }
