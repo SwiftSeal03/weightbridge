@@ -10,6 +10,7 @@ Wire :class:`~wbridge.ShardSpec` layouts (per-rank HF boxes) are built here from
 
 from __future__ import annotations
 
+import os
 import threading
 import time
 from collections.abc import Callable
@@ -36,6 +37,13 @@ from qwen_tiny import (
 from utils import make_hf_iter_factory
 
 CheckpointBuilder = Callable[[], dict[str, torch.Tensor]]
+
+
+def _apply_network_interface_for_process_group(iface: str) -> None:
+    if not iface:
+        return
+    os.environ.setdefault("NCCL_SOCKET_IFNAME", iface)
+    os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
 
 
 def _shard_col_major(rows: int, cols: int, tp_rank: int, tp_size: int) -> list[tuple[int, int, int]]:
@@ -106,6 +114,7 @@ class EngineArgs:
     dtype: torch.dtype = torch.float32
 
     rollout_controller_ipc_name: str = ""
+    network_interface: str = "eno1"
 
 
 @ray.remote(num_gpus=1, num_cpus=1)
@@ -113,6 +122,7 @@ class RolloutWorker:
     """One per receiver GPU. Receives weights via NCCL and optionally verifies."""
 
     def init(self, rank: int, args: EngineArgs):
+        _apply_network_interface_for_process_group(args.network_interface)
         self.rank = rank
         self.args = args
         cfg = args.model_config
@@ -206,6 +216,7 @@ class TrainerWorker:
     """One per sender GPU. Sends shards via :class:`~adapters.ExampleSenderAdapter`."""
 
     def init(self, rank: int, args: EngineArgs):
+        _apply_network_interface_for_process_group(args.network_interface)
         self.args = args
         self.rank = rank
         cfg = args.model_config
