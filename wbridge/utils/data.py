@@ -214,10 +214,6 @@ class BoundShardSpec:
                         f"Tensor dtype mismatch for {name}: {b_tensor.dtype} vs {s_tensor.dtype}"
                     alignment = _check_shard_compatibility(b_shard, s_shard)
                     
-                    if name == "model.embed_tokens.weight":
-                        print("s_tensor: ", s_tensor[:, :1].view(-1))
-                        print("b_tensor: ", b_tensor[:, :1].view(-1))
-                    
                     if not alignment or not all(
                         bl <= sl and sr <= br
                         for bl, br, sl, sr, _ in alignment

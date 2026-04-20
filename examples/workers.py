@@ -119,8 +119,8 @@ class RolloutWorker:
     def verify(self) -> dict:
         for name, t in self.recv_state_dict.items():
             if not torch.allclose(t, self.state_dict[name]):
-                print(f"value mismatch for {name} on rank {self.rank}, expected: {self.state_dict[name]}, got: {t}")
-                return {"rank": self.rank, "name": name, "ok": False, "detail": "value mismatch"}
+                return {"rank": self.rank, "name": name, "ok": False, "detail": f"value mismatch for {name} on rank {self.rank}, \
+                    expected: {self.state_dict[name][:, :1].view(-1)}, got: {t[:, :1].view(-1)}"}
         return {"rank": self.rank, "ok": True, "detail": "all values match"}
 
 
