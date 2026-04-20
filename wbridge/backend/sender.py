@@ -87,7 +87,6 @@ class WeightSender:
                 base_rank += num_workers
 
         self.group = init_custom_process_group(**pg_init_args)
-        print(f"group initialized for rank {self.rank}")
 
         all_specs = [None] * total_world_size
         dist.all_gather_object(all_specs, self.shard_spec, group=self.group)
