@@ -198,7 +198,7 @@ class WeightReceiver:
         # TODO: use pinned memory for CPU recv_buffer
         self.recv_buffer = {
             name: torch.empty(shards_numel(self.shard_spec[name]), dtype=self.dtype_spec[name], device=self.device)
-            for name in self.shard_spec
+            for name, _ in self.shard_spec
         }
         chunks = {
             sender_rank: torch.zeros(overlap.nbytes(self.recv_buffer), dtype=torch.uint8, device=self.device)

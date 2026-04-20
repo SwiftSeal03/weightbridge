@@ -142,7 +142,7 @@ class ExampleSenderAdapter(_ExampleAdapterBase):
                 dtype=self.dtype_spec[name],
                 device=self.wksd[name].device,
             )
-            for name in self.src_shard_spec
+            for name, _ in self.src_shard_spec
         }
         self.load_spec.copy_fromto_sharded(self.src_shard_spec, buf, self.wksd, src_to_dst=False)
         self._sender.send(buf)

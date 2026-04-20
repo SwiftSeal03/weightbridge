@@ -249,7 +249,7 @@ class WBMegatronAdapter:
     def send_weights(self) -> None:
         self.sender_buffer = {
             name: torch.empty(shards_numel(self.shard_spec[name]), dtype=self.dtype_spec[name], device="cuda")
-            for name in self.shard_spec
+            for name, _ in self.shard_spec
         }
         self.load_spec.copy_fromto_sharded(self.shard_spec, self.sender_buffer, self.wksd, src_to_dst=False)
         self.sender.send(self.sender_buffer)
