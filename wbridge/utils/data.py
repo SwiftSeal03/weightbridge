@@ -120,11 +120,11 @@ class ShardSpec:
     def nbytes(self, tensors: dict[str, torch.Tensor]) -> int:
         return sum(shards_numel(shards) * tensors[name].element_size() for name, shards in self)
     
-    def iter_with_intv(self, tensors: dict[str, torch.Tensor]) -> Iterator[tuple[int, int, str]]:
+    def iter_with_intv(self, tensors: dict[str, torch.Tensor]) -> Iterator[tuple[int, int, str, torch.dtype]]:
         offset = 0
         for name, shards in self:
             length = shards_numel(shards) * tensors[name].element_size()
-            yield offset, offset + length, name
+            yield offset, offset + length, name, tensors[name].dtype
             offset += length
         
     @staticmethod
@@ -186,7 +186,7 @@ class BoundShardSpec:
             assert tensor.dim() == 1, f"Tensor {name} must be 1D"
             assert shards_numel(shards) == tensor.numel(), \
                 f"spec and tensor numel mismatch for {name}, {shards_numel(shards)} vs {tensor.numel()}"
-            self._tensors[name] = tensor.flatten().view(torch.uint8)
+            self._tensors[name] = tensor.flatten()
             assert tensor.device == self.device, f"Tensor {name} is not on the same device as other tensors"
             
         # Drop tensors not listed in shard_spec
@@ -206,16 +206,17 @@ class BoundShardSpec:
         "small" should represent a subset of the data in "large".
         """        
         for name, _ in small._shard_spec:
-            s_tensor = small._tensors[name]
             assert name in large._shard_spec, f"Missing tensor {name} for large entry"
-            b_tensor = large._tensors[name]
-            
-            assert b_tensor.dtype == s_tensor.dtype, \
-                f"Tensor dtype mismatch for {name}: {b_tensor.dtype} vs {s_tensor.dtype}"
             
             for s_shard, s_tensor in shards_iterator(small._shard_spec[name], small._tensors[name]):
                 for b_shard, b_tensor in shards_iterator(large._shard_spec[name], large._tensors[name]):
+                    assert b_tensor.dtype == s_tensor.dtype, \
+                        f"Tensor dtype mismatch for {name}: {b_tensor.dtype} vs {s_tensor.dtype}"
                     alignment = _check_shard_compatibility(b_shard, s_shard)
+                    
+                    if name == "model.embed_tokens.weight":
+                        print("s_tensor: ", s_tensor[:, :1].view(-1))
+                        print("b_tensor: ", b_tensor[:, :1].view(-1))
                     
                     if not alignment or not all(
                         bl <= sl and sr <= br
@@ -240,8 +241,8 @@ class BoundShardSpec:
         for rank, dst_spec in dst_specs.items():
             dst_tensor = torch.empty(dst_spec.nbytes(self._tensors), dtype=torch.uint8, device=self.device)
             state_dict = {
-                name: dst_tensor[start:end]
-                for start, end, name in dst_spec.iter_with_intv(self._tensors)
+                name: dst_tensor[start:end].view(dtype)
+                for start, end, name, dtype in dst_spec.iter_with_intv(self._tensors)
             }
             BoundShardSpec.slice_copy(self, dst_spec(state_dict), big2small=True)
             dst_tensors[rank] = dst_tensor
@@ -255,8 +256,8 @@ class BoundShardSpec:
         for rank, src_spec in src_specs.items():
             src_tensor = src_tensors[rank]
             state_dict = {
-                name: src_tensor[start:end]
-                for start, end, name in src_spec.iter_with_intv(self._tensors)
+                name: src_tensor[start:end].view(dtype)
+                for start, end, name, dtype in src_spec.iter_with_intv(self._tensors)
             }
             BoundShardSpec.slice_copy(self, src_spec(state_dict), big2small=False)
 
