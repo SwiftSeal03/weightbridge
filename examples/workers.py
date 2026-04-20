@@ -4,8 +4,8 @@ Configuration is passed as a single :class:`EngineArgs` instance. HF weights are
 ``EngineArgs``; each worker calls ``build_checkpoint()`` locally so checkpoints are identical across
 nodes without shipping CPU tensors through Ray. Trainer (**actor**) workers use a TP shard of HF
 names in ``wksd``; **rollout** workers use merged names (``qkv_proj``, ``gate_up_proj``, …).
-Wire :class:`~wbridge.ShardSpec` layouts (per-rank HF boxes) are built here from
-:class:`~qwen_tiny.QwenTinyConfig`.
+HF shard layout on the wire is defined by :meth:`~wbridge.utils.data.LoadSpec.src_spec` after
+LoadSpec inference in :mod:`adapters`.
 """
 
 from __future__ import annotations
@@ -22,7 +22,7 @@ import uvicorn
 from fastapi import FastAPI
 from ray.util.scheduling_strategies import NodeAffinitySchedulingStrategy
 
-from wbridge import ShardSpec, WeightReceiverController
+from wbridge import WeightReceiverController
 
 from adapters import ExampleReceiverAdapter, ExampleSenderAdapter
 from qwen_tiny import (
@@ -44,54 +44,6 @@ def _apply_network_interface_for_process_group(iface: str) -> None:
         return
     os.environ.setdefault("NCCL_SOCKET_IFNAME", iface)
     os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
-
-
-def _shard_col_major(rows: int, cols: int, tp_rank: int, tp_size: int) -> list[tuple[int, int, int]]:
-    part = rows // tp_size
-    lo = tp_rank * part
-    hi = lo + part
-    return [(lo, hi, rows), (0, cols, cols)]
-
-
-def _shard_row_major(rows: int, cols: int, tp_rank: int, tp_size: int) -> list[tuple[int, int, int]]:
-    part = cols // tp_size
-    lo = tp_rank * part
-    hi = lo + part
-    return [(0, rows, rows), (lo, hi, cols)]
-
-
-def _shard_1d(n: int) -> list[tuple[int, int, int]]:
-    return [(0, n, n)]
-
-
-def _shard_embed_rows(cfg: QwenTinyConfig, rank: int, world: int) -> list[tuple[int, int, int]]:
-    part = cfg.vocab_size // world
-    lo = rank * part
-    hi = lo + part
-    return [(lo, hi, cfg.vocab_size), (0, cfg.hidden_size, cfg.hidden_size)]
-
-
-def actor_wire_shard_spec(cfg: QwenTinyConfig, tp_rank: int, tp_size: int) -> ShardSpec:
-    """HF regions this actor rank sends (split Q/K/V on the wire; packing is in ``actor_load_weights``)."""
-    h, qo, kvo, iq = cfg.hidden_size, cfg.q_out, cfg.kv_out, cfg.intermediate_size
-    entries = {
-        "model.embed_tokens.weight": _shard_embed_rows(cfg, tp_rank, tp_size),
-        "self_attn.q_proj.weight": _shard_col_major(qo, h, tp_rank, tp_size),
-        "self_attn.k_proj.weight": _shard_col_major(kvo, h, tp_rank, tp_size),
-        "self_attn.v_proj.weight": _shard_col_major(kvo, h, tp_rank, tp_size),
-        "self_attn.o_proj.weight": _shard_row_major(h, qo, tp_rank, tp_size),
-        "mlp.gate_proj.weight": _shard_col_major(iq, h, tp_rank, tp_size),
-        "mlp.up_proj.weight": _shard_col_major(iq, h, tp_rank, tp_size),
-        "mlp.down_proj.weight": _shard_row_major(h, iq, tp_rank, tp_size),
-        "input_layernorm.weight": _shard_1d(h),
-        "post_attention_layernorm.weight": _shard_1d(h),
-    }
-    return ShardSpec(entries)
-
-
-def rollout_wire_shard_spec(cfg: QwenTinyConfig, rollout_rank: int, rollout_size: int) -> ShardSpec:
-    """HF regions per rollout rank (TP-aligned, same box pattern as :func:`actor_wire_shard_spec`)."""
-    return actor_wire_shard_spec(cfg, rollout_rank, rollout_size)
 
 
 @dataclass
@@ -128,7 +80,6 @@ class RolloutWorker:
         cfg = args.model_config
         hf_cpu = args.build_checkpoint()
         self.hf_iter_factory = make_hf_iter_factory(hf_cpu)
-        self.shard_spec = rollout_wire_shard_spec(cfg, rank, args.num_rollout_workers)
         self.state_dict = build_rollout_wksd(
             cfg,
             device="cuda",
@@ -149,7 +100,6 @@ class RolloutWorker:
             self.hf_iter_factory,
             self.state_dict,
             self.load_weights,
-            self.shard_spec,
             rollout_load_spec_path(args.load_spec_dir, rank),
             rank=rank,
         )
@@ -222,7 +172,6 @@ class TrainerWorker:
         cfg = args.model_config
         hf_cpu = args.build_checkpoint()
         self.hf_iter_factory = make_hf_iter_factory(hf_cpu)
-        self.shard_spec = actor_wire_shard_spec(cfg, rank, args.num_trainer_workers)
         self.state_dict = build_actor_wksd(
             cfg,
             device="cuda",
@@ -243,7 +192,6 @@ class TrainerWorker:
             self.hf_iter_factory,
             self.state_dict,
             self.load_weights,
-            self.shard_spec,
             actor_load_spec_path(args.load_spec_dir, rank),
             rank=rank,
         )

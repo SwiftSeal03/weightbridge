@@ -4,9 +4,9 @@ HF tensor iterator, GPU ``wksd``, and a ``load_weights`` callable (same contract
 ``load_weights`` hooks), then drive :class:`~wbridge.backend.sender.WeightSender` or
 :class:`~wbridge.backend.receiver.WeightReceiver`.
 
-*wire_hf_shard_spec* describes HF tensor regions on the wire per rank (e.g. actor TP shards vs
-rollout slices). *load_weights* maps a full HF dict (from the iterator) into *wksd*; call it to
-populate *wksd* before :meth:`ensure_load_spec` / :func:`~wbridge.utils.specgen.verify_load_spec`.
+*load_weights* maps a full HF dict (from the iterator) into *wksd*; call it to populate *wksd*
+before :meth:`ensure_load_spec` / :func:`~wbridge.utils.specgen.verify_load_spec`. HF shard layout
+on the wire comes from :meth:`~wbridge.utils.data.LoadSpec.src_spec` after inference.
 """
 
 from __future__ import annotations
@@ -45,14 +45,12 @@ class _ExampleAdapterBase:
         hf_iter_factory: WeightsIterFactory,
         wksd: dict[str, torch.Tensor],
         load_weights: LoadWeightsFn,
-        wire_hf_shard_spec: ShardSpec,
         load_spec_path: str | Path,
         rank: int,
     ) -> None:
         self.hf_iter_factory = hf_iter_factory
         self.wksd = wksd
         self.load_weights = load_weights
-        self.wire_hf_shard_spec = wire_hf_shard_spec
         self.load_spec_path = Path(load_spec_path)
         self.rank = rank
         self.load_spec: LoadSpec | None = None
@@ -104,11 +102,10 @@ class ExampleSenderAdapter(_ExampleAdapterBase):
         hf_iter_factory: WeightsIterFactory,
         wksd: dict[str, torch.Tensor],
         load_weights: LoadWeightsFn,
-        wire_hf_shard_spec: ShardSpec,
         load_spec_path: str | Path,
         rank: int,
     ) -> None:
-        super().__init__(hf_iter_factory, wksd, load_weights, wire_hf_shard_spec, load_spec_path, rank)
+        super().__init__(hf_iter_factory, wksd, load_weights, load_spec_path, rank)
         self._sender: WeightSender | None = None
 
     def connect(
@@ -153,18 +150,18 @@ class ExampleReceiverAdapter(_ExampleAdapterBase):
 
     def make_receiver(self, controller_ipc_name: str) -> WeightReceiver:
         self.ensure_load_spec()
-        assert self.dtype_spec is not None
+        assert self.dtype_spec is not None and self.src_shard_spec is not None
         return WeightReceiver(
             controller_ipc_name,
             self.rank,
-            self.wire_hf_shard_spec,
+            self.src_shard_spec,
             self.dtype_spec,
         )
 
     def apply_recv_buffer(self, recv_buffer: dict[str, torch.Tensor], target: dict[str, torch.Tensor]) -> None:
-        assert self.load_spec is not None
+        assert self.load_spec is not None and self.src_shard_spec is not None
         self.load_spec.copy_fromto_sharded(
-            self.load_spec.src_spec(),
+            self.src_shard_spec,
             recv_buffer,
             target,
             src_to_dst=True,
