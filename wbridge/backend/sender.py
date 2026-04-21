@@ -7,6 +7,9 @@ import torch.distributed as dist
 from wbridge.utils.data import ShardSpec
 from wbridge.utils.distributed import init_custom_process_group
 
+import logging
+logger = logging.getLogger(__name__)
+
 
 @dataclass
 class SenderArgs:
@@ -37,7 +40,7 @@ class WeightSender:
         self.init_method = f"tcp://{args.master_addr}:{args.master_port}"
 
         if args.transfer_mode == "gpu_direct":
-            self.device = "cuda"
+            self.device = f"cuda:{torch.cuda.current_device()}"
             self.backend = "nccl"
         else:
             self.device = "cpu"
@@ -85,8 +88,12 @@ class WeightSender:
                 resp = requests.post(f"{url}/wbridge/connect", json=connect_args)
                 resp.raise_for_status()
                 base_rank += num_workers
+        
+        logger.error(f"Sender: {self.rank} pg_init_args: {pg_init_args}")
 
         self.group = init_custom_process_group(**pg_init_args)
+        
+        logger.error(f"Sender: {self.rank} group initialized")
 
         all_specs = [None] * total_world_size
         dist.all_gather_object(all_specs, self.shard_spec, group=self.group)

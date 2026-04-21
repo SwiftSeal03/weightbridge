@@ -176,12 +176,12 @@ class ReceiverAdapter(BaseAdapter):
 
         Returns ``True`` if an update was consumed, ``False`` if nothing was ready.
         """
-        if not self.receiver.is_weights_ready:
+        buf = self.receiver.request_update()
+        if buf is None:
             return False
-        self.receiver.request_update()
         self.load_spec.copy_fromto_sharded(
             self.src_shard_spec,
-            self.receiver.recv_buffer,
+            buf,
             self.wksd,
             src_to_dst=True,
         )

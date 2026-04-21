@@ -24,6 +24,7 @@ class WBSGLangAdapter(ReceiverAdapter):
     """Receive weights via :class:`~wbridge.frontend.adapters.ReceiverAdapter` into SGLang's
     ``model.state_dict()``.
     """
+    
 
     def __init__(
         self,

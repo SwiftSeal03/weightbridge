@@ -1,14 +1,17 @@
-import base64
-import io
 import json
 import logging
-import threading
+import pickle
 import tempfile
+from dataclasses import dataclass
 from enum import Enum
-from typing import Any, List
+from multiprocessing.reduction import ForkingPickler
+from typing import Any, List, Optional
 
 import torch
 import torch.distributed as dist
+# Importing ``torch.multiprocessing`` registers tensor reducers on ``ForkingPickler`` so
+# ``ForkingPickler.dumps(cuda_tensor)`` produces a CUDA IPC handle instead of copying data.
+import torch.multiprocessing as mp
 import zmq
 from fastapi import FastAPI, APIRouter
 from fastapi.responses import JSONResponse
@@ -33,51 +36,61 @@ class ReceiverState(str, Enum):
     AWAITING_SCHEDULER_UPDATE = "awaiting_scheduler_update"
 
 
-class WeightReceiver:
-    def __init__(
-        self,
-        controller_ipc_name: str,
-        rank: int,
-        shard_spec: ShardSpec,
-        dtype_spec: dict[str, torch.dtype]
-    ):
-        self.controller_ipc_name = controller_ipc_name
-        self.scheduler_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
-        self.rank = rank
-        self.shard_spec = shard_spec
-        self.dtype_spec = dtype_spec
-        
+@dataclass
+class ReceiverArgs:
+    """Bundle of arguments passed from :class:`WeightReceiver` to its subprocess.
+
+    Grouped as a dataclass so the spawn target signature stays stable and the values cross
+    the ``torch.multiprocessing`` pickle boundary as a single object.
+
+    Attributes:
+        controller_ipc_name: ZMQ IPC endpoint of the controller's ROUTER (DEALER connects here).
+        scheduler_ipc_name: ZMQ IPC endpoint bound by the child's REP socket (parent REQ connects).
+        rank: Receiver rank within the receiver engine.
+        shard_spec: Local destination shard layout for received weights.
+        dtype_spec: Per-HF-name dtypes for the receive buffer.
+        cuda_device: Parent-captured CUDA device index; child calls ``torch.cuda.set_device``
+            on this to match the parent's device. ``None`` when CUDA is unavailable.
+        ready_event: Cross-process :class:`multiprocessing.Event` the child sets once its
+            sockets are wired and it is ready to accept requests.
+    """
+
+    controller_ipc_name: str
+    scheduler_ipc_name: str
+    rank: int
+    shard_spec: ShardSpec
+    dtype_spec: dict[str, torch.dtype]
+    cuda_device: Optional[int]
+    ready_event: Any
+
+
+class WeightReceiverProc:
+    """In-subprocess receiver state machine driven by ZMQ messages.
+
+    Owns the process group, the per-param dtype/shard specs, the receive buffer, and the
+    current :class:`ReceiverState`. :meth:`run` is the subprocess entry point: it wires up
+    the DEALER socket (controller) and REP socket (scheduler), signals readiness via the
+    cross-process ``ready_event``, and loops on a poller dispatching to the ``_handle_*``
+    methods. :class:`WeightReceiver` only spawns this class via ``torch.multiprocessing``.
+    """
+
+    def __init__(self, args: ReceiverArgs):
+        self.controller_ipc_name = args.controller_ipc_name
+        self.scheduler_ipc_name = args.scheduler_ipc_name
+        self.rank = args.rank
+        self.shard_spec = args.shard_spec
+        self.dtype_spec = args.dtype_spec
+        self.cuda_device = args.cuda_device
+        self.ready_event = args.ready_event
+
         self._state = ReceiverState.DISCONNECTED
-        self.ready_event = threading.Event()
-        self.receiver_thread = threading.Thread(
-            target=self._receiver_process_entry
-        )
-        self.receiver_thread.start()
-        
-        self.context = zmq.Context()
-        self.socket = self.context.socket(zmq.REQ)
-        self.socket.connect(self.scheduler_ipc_name)
-        
-        if not self.ready_event.wait(timeout=10):
-            raise TimeoutError("Receiver thread did not become ready in time")
-
-    def stop(self):
-        """Stop the receiver subprocess if ``self.process`` was set (optional hook)."""
-        proc = getattr(self, "process", None)
-        if proc is not None and proc.is_alive():
-            proc.terminate()
-            proc.join()
-
-    @property
-    def is_weights_ready(self) -> bool:
-        """True after the trainer has POSTed ``/wbridge/receive``; then call :meth:`request_update`."""
-        return self._state == ReceiverState.AWAITING_SCHEDULER_UPDATE
-
-    def request_update(self) -> bool:
-        """Scheduler REQ/REP: trigger weight receive when state is AWAITING_SCHEDULER_UPDATE."""
-        self.socket.send_string(UPDATE_REQUEST)
-        return json.loads(self.socket.recv_string())["success"]
-
+        self.group = None
+        self.device: Optional[str] = None
+        self.overlaps: dict = {}
+        self.recv_buffer: dict[str, torch.Tensor] = {}
+        import os
+        pid = os.getpid()
+        print(f"ReceiverProc: {self.rank} pid: {pid}")
 
     def _handle_connect_request(
         self, controller_socket: zmq.Socket, data: dict[str, Any]
@@ -86,33 +99,39 @@ class WeightReceiver:
         Handle connect request from controller. This sets up the process group and the device.
         It also destroys the previous process group if it exists.
         """
+        logger.error(f"Receiver: {self.rank} connect request received")
         if self._state == ReceiverState.AWAITING_SCHEDULER_UPDATE:
             controller_socket.send_string(
                 json.dumps({"status": "error", "detail": "cannot connect while awaiting scheduler update"})
             )
             return
         controller_socket.send_string(json.dumps({"status": "ack"}))
-        if getattr(self, "group", None) is not None:
+        if self.group is not None:
             dist.destroy_process_group(self.group)
-            
+
         # Initialize the process group (pop keys not accepted by init_custom_process_group)
         sender_world_size = int(data.pop("sender_world_size"))
         data["rank"] += self.rank
         is_nccl = data["backend"] == "nccl"
+        logger.error(f"Receiver: {self.rank} data: {data}")
         self.group = init_custom_process_group(**data)
-        self.device = "cuda" if is_nccl else "cpu"
-        
+        self.device = f"cuda:{torch.cuda.current_device()}" if is_nccl else "cpu"
+
+        logger.error(f"Receiver: {self.rank} group initialized on device {self.device}")
+
         all_shard_specs = [None] * data["world_size"]
         dist.all_gather_object(all_shard_specs, self.shard_spec, group=self.group)
         self.overlaps = {
-            rank: overlap for rank, spec in enumerate(all_shard_specs) 
+            rank: overlap for rank, spec in enumerate(all_shard_specs)
             if rank < sender_world_size and (overlap := ShardSpec.compute_overlap(self.shard_spec, spec))
         }
-        
+        print(f"Receiver: {self.rank} overlaps computed")
+
         # Gather dtype specs from all ranks
         all_dtype_specs = [None] * data["world_size"]
         dist.all_gather_object(all_dtype_specs, self.dtype_spec, group=self.group)
-        
+        print(f"Receiver: {self.rank} dtype specs gathered")
+
         # Verify dtype spec consistency
         for dtype_spec in all_dtype_specs:
             if dtype_spec is not None:
@@ -121,9 +140,8 @@ class WeightReceiver:
                         assert self.dtype_spec[name] == dtype, f"Dtype mismatch for {name} on rollout rank {data['rank']}"
                     else:
                         self.dtype_spec[name] = dtype
-            
-        self._state = ReceiverState.CONNECTED
 
+        self._state = ReceiverState.CONNECTED
 
     def _handle_receive_request(self, controller_socket: zmq.Socket) -> None:
         if self._state != ReceiverState.CONNECTED:
@@ -136,27 +154,47 @@ class WeightReceiver:
             self._receive_weights()
         self._state = ReceiverState.AWAITING_SCHEDULER_UPDATE
 
+    def _handle_scheduler_update(self, scheduler_socket: zmq.Socket) -> None:
+        """REP a pickled dict of tensors on success; pickled ``None`` when no pending weights.
 
-    def _handle_scheduler_update(
-        self, scheduler_socket: zmq.Socket, msg: str
-    ) -> None:
+        Uses :class:`ForkingPickler` so CUDA tensors are shared via IPC handles across the
+        subprocess boundary instead of being copied through ZMQ.
+        """
         if self._state != ReceiverState.AWAITING_SCHEDULER_UPDATE:
-            scheduler_socket.send_string(
-                json.dumps({"success": False, "message": "no pending weights"})
-            )
+            scheduler_socket.send(ForkingPickler.dumps(None))
             return
-        if self.device == "cuda":
+        if str(self.device).startswith("cuda"):
             self._receive_weights()
         self._state = ReceiverState.CONNECTED
-        scheduler_socket.send_string(json.dumps({"success": True}))
+        scheduler_socket.send(ForkingPickler.dumps(self.recv_buffer))
 
+    def _receive_weights(self) -> None:
+        """Receive overlap bytes from each sender, unpack into ``recv_buffer`` via :class:`BoundShardSpec`."""
+        # TODO: use pinned memory for CPU recv_buffer
+        self.recv_buffer = {
+            name: torch.empty(shards_numel(self.shard_spec[name]), dtype=self.dtype_spec[name], device=self.device)
+            for name, _ in self.shard_spec
+        }
+        chunks = {
+            sender_rank: torch.zeros(overlap.nbytes(self.recv_buffer), dtype=torch.uint8, device=self.device)
+            for sender_rank, overlap in self.overlaps.items()
+        }
+        ops = [
+            dist.P2POp(dist.irecv, chunk, sender_rank, self.group)
+            for sender_rank, chunk in chunks.items()
+        ]
+        for h in dist.batch_isend_irecv(ops):
+            h.wait()
 
-    def _receiver_process_entry(
-        self
-    ):
-        """Entry point for the WeightReceiver subprocess. Handles both controller (DEALER)
-        and scheduler (REP) requests.
-        """
+        self.shard_spec(self.recv_buffer)[self.overlaps] = chunks
+
+    def run(self) -> None:
+        """Subprocess entry point. Wires sockets, signals ready, and polls forever."""
+        if self.cuda_device is not None:
+            torch.cuda.set_device(self.cuda_device)
+
+        logger.error(f"Receiver: {self.rank} set device to {torch.cuda.current_device()}")
+
         context = zmq.Context()
         poller = zmq.Poller()
 
@@ -170,7 +208,7 @@ class WeightReceiver:
         scheduler_socket = context.socket(zmq.REP)
         scheduler_socket.bind(self.scheduler_ipc_name)
         poller.register(scheduler_socket, zmq.POLLIN)
-        
+
         self.ready_event.set()
 
         while True:
@@ -188,30 +226,83 @@ class WeightReceiver:
             if scheduler_socket in socks:
                 msg = scheduler_socket.recv_string()
                 if msg == UPDATE_REQUEST:
-                    self._handle_scheduler_update(scheduler_socket, msg)
+                    self._handle_scheduler_update(scheduler_socket)
                 else:
                     raise ValueError(f"Unknown message from scheduler: {msg}")
 
 
-    def _receive_weights(self) -> None:
-        """Receive overlap bytes from each sender, unpack into ``gpu_tensors`` via :class:`BoundShardSpec`."""
-        # TODO: use pinned memory for CPU recv_buffer
-        self.recv_buffer = {
-            name: torch.empty(shards_numel(self.shard_spec[name]), dtype=self.dtype_spec[name], device=self.device)
-            for name, _ in self.shard_spec
-        }
-        chunks = {
-            sender_rank: torch.zeros(overlap.nbytes(self.recv_buffer), dtype=torch.uint8, device=self.device)
-            for sender_rank, overlap in self.overlaps.items()
-        }
-        ops = [
-            dist.P2POp(dist.irecv, chunk, sender_rank, self.group)
-            for sender_rank, chunk in chunks.items()
-        ]
-        for h in dist.batch_isend_irecv(ops):
-            h.wait()
-        
-        self.shard_spec(self.recv_buffer)[self.overlaps] = chunks
+def _receiver_proc_entry(args: ReceiverArgs) -> None:
+    """Module-level target for ``torch.multiprocessing`` spawn.
+
+    Kept out of :class:`WeightReceiverProc` so the spawn pickler only has to serialize a
+    plain :class:`ReceiverArgs` dataclass rather than a bound method closing over an
+    un-constructed instance.
+    """
+    WeightReceiverProc(args).run()
+
+
+class WeightReceiver:
+    """Spawns a :class:`WeightReceiverProc` in a ``torch.multiprocessing`` subprocess.
+
+    The child inherits the parent's CUDA device index (captured before ``fork``/``spawn``)
+    via ``torch.cuda.set_device`` in :meth:`WeightReceiverProc.run`. The scheduler-facing
+    API is :meth:`request_update`, which REQ/REPs with the child and returns either a dict
+    of received tensors (CUDA IPC-shared via :class:`ForkingPickler`) or ``None`` when the
+    child is not awaiting an update.
+    """
+
+    # ``spawn`` is required for CUDA safety; ``fork`` after CUDA init is undefined behavior.
+    _mp_context = mp.get_context("spawn")
+
+    def __init__(
+        self,
+        controller_ipc_name: str,
+        rank: int,
+        shard_spec: ShardSpec,
+        dtype_spec: dict[str, torch.dtype],
+    ):
+        scheduler_ipc_name = f"ipc://{tempfile.NamedTemporaryFile(delete=False).name}"
+        ready_event = self._mp_context.Event()
+
+        proc_args = ReceiverArgs(
+            controller_ipc_name=controller_ipc_name,
+            scheduler_ipc_name=scheduler_ipc_name,
+            rank=rank,
+            shard_spec=shard_spec,
+            dtype_spec=dtype_spec,
+            cuda_device=torch.cuda.current_device() if torch.cuda.is_available() else None,
+            ready_event=ready_event
+        )
+        self._process = self._mp_context.Process(
+            target=_receiver_proc_entry,
+            args=(proc_args,),
+            daemon=True,
+        )
+        self._process.start()
+
+        self.context = zmq.Context()
+        self.socket = self.context.socket(zmq.REQ)
+        self.socket.connect(scheduler_ipc_name)
+
+        if not ready_event.wait(timeout=60):
+            raise TimeoutError("Receiver subprocess did not become ready in time")
+
+    def stop(self):
+        """Terminate and join the receiver subprocess."""
+        proc = getattr(self, "_process", None)
+        if proc is not None and proc.is_alive():
+            proc.terminate()
+            proc.join()
+
+    def request_update(self) -> Optional[dict[str, torch.Tensor]]:
+        """Ask the receiver proc for the received weights.
+
+        Returns a ``{name: tensor}`` dict when the proc is in ``AWAITING_SCHEDULER_UPDATE``;
+        returns ``None`` otherwise so callers can poll without a separate ready check.
+        Tensors are reconstructed from CUDA IPC handles produced by :class:`ForkingPickler`.
+        """
+        self.socket.send_string(UPDATE_REQUEST)
+        return pickle.loads(self.socket.recv())
 
 
 class WeightReceiverController:
