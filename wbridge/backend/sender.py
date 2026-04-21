@@ -133,6 +133,7 @@ class WeightSender:
                 dist.P2POp(dist.isend, chunk, receiver_rank, self.group)
                 for receiver_rank, chunk in chunks.items()
             ]
+            dist.barrier(group=self.group)
             if ops:
                 for h in dist.batch_isend_irecv(ops):
                     h.wait()
