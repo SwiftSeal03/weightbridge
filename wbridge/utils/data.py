@@ -117,8 +117,8 @@ class ShardSpec:
         _sanity_check(key, shards)
         self.entries[key] = shards
         
-    def nbytes(self, tensors: dict[str, torch.Tensor]) -> int:
-        return sum(shards_numel(shards) * tensors[name].element_size() for name, shards in self)
+    def nbytes(self, dtype_spec: dict[str, torch.dtype]) -> int:
+        return sum(shards_numel(shards) * dtype_spec[name].itemsize for name, shards in self)
     
     def iter_with_intv(self, tensors: dict[str, torch.Tensor]) -> Iterator[tuple[int, int, str, torch.dtype]]:
         offset = 0

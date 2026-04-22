@@ -50,6 +50,7 @@ class WeightReceiver:
         self.rank = rank
         self.shard_spec = shard_spec
         self.dtype_spec = dtype_spec
+        self.cuda_device = f"cuda:{torch.cuda.current_device()}"
 
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
@@ -155,8 +156,8 @@ class WeightReceiver:
         data["rank"] += self.rank
         
         if data["backend"] == "nccl":
+            self.device = self.cuda_device
             self._pending_connect_data = dict(data)
-            self.device = f"cuda:{torch.cuda.current_device()}"
             self._state = ReceiverState.PENDING_CONNECT
             logger.error(f"Receiver: {self.rank} NCCL connect deferred to main thread (PENDING_CONNECT)")
             return
@@ -185,14 +186,11 @@ class WeightReceiver:
 
     def _receive_weights(self) -> None:
         """Receive overlap bytes from each sender, unpack into ``recv_buffer`` via :class:`BoundShardSpec`."""
-        self.recv_buffer = {
-            name: torch.empty(shards_numel(self.shard_spec[name]), dtype=self.dtype_spec[name], device=self.device)
-            for name, _ in self.shard_spec
-        }
         chunks = {
-            sender_rank: torch.zeros(overlap.nbytes(self.recv_buffer), dtype=torch.uint8, device=self.device)
+            sender_rank: torch.zeros(overlap.nbytes(self.dtype_spec), dtype=torch.uint8, device=self.device)
             for sender_rank, overlap in self.overlaps.items()
         }
+        logger.error(f"Receiver: {self.rank} chunks: {[(rank, chunk.size()) for rank, chunk in chunks.items()]}")
         ops = [
             dist.P2POp(dist.irecv, chunk, sender_rank, self.group)
             for sender_rank, chunk in chunks.items()
@@ -200,7 +198,11 @@ class WeightReceiver:
         dist.barrier(group=self.group)
         for h in dist.batch_isend_irecv(ops):
             h.wait()
-
+            
+        self.recv_buffer = {
+            name: torch.empty(shards_numel(self.shard_spec[name]), dtype=self.dtype_spec[name], device=self.device)
+            for name, _ in self.shard_spec
+        }
         self.shard_spec(self.recv_buffer)[self.overlaps] = chunks
 
 
