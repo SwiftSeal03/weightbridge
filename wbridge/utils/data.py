@@ -146,8 +146,8 @@ class ShardSpec:
             for name, shards in self
         }
         
-    def make_byte_chunk(self, dtype_spec: dict[str, torch.dtype], device: str) -> dict[int, torch.Tensor]:
-        """Make a byte chunk for the shard spec."""
+    def make_byte_chunk(self, dtype_spec: dict[str, torch.dtype], device: str) -> torch.Tensor:
+        """Return a uint8 P2P buffer covering this spec (all tensor names, layout order in :meth:`iter_with_intv`)."""
         return torch.zeros(self.nbytes(dtype_spec), dtype=torch.uint8, device=device)
         
     @staticmethod
@@ -255,8 +255,10 @@ class BoundShardSpec:
 
     def __getitem__(
         self, dst_specs: dict[int, ShardSpec]
-    ) -> dict[int, torch.Tensor]:        
-        dst_tensors = {rank: dst_spec.make_byte_chunk(self._tensors, self.device) for rank, dst_spec in dst_specs.items()}
+    ) -> dict[int, torch.Tensor]:
+        # Wire layout uses dtypes from the *full* bound tensors (per-name), not the tensor objects themselves.
+        dtype_by_name = {n: t.dtype for n, t in self._tensors.items()}
+        dst_tensors = {rank: dst_spec.make_byte_chunk(dtype_by_name, self.device) for rank, dst_spec in dst_specs.items()}
         for rank, dst_spec in dst_specs.items():
             dst_tensor = dst_tensors[rank]
             state_dict = {
@@ -382,7 +384,7 @@ def _try_merge_two_shards(a: Shard, b: Shard) -> Shard | None:
     return out
 
 
-def _merge_shards_for_src_spec(shards: Shards) -> Shards:
+def _merge_shards_for_src_shard_spec(shards: Shards) -> Shards:
     """Collapse duplicate / contained shards and merge axis-aligned neighbors that differ on one axis only."""
     keep = [True] * len(shards)
     i = 0
@@ -445,7 +447,13 @@ class LoadSpec:
     def __len__(self) -> int:
         return len(self.entries)
 
-    def src_spec(self) -> ShardSpec:
+    @property
+    def src_shard_spec(self) -> ShardSpec:
+        if not hasattr(self, "_src_shard_spec_cache"):
+            self._src_spec = self._compute_src_shard_spec()
+        return self._src_spec
+    
+    def _compute_src_shard_spec(self) -> ShardSpec:
         def _unique_shards_for_src(entry: dict[str, list[ShardMapping]]) -> Shards:
             seen: set[tuple[tuple[int, int, int], ...]] = set()
             out: Shards = []
@@ -455,7 +463,7 @@ class LoadSpec:
                     if key not in seen:
                         seen.add(key)
                         out.append(list(s_shard))
-            return _merge_shards_for_src_spec(out)
+            return _merge_shards_for_src_shard_spec(out)
 
         return ShardSpec({src_name: _unique_shards_for_src(entry) for src_name, entry in self.entries.items()})
 
@@ -497,11 +505,11 @@ class LoadSpec:
                     
     def copy_fromto_params(
         self,
-        shard_spec: ShardSpec,
-        src_tensors: dict[str, torch.Tensor], # Flattened and concatenated source tensors
-        dst_tensors: dict[str, torch.Tensor], # Destination tensors
+        src_shard_spec: ShardSpec,
+        src_tensors: dict[str, torch.Tensor],  # 1D comm buffers associated with src_shard_spec
+        dst_tensors: dict[str, torch.Tensor],  # parameter tensors (2D+)
         *,
-        src_to_dst: bool
+        src_to_dst: bool,
     ) -> None:
         """
         Copy data between communication buffer and parameter tensors for compute.
@@ -511,11 +519,11 @@ class LoadSpec:
         NOTE: Only mapping whose source fully contained in shard_spec are copied. Partial overlaps are not supported.
         """
         for sname, dname, s_shard, d_shard in self:
-            if sname not in shard_spec:
+            if sname not in src_shard_spec:
                 continue
             assert dname in dst_tensors, f"Missing tensor {dname} for load"
             dst_tensor = dst_tensors[dname]
-            for shard, src_tensor in shards_iterator(shard_spec[sname], src_tensors[sname]):
+            for shard, src_tensor in shards_iterator(src_shard_spec[sname], src_tensors[sname]):
                 if _shard_contained_in(s_shard, shard):
                     src_slices = tuple(slice(l - l0, r - l0) for (l, r, _), (l0, _, _) in zip(s_shard, shard))
                     dst_slices = tuple(slice(l, r) for l, r, _ in d_shard)
@@ -523,4 +531,3 @@ class LoadSpec:
                         dst_tensor[dst_slices].copy_(src_tensor[src_slices])
                     else:
                         src_tensor[src_slices].copy_(dst_tensor[dst_slices])
-                    break

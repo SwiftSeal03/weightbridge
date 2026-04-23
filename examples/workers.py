@@ -4,7 +4,7 @@ Configuration is passed as a single :class:`EngineArgs` instance. HF weights are
 ``EngineArgs``; each worker calls ``build_checkpoint()`` locally so checkpoints are identical across
 nodes without shipping CPU tensors through Ray. Trainer (**actor**) workers use a TP shard of HF
 names in ``wksd``; **rollout** workers use merged names (``qkv_proj``, ``gate_up_proj``, ...).
-HF shard layout on the wire is defined by :meth:`~wbridge.utils.data.LoadSpec.src_spec` after
+HF shard layout on the wire is defined by :attr:`~wbridge.utils.data.LoadSpec.src_shard_spec` after
 LoadSpec inference inside :class:`~wbridge.frontend.adapters.SenderAdapter` /
 :class:`~wbridge.frontend.adapters.ReceiverAdapter`.
 """

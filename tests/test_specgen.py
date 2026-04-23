@@ -131,7 +131,7 @@ def test_infer_shard_spec_complex_lw(device: torch.device) -> None:
     )
 
     load_spec = infer_load_spec(hfsd.items(), wksd, lw)
-    spec = load_spec.src_spec()
+    spec = load_spec.src_shard_spec
 
     assert "pp_skip.model.layers.0.mlp.fc.weight" not in spec.entries
 
@@ -181,8 +181,8 @@ def test_infer_load_spec_batched_merge_matches_single(device: torch.device) -> N
     cap = 2 * hfsd_named["a.weight"].numel() * hfsd_named["a.weight"].element_size()
     assert cap < DEFAULT_MAX_HF_BYTES
 
-    full = infer_load_spec(hfsd_named.items(), wksd, lw, max_hf_bytes=DEFAULT_MAX_HF_BYTES).src_spec()
-    batched = infer_load_spec(hfsd_named.items(), wksd, lw, max_hf_bytes=cap).src_spec()
+    full = infer_load_spec(hfsd_named.items(), wksd, lw, max_hf_bytes=DEFAULT_MAX_HF_BYTES).src_shard_spec
+    batched = infer_load_spec(hfsd_named.items(), wksd, lw, max_hf_bytes=cap).src_shard_spec
 
     assert set(full.entries.keys()) == set(batched.entries.keys())
     for name in full.entries:
@@ -210,7 +210,7 @@ def test_infer_load_spec_hf_worker_dtype_mismatch(device: torch.device) -> None:
                 wksd["layers.0.mlp.gate.e_score_correction_bias"].copy_(t)
 
     load_spec = infer_load_spec(hfsd.items(), wksd, lw)
-    spec = load_spec.src_spec()
+    spec = load_spec.src_shard_spec
     name = "model.layers.0.mlp.gate.e_score_correction_bias"
     assert spec[name] == [[(0, 8, 8)]]
 
@@ -245,7 +245,7 @@ def test_infer_load_spec_bfloat16(device: torch.device) -> None:
                     t[:, tp_rank_o * half_w : (tp_rank_o + 1) * half_w]
                 )
 
-    spec_o = infer_load_spec(hfsd_o.items(), wksd_o, lw_o).src_spec()
+    spec_o = infer_load_spec(hfsd_o.items(), wksd_o, lw_o).src_shard_spec
     assert spec_o["model.layers.0.self_attn.o_proj.weight"] == [
         [(0, H, H), (tp_rank_o * half_w, (tp_rank_o + 1) * half_w, H)]
     ]
@@ -268,7 +268,7 @@ def test_infer_load_spec_bfloat16(device: torch.device) -> None:
                     t[:, tp_rank_e * half_c : (tp_rank_e + 1) * half_c]
                 )
 
-    spec_e = infer_load_spec(hfsd_e.items(), wksd_e, lw_e).src_spec()
+    spec_e = infer_load_spec(hfsd_e.items(), wksd_e, lw_e).src_shard_spec
     assert spec_e["model.embed_tokens.weight"] == [
         [(0, rows, rows), (tp_rank_e * half_c, (tp_rank_e + 1) * half_c, cols)]
     ]
@@ -294,12 +294,12 @@ def test_verify_load_spec_1to1(device: torch.device) -> None:
 
     lw(hfsd.items())
     load_spec = infer_load_spec(hfsd.items(), wksd, lw)
-    spec = load_spec.src_spec()
+    spec = load_spec.src_shard_spec
     verify_load_spec(hfsd_verify.items(), wksd, load_spec)
 
 
-def test_load_spec_src_spec_multi_mapping_merge_and_split() -> None:
-    """Multiple :class:`ShardMapping` for one (src, dst) pair; :meth:`LoadSpec.src_spec` lists source shards.
+def test_load_spec_src_shard_spec_multi_mapping_merge_and_split() -> None:
+    """Multiple :class:`ShardMapping` for one (src, dst) pair; :attr:`LoadSpec.src_shard_spec` lists source shards.
 
     Cases 1–4 use **2D** tensors (axis-aligned boxes). Cases 5–6 are separate **1D** tensors with scattered
     index ranges.
@@ -315,7 +315,7 @@ def test_load_spec_src_spec_multi_mapping_merge_and_split() -> None:
             ]
         }
     }
-    spec_split = LoadSpec(split_entries).src_spec()
+    spec_split = LoadSpec(split_entries).src_shard_spec
     assert sorted(spec_split["hf_split"], key=lambda s: (s[1][0], s[1][1])) == [
         [(0, H, H), (0, 4, C)],
         [(0, H, H), (8, 12, C)],
@@ -330,7 +330,7 @@ def test_load_spec_src_spec_multi_mapping_merge_and_split() -> None:
             ]
         }
     }
-    spec_gap = LoadSpec(gap_entries).src_spec()
+    spec_gap = LoadSpec(gap_entries).src_shard_spec
     assert sorted(spec_gap["hf_gap"], key=lambda s: (s[1][0], s[1][1])) == [
         [(0, H, H), (0, 3, C)],
         [(0, H, H), (10, 14, C)],
@@ -346,7 +346,7 @@ def test_load_spec_src_spec_multi_mapping_merge_and_split() -> None:
             ]
         }
     }
-    spec_scatter = LoadSpec(scattered_entries).src_spec()
+    spec_scatter = LoadSpec(scattered_entries).src_shard_spec
     assert sorted(spec_scatter["hf_scatter"], key=lambda s: s[1][0]) == [
         [(0, H, H), (0, 2, C)],
         [(0, H, H), (5, 7, C)],
@@ -362,7 +362,7 @@ def test_load_spec_src_spec_multi_mapping_merge_and_split() -> None:
             ]
         }
     }
-    spec_disjoint = LoadSpec(disjoint_entries).src_spec()
+    spec_disjoint = LoadSpec(disjoint_entries).src_shard_spec
     assert sorted(spec_disjoint["hf_disjoint"], key=lambda s: (s[0][0], s[1][0])) == [
         [(0, 2, H), (0, 4, C)],
         [(2, H, H), (8, 12, C)],
@@ -379,7 +379,7 @@ def test_load_spec_src_spec_multi_mapping_merge_and_split() -> None:
             ]
         }
     }
-    spec_1d = LoadSpec(random_1d).src_spec()
+    spec_1d = LoadSpec(random_1d).src_shard_spec
     assert sorted(spec_1d["hf_rand1d"], key=lambda s: s[0][0]) == [
         [(1, 3, W1)],
         [(11, 15, W1)],
@@ -397,7 +397,7 @@ def test_load_spec_src_spec_multi_mapping_merge_and_split() -> None:
             ]
         }
     }
-    spec_1d_b = LoadSpec(random_1d_b).src_spec()
+    spec_1d_b = LoadSpec(random_1d_b).src_shard_spec
     assert sorted(spec_1d_b["hf_rand1d_b"], key=lambda s: s[0][0]) == [
         [(0, 5, W2)],
         [(7, 11, W2)],

@@ -115,7 +115,7 @@ class BaseAdapter:
             self._persist_load_spec()
 
         self.dtype_spec = _dtype_spec_from_load_spec(self.load_spec, ctx.wksd)
-        self.src_shard_spec = self.load_spec.src_spec()
+        self.src_shard_spec = self.load_spec.src_shard_spec
 
     def _persist_load_spec(self) -> None:
         self.load_spec_path.parent.mkdir(parents=True, exist_ok=True)
