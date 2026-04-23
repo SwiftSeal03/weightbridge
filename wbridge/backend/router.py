@@ -39,7 +39,7 @@ class WeightRouter:
         self.global_rounds = self.compute_global_rounds()
         self.local_rounds = self.compute_local_rounds()
         
-    def compute_global_rounds(self) -> list[dict[tuple[int, int], ShardSpec]]:
+    def compute_global_rounds(self) -> list[set[str]]:
         """Schedule rounds in **name-priority** order (sorted tensor names, then sorted pairs per name).
 
         Each round: walk ``sorted(dtype_spec)`` (tensor names); for each name with remaining work, walk
@@ -110,6 +110,9 @@ class WeightRouter:
                 for si in range(self.sender_ws)
             }
         for round_plan in self.global_rounds:
+            round_plan &= full_spec.entries.keys()
+            print(f"Round plan: {round_plan}")
+            print(f"Overlaps: {[(rank, overlap.entries.keys()) for rank, overlap in overlaps.items()]}")
             round_overlaps = {
                 rank: overlap.subset(round_plan)
                 for rank, overlap in overlaps.items()
