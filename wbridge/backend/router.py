@@ -110,12 +110,9 @@ class WeightRouter:
                 for si in range(self.sender_ws)
             }
         for round_plan in self.global_rounds:
-            round_plan &= full_spec.entries.keys()
-            print(f"Round plan: {round_plan}")
-            print(f"Overlaps: {[(rank, overlap.entries.keys()) for rank, overlap in overlaps.items()]}")
             round_overlaps = {
-                rank: overlap.subset(round_plan)
-                for rank, overlap in overlaps.items()
+                rank: sub_overlap
+                for rank, overlap in overlaps.items() if (sub_overlap := overlap.subset(round_plan))
             }
             out.append((full_spec.subset(round_plan), round_overlaps))
         return out

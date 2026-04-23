@@ -136,7 +136,7 @@ class ShardSpec:
         return ShardSpec(copy.deepcopy(self.entries))
     
     def subset(self, names: set[str]) -> "ShardSpec":
-        assert all(name in self for name in names), "All names must be in the shard spec"
+        names &= self.entries.keys()
         return ShardSpec({name: self[name] for name in names})
     
     def make_named_buffer(self, dtype_spec: dict[str, torch.dtype], device: str) -> dict[str, torch.Tensor]:
