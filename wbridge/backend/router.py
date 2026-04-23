@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import field
 
 import torch
 import torch.distributed as dist
@@ -34,7 +35,7 @@ class WeightRouter:
         assert all(isinstance(spec, ShardSpec) for spec in all_specs), "all_specs must be a list of ShardSpec"
         self.send_specs = all_specs[:sender_ws]
         self.recv_specs = all_specs[sender_ws:]
-        self.dtype_spec = sorted(dtype_spec)
+        self.dtype_spec = dtype_spec
         self.global_rounds = self.compute_global_rounds()
         self.local_rounds = self.compute_local_rounds()
         
@@ -60,17 +61,11 @@ class WeightRouter:
             recv_caps = [RECEIVER_ROUND_CAP_BYTES] * self.receiver_ws
             round_plan: set[str] = set()
             
-            for name in remaining_names:
+            for name in sorted(remaining_names):
                 dtype = self.dtype_spec[name]
-                if any(
-                    send_caps[si] < shards_nbytes(self.send_specs[si][name], dtype)
-                    for si in range(self.sender_ws)
-                ) or any(
-                    recv_caps[ri] < shards_nbytes(self.recv_specs[ri][name], dtype)
-                    for ri in range(self.receiver_ws)
-                ):
-                    continue
-            
+                send_caps_old = send_caps.copy()
+                recv_caps_old = recv_caps.copy()
+                
                 for (si, ri), overlap in all_overlaps.items():
                     if name not in overlap:
                         continue
@@ -78,14 +73,19 @@ class WeightRouter:
                     nbytes = shards_nbytes(shards, dtype)
                     send_caps[si] -= nbytes
                     recv_caps[ri] -= nbytes
-                    
+                
+                if any(c < 0 for c in send_caps + recv_caps):
+                    send_caps = send_caps_old
+                    recv_caps = recv_caps_old
+                    continue
+                
                 round_plan.add(name)
             
-            remaining_names -= round_plan
             if not round_plan:
                 raise RuntimeError(
                     "routing deadlock: no tensor fits per-round caps (try smaller per-tensor overlap or raise caps)"
                 )
+            remaining_names -= round_plan
             rounds.append(round_plan)
 
         return rounds

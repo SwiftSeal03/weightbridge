@@ -50,6 +50,7 @@ class WeightSender(WBEndpoint):
         
         self.rank = rank
         self.shard_spec = shard_spec
+        self.dtype_spec = {}
         self.save_weights = save_weights
 
         if args.transfer_mode == "gpu_direct":
@@ -83,6 +84,7 @@ class WeightSender(WBEndpoint):
             "world_size": total_world_size,
             "rank": self.rank,
             "group_name": "wbridge",
+            "sender_world_size": self.world_size,
         }
 
         if self.rank == 0:
@@ -91,7 +93,6 @@ class WeightSender(WBEndpoint):
                 connect_args = {
                     **pg_init_args,
                     "rank": base_rank,
-                    "sender_world_size": self.world_size,
                 }
                 resp = requests.post(f"{url}/wbridge/connect", json=connect_args)
                 resp.raise_for_status()
