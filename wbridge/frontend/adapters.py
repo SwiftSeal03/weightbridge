@@ -7,8 +7,8 @@ through a framework ``load_weights`` callable into a GPU ``wksd`` (weight state 
 forward it to :class:`BaseAdapter`.
 
 :class:`SenderAdapter` wraps a :class:`~wbridge.backend.sender.WeightSender`; :class:`ReceiverAdapter`
-wraps a :class:`~wbridge.backend.receiver.WeightReceiver` and copies received buffers back into
-``wksd`` in :meth:`ReceiverAdapter.try_receive_weights`.
+wraps a :class:`~wbridge.backend.receiver.WeightReceiver` and applies each round's partial buffer into
+``wksd`` through the receiver's ``load_weights`` callback when the scheduler calls :meth:`ReceiverAdapter.request_update`.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ import torch
 
 from wbridge.backend.receiver import WeightReceiver
 from wbridge.backend.sender import SenderArgs, WeightSender
-from wbridge.utils.data import LoadSpec, ShardSpec, shards_numel
+from wbridge.utils.data import LoadSpec, ShardSpec
 from wbridge.utils.specgen import infer_load_spec, verify_load_spec
 
 logger = logging.getLogger(__name__)
@@ -136,22 +136,21 @@ class SenderAdapter(BaseAdapter):
 
     def __init__(self, ctx: AdapterContext, args: SenderArgs) -> None:
         super().__init__(ctx)
-        self.sender = WeightSender(ctx.rank, args)
+        self.sender = WeightSender(
+            args,
+            ctx.rank,
+            self.src_shard_spec,
+            self._save_weights
+        )
+
+    def _save_weights(self, sub: ShardSpec, buf: dict[str, torch.Tensor]) -> None:
+        self.load_spec.copy_fromto_params(sub, buf, self.wksd, src_to_dst=False)
 
     def connect(self) -> None:
-        self.sender.connect(self.src_shard_spec)
+        self.sender.connect()
 
     def send_weights(self) -> None:
-        buf = {
-            name: torch.empty(
-                shards_numel(self.src_shard_spec[name]),
-                dtype=self.dtype_spec[name],
-                device=self.sender.device,
-            )
-            for name, _ in self.src_shard_spec
-        }
-        self.load_spec.copy_fromto_sharded(self.src_shard_spec, buf, self.wksd, src_to_dst=False)
-        self.sender.send(buf)
+        self.sender.send()
 
 
 class ReceiverAdapter(BaseAdapter):
@@ -169,20 +168,15 @@ class ReceiverAdapter(BaseAdapter):
             ctx.rank,
             self.src_shard_spec,
             self.dtype_spec,
+            load_weights=self._load_weights,
         )
+        
+    def _load_weights(self, sub: ShardSpec, buf: dict[str, torch.Tensor]) -> None:
+        self.load_spec.copy_fromto_params(sub, buf, self.wksd, src_to_dst=True)
 
-    def try_receive_weights(self) -> bool:
+    def request_update(self) -> bool:
         """Apply a pending weight update into ``ctx.wksd`` if one is ready.
 
         Returns ``True`` if an update was consumed, ``False`` if nothing was ready.
         """
-        buf = self.receiver.request_update()
-        if buf is None:
-            return False
-        self.load_spec.copy_fromto_sharded(
-            self.src_shard_spec,
-            buf,
-            self.wksd,
-            src_to_dst=True,
-        )
-        return True
+        return self.receiver.request_update()

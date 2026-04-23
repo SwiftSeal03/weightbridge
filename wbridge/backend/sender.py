@@ -1,10 +1,12 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 
 import requests
 import torch
 import torch.distributed as dist
 
-from wbridge.utils.data import ShardSpec
+from wbridge.utils.data import ShardSpec, shards_numel
+from wbridge.backend.router import WeightRouter, WBEndpoint
 from wbridge.utils.distributed import init_custom_process_group
 
 import logging
@@ -31,13 +33,24 @@ class SenderArgs:
     master_port: int
 
 
-class WeightSender:
-    def __init__(self, rank: int, args: SenderArgs):
-        self.rank = rank
+class WeightSender(WBEndpoint):
+    """Sends weight rounds to receivers. ``save_weights`` fills each round's buffers (inverse of the receiver's ``load_weights``)."""
+
+    def __init__(
+        self,
+        args: SenderArgs,
+        rank: int,
+        shard_spec: ShardSpec,
+        save_weights: Callable[[ShardSpec, dict[str, torch.Tensor]], None],
+    ) -> None:
         self.transfer_mode = args.transfer_mode
         self.receiver_urls = args.receiver_urls
         self.world_size = args.world_size
         self.init_method = f"tcp://{args.master_addr}:{args.master_port}"
+        
+        self.rank = rank
+        self.shard_spec = shard_spec
+        self.save_weights = save_weights
 
         if args.transfer_mode == "gpu_direct":
             self.device = f"cuda:{torch.cuda.current_device()}"
@@ -47,19 +60,14 @@ class WeightSender:
             self.backend = "gloo"
 
         self.connected = False
-        self.group: dist.ProcessGroup | None = None
-        self.overlaps: dict[int, ShardSpec] = {}
-        self.shard_spec: ShardSpec | None = None
-        self.dtype_spec: dict[str, torch.dtype] | None = None
 
-    def connect(self, shard_spec: ShardSpec) -> None:
+    def connect(self) -> None:
         """Join receivers over NCCL after a short-lived Gloo group for sender coordination.
 
         The Gloo process group uses ``tcp://{master_addr}:{master_port}`` from
         :meth:`__init__` so all sender ranks rendezvous before rank 0 drives
         HTTP receiver_world/connect and broadcasts rendezvous info for the main group.
         """
-        self.shard_spec = shard_spec
         if self.group is not None:
             dist.destroy_process_group(self.group)
 
@@ -89,53 +97,37 @@ class WeightSender:
                 resp.raise_for_status()
                 base_rank += num_workers
         
-        logger.error(f"Sender: {self.rank} pg_init_args: {pg_init_args}")
-
-        self.group = init_custom_process_group(**pg_init_args)
-        
-        logger.error(f"Sender: {self.rank} group initialized")
-
-        all_specs = [None] * total_world_size
-        dist.all_gather_object(all_specs, self.shard_spec, group=self.group)
-        self.overlaps = {
-            rank: overlap
-            for rank, tensor in enumerate(all_specs)
-            if rank >= self.world_size and (overlap := ShardSpec.compute_overlap(self.shard_spec, tensor))
-        }
-
-        all_dtype_specs = [None] * total_world_size
-        dist.all_gather_object(all_dtype_specs, self.dtype_spec, group=self.group)
-
-        if self.dtype_spec is None:
-            self.dtype_spec = {}
-
-        for dtype_spec in all_dtype_specs:
-            if dtype_spec is not None:
-                for name, dtype in dtype_spec.items():
-                    if name in self.dtype_spec:
-                        assert self.dtype_spec[name] == dtype, f"Dtype mismatch for {name} on rollout rank {self.rank}"
-                    else:
-                        self.dtype_spec[name] = dtype
-
+        self.set_up_connection(**pg_init_args)
         self.connected = True
+        
+        
+    def send(self) -> None:
+        """Send weights in router rounds. :attr:`save_weights` fills each round's 1D buffers (per name).
 
-    def send(self, state_dict: dict[str, torch.Tensor]) -> None:
-        if self.transfer_mode == "gpu_direct":
-            if not self.connected or self.shard_spec is None:
-                raise RuntimeError("WeightSender.send requires connect() first")
-            if self.rank == 0:
-                for url in self.receiver_urls:
-                    resp = requests.post(f"{url}/wbridge/receive")
-                    resp.raise_for_status()
+        This mirrors :meth:`WeightReceiver._receive_weights`: the receiver calls :attr:`WeightReceiver.load_weights`
+        after recv+unpack; here we call :attr:`save_weights` to pack the logical buffer from the
+        model, then ``isend`` the wire chunks to each peer.
+        """
+        if not self.connected or self.shard_spec is None or self.router is None or self.group is None:
+            raise RuntimeError("WeightSender.send requires connect() first")
+        if self.rank == 0:
+            for url in self.receiver_urls:
+                resp = requests.post(f"{url}/wbridge/receive")
+                resp.raise_for_status()
 
-            chunks = self.shard_spec(state_dict)[self.overlaps]
-            ops = [
-                dist.P2POp(dist.isend, chunk, receiver_rank, self.group)
-                for receiver_rank, chunk in chunks.items()
-            ]
+        for full_spec, overlap_specs in self.router.local_rounds:
+            if full_spec:
+                buf = full_spec.make_named_buffer(self.dtype_spec, self.device)
+                self.save_weights(full_spec, buf)
+                chunks = full_spec(buf)[overlap_specs]
+
+                ops = [
+                    dist.P2POp(dist.isend, chunk, peer_rank, self.group)
+                    for peer_rank, chunk in chunks.items()
+                ]
             dist.barrier(group=self.group)
-            if ops:
+            if full_spec:
                 for h in dist.batch_isend_irecv(ops):
                     h.wait()
-        else:
-            pass  # TODO: Implement CPU transfer send
+                    
+                del buf

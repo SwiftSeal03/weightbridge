@@ -111,7 +111,7 @@ class RolloutWorker:
 
     def recv_weights(self) -> None:
         for _ in range(500):
-            if self.adapter.try_receive_weights():
+            if self.adapter.request_update():
                 return
             time.sleep(0.05)
         raise TimeoutError("receiver never became ready for weights")

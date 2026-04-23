@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import copy
 import math
 from typing import Iterator, TypeAlias
 import torch
@@ -36,6 +37,10 @@ def shard_numel(shard: Shard) -> int:
 def shards_numel(shards: Shards) -> int:
     return sum(shard_numel(shard) for shard in shards)
         
+        
+def shards_nbytes(shards: Shards, dtype: torch.dtype) -> int:
+    return shards_numel(shards) * dtype.itemsize
+        
 
 def _sanity_check(name: str, shards: Shards) -> None:
     numel = None
@@ -50,7 +55,7 @@ def _sanity_check(name: str, shards: Shards) -> None:
         else:
             assert numel == cur_numel, f"Shard {shard} does not match original total numel: {numel} != {cur_numel}!"
 
-def shards_iterator(shards: Shards, tensor: torch.Tensor) -> Iterator[tuple[int, int, Shard]]:
+def shards_iterator(shards: Shards, tensor: torch.Tensor) -> Iterator[tuple[Shard, torch.Tensor]]:
     """Iterate over shards and yield the corresponding tensor slices."""
     offset = 0
     for shard in shards:
@@ -118,14 +123,32 @@ class ShardSpec:
         self.entries[key] = shards
         
     def nbytes(self, dtype_spec: dict[str, torch.dtype]) -> int:
-        return sum(shards_numel(shards) * dtype_spec[name].itemsize for name, shards in self)
+        return sum(shards_nbytes(shards, dtype_spec[name]) for name, shards in self)
     
     def iter_with_intv(self, tensors: dict[str, torch.Tensor]) -> Iterator[tuple[int, int, str, torch.dtype]]:
         offset = 0
         for name, shards in self:
-            length = shards_numel(shards) * tensors[name].element_size()
+            length = shards_nbytes(shards, tensors[name].dtype)
             yield offset, offset + length, name, tensors[name].dtype
             offset += length
+            
+    def clone(self) -> "ShardSpec":
+        return ShardSpec(copy.deepcopy(self.entries))
+    
+    def subset(self, names: set[str]) -> "ShardSpec":
+        assert all(name in self for name in names), "All names must be in the shard spec"
+        return ShardSpec({name: self[name] for name in names})
+    
+    def make_named_buffer(self, dtype_spec: dict[str, torch.dtype], device: str) -> dict[str, torch.Tensor]:
+        """Make a dictionary of tensors for each name in the shard spec."""
+        return {
+            name: torch.empty(shards_numel(shards), dtype=dtype_spec[name], device=device)
+            for name, shards in self
+        }
+        
+    def make_byte_chunk(self, dtype_spec: dict[str, torch.dtype], device: str) -> dict[int, torch.Tensor]:
+        """Make a byte chunk for the shard spec."""
+        return torch.zeros(self.nbytes(dtype_spec), dtype=torch.uint8, device=device)
         
     @staticmethod
     def compute_overlap(sender: "ShardSpec", receiver: "ShardSpec") -> "ShardSpec":
@@ -233,15 +256,14 @@ class BoundShardSpec:
     def __getitem__(
         self, dst_specs: dict[int, ShardSpec]
     ) -> dict[int, torch.Tensor]:        
-        dst_tensors = {}
+        dst_tensors = {rank: dst_spec.make_byte_chunk(self._tensors, self.device) for rank, dst_spec in dst_specs.items()}
         for rank, dst_spec in dst_specs.items():
-            dst_tensor = torch.empty(dst_spec.nbytes(self._tensors), dtype=torch.uint8, device=self.device)
+            dst_tensor = dst_tensors[rank]
             state_dict = {
                 name: dst_tensor[start:end].view(dtype)
                 for start, end, name, dtype in dst_spec.iter_with_intv(self._tensors)
             }
             BoundShardSpec.slice_copy(self, dst_spec(state_dict), big2small=True)
-            dst_tensors[rank] = dst_tensor
         return dst_tensors
 
     def __setitem__(
@@ -473,7 +495,7 @@ class LoadSpec:
                     dst_slices = tuple(slice(l, r) for l, r, _ in d_shard)
                     dst_tensor[dst_slices].copy_(src_tensor[src_slices])
                     
-    def copy_fromto_sharded(
+    def copy_fromto_params(
         self,
         shard_spec: ShardSpec,
         src_tensors: dict[str, torch.Tensor], # Flattened and concatenated source tensors
@@ -482,9 +504,15 @@ class LoadSpec:
         src_to_dst: bool
     ) -> None:
         """
-        Load weights from sharded, flattened and concatenated source tensors to destination tensors.
+        Copy data between communication buffer and parameter tensors for compute.
+        
+        Only a subset of names indicated by `shard_spec` are copied.
+        
+        NOTE: Only mapping whose source fully contained in shard_spec are copied. Partial overlaps are not supported.
         """
         for sname, dname, s_shard, d_shard in self:
+            if sname not in shard_spec:
+                continue
             assert dname in dst_tensors, f"Missing tensor {dname} for load"
             dst_tensor = dst_tensors[dname]
             for shard, src_tensor in shards_iterator(shard_spec[sname], src_tensors[sname]):

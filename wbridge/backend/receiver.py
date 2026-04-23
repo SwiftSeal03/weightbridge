@@ -2,6 +2,7 @@ import json
 import logging
 import tempfile
 import threading
+from collections.abc import Callable
 from enum import Enum
 from typing import Any, List, Optional
 
@@ -11,6 +12,7 @@ import zmq
 from fastapi import FastAPI, APIRouter
 from fastapi.responses import JSONResponse
 
+from wbridge.backend.router import WeightRouter, WBEndpoint
 from wbridge.utils.data import ShardSpec, shards_numel
 from wbridge.utils.distributed import init_custom_process_group
 
@@ -30,13 +32,14 @@ class ReceiverState(str, Enum):
     AWAITING_SCHEDULER_UPDATE = "awaiting_scheduler_update"
 
 
-class WeightReceiver:
+class WeightReceiver(WBEndpoint):
     """Runs a ZMQ message loop in a daemon thread for controller (ROUTER/DEALER) traffic.
 
     Gloo (CPU) runs :meth:`_receive_weights` on that worker thread when the HTTP
     receive signal arrives. NCCL defers process-group creation to the main thread
     (see :attr:`ReceiverState.PENDING_CONNECT`) and runs :meth:`_receive_weights`
-    on the main thread in :meth:`request_update`.
+    on the main thread in :meth:`request_update`. Each completed round calls ``load_weights``
+    to apply unpacked buffers (see :attr:`load_weights`).
     """
 
     def __init__(
@@ -45,11 +48,13 @@ class WeightReceiver:
         rank: int,
         shard_spec: ShardSpec,
         dtype_spec: dict[str, torch.dtype],
-    ):
+        load_weights: Callable[[ShardSpec, dict[str, torch.Tensor]], None],
+    ) -> None:
         self._controller_ipc_name = controller_ipc_name
         self.rank = rank
         self.shard_spec = shard_spec
         self.dtype_spec = dtype_spec
+        self.load_weights = load_weights
         self.cuda_device = f"cuda:{torch.cuda.current_device()}"
 
         self._lock = threading.Lock()
@@ -57,10 +62,7 @@ class WeightReceiver:
         self._ready_event = threading.Event()
 
         self._state = ReceiverState.DISCONNECTED
-        self.group = None
         self.device: Optional[str] = None
-        self.overlaps: dict = {}
-        self.recv_buffer: dict[str, torch.Tensor] = {}
         self._pending_connect_data: Optional[dict[str, Any]] = None
 
         self._zmq_context = zmq.Context()
@@ -83,8 +85,8 @@ class WeightReceiver:
         self._zmq_context.term()
     
 
-    def request_update(self) -> Optional[dict[str, torch.Tensor]]:
-        """Apply a pending NCCL connect or hand off received weights when ready; else ``None``."""
+    def request_update(self) -> bool:
+        """Apply pending connect, or finish a receive and return ``True`` when weights were loaded."""
         with self._lock:
             if self._state == ReceiverState.PENDING_CONNECT:
                 assert self._pending_connect_data is not None
@@ -92,53 +94,22 @@ class WeightReceiver:
                 data = dict(self._pending_connect_data)
                 self._pending_connect_data = None
                 self._send_ack()
-                self._install_process_group_and_gather_specs(data)
+                self.set_up_connection(**data)
                 self._state = ReceiverState.CONNECTED
-                return None
+                return False
             if self._state == ReceiverState.AWAITING_SCHEDULER_UPDATE:
                 if self.device != "cpu":
                     self._send_ack()
                     self._receive_weights()
                 self._state = ReceiverState.CONNECTED
-                return self.recv_buffer
-            return None
+                return True
+            return False
         
     
     def _send_ack(self) -> None:
         """Send an ack message to the controller."""
         self._controller_socket.send_string(json.dumps({"status": "ack"}))
         
-
-    def _install_process_group_and_gather_specs(self, data: dict[str, Any]) -> None:
-        """Build the process group and gather shard/dtype metadata (shared by connect paths)."""
-        sender_world_size = int(data.pop("sender_world_size"))
-        logger.error(f"Receiver: {self.rank} data: {data} device: {self.device} real device: {torch.cuda.current_device()}")
-        self.group = init_custom_process_group(**data)
-
-        all_shard_specs = [None] * data["world_size"]
-        dist.all_gather_object(all_shard_specs, self.shard_spec, group=self.group)
-        self.overlaps = {
-            rank: overlap
-            for rank, spec in enumerate(all_shard_specs)
-            if rank < sender_world_size and (overlap := ShardSpec.compute_overlap(self.shard_spec, spec))
-        }
-
-        all_dtype_specs = [None] * data["world_size"]
-        dist.all_gather_object(all_dtype_specs, self.dtype_spec, group=self.group)
-
-        for dtype_spec in all_dtype_specs:
-            if dtype_spec is not None:
-                for name, dtype in dtype_spec.items():
-                    if name in self.dtype_spec:
-                        assert self.dtype_spec[name] == dtype, (
-                            f"Dtype mismatch for {name} on rollout rank {data['rank']}"
-                        )
-                    else:
-                        self.dtype_spec[name] = dtype
-        
-        logger.error(f"Receiver: {self.rank} group initialized on device {self.device}")
-
-
     def _handle_connect_request(self, controller_socket: zmq.Socket, data: dict[str, Any]) -> None:
         """
         Handle connect request from controller. This sets up the process group and the device,
@@ -167,7 +138,7 @@ class WeightReceiver:
             dist.destroy_process_group(self.group)
             self.group = None
         self.device = "cpu"
-        self._install_process_group_and_gather_specs(data)
+        self.set_up_connection(**data)
         self._state = ReceiverState.CONNECTED
 
 
@@ -185,25 +156,27 @@ class WeightReceiver:
 
 
     def _receive_weights(self) -> None:
-        """Receive overlap bytes from each sender, unpack into ``recv_buffer`` via :class:`BoundShardSpec`."""
-        chunks = {
-            sender_rank: torch.zeros(overlap.nbytes(self.dtype_spec), dtype=torch.uint8, device=self.device)
-            for sender_rank, overlap in self.overlaps.items()
-        }
-        logger.error(f"Receiver: {self.rank} chunks: {[(rank, chunk.size()) for rank, chunk in chunks.items()]}")
-        ops = [
-            dist.P2POp(dist.irecv, chunk, sender_rank, self.group)
-            for sender_rank, chunk in chunks.items()
-        ]
-        dist.barrier(group=self.group)
-        for h in dist.batch_isend_irecv(ops):
-            h.wait()
-            
-        self.recv_buffer = {
-            name: torch.empty(shards_numel(self.shard_spec[name]), dtype=self.dtype_spec[name], device=self.device)
-            for name, _ in self.shard_spec
-        }
-        self.shard_spec(self.recv_buffer)[self.overlaps] = chunks
+        """Multi-round recv: fresh partial buffer per round, unpack, ``load_weights``, then drop buffer."""
+        for full_spec, overlap_specs in self.router.local_rounds:
+            if full_spec:
+                chunks = {
+                    peer_rank: overlap_spec.make_byte_chunk(self.dtype_spec, self.device)
+                    for peer_rank, overlap_spec in overlap_specs.items()
+                }
+                ops = [
+                    dist.P2POp(dist.irecv, chunk, peer_rank, self.group)
+                    for peer_rank, chunk in chunks.items()
+                ]
+            dist.barrier(group=self.group)
+            if full_spec:
+                for h in dist.batch_isend_irecv(ops):
+                    h.wait()
+                    
+                buf = full_spec.make_named_buffer(self.dtype_spec, self.device)                    
+                full_spec(buf)[overlap_specs] = chunks
+                self.load_weights(full_spec, buf)
+                
+                del buf
 
 
     def _run_loop(self) -> None:
