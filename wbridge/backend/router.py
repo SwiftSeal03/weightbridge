@@ -27,6 +27,8 @@ class WeightRouter:
         sender_ws: int,
         all_specs: list[ShardSpec],
         dtype_spec: dict[str, torch.dtype],
+        *,
+        single_round: bool = False,
     ) -> None:
         self.rank = rank
         self.sender_ws = sender_ws
@@ -36,6 +38,7 @@ class WeightRouter:
         self.send_specs = all_specs[:sender_ws]
         self.recv_specs = all_specs[sender_ws:]
         self.dtype_spec = dtype_spec
+        self.single_round = single_round
         self.global_rounds = self.compute_global_rounds()
         self.local_rounds = self.compute_local_rounds()
         
@@ -46,6 +49,9 @@ class WeightRouter:
         pairs ``(si, ri)`` in sorted order; if that slice fits caps for sender ``si`` and receiver
         ``sender_ws + ri``, add it and remove it from the remaining structure.
         """
+        if self.single_round:
+            return [set(self.dtype_spec)]
+
         all_overlaps = {
             (si, ri): ShardSpec.compute_overlap(self.send_specs[si], self.recv_specs[ri])
             for si in range(self.sender_ws)
@@ -120,6 +126,7 @@ class WeightRouter:
 
 class WBEndpoint:
     """Endpoint for weight bridge communication."""
+    cuda_device: str
     shard_spec: ShardSpec
     dtype_spec: dict[str, torch.dtype]
     router: WeightRouter | None = None
@@ -127,7 +134,21 @@ class WBEndpoint:
     
     def set_up_connection(self, **pg_args) -> None:
         """Set up the connection to the other endpoint."""
+        if self.group is not None:
+            dist.destroy_process_group(self.group)
+            self.group = None
+        
         sender_ws = pg_args.pop("sender_world_size")
+        self.transfer_mode = pg_args.pop("transfer_mode")
+        if self.transfer_mode == "gpu_direct":
+            pg_args["backend"] = "nccl"
+            self.device = self.cuda_device
+        elif self.transfer_mode == "cpu_direct":
+            pg_args["backend"] = "gloo"
+            self.device = "cpu"
+        else:
+            raise ValueError(f"Invalid transfer mode: {self.transfer_mode}")
+        
         rank = pg_args["rank"]
         ws = pg_args["world_size"]
         self.group = init_custom_process_group(**pg_args)
@@ -145,7 +166,13 @@ class WBEndpoint:
                 else:
                     self.dtype_spec[name] = dtype
 
-        self.router = WeightRouter(rank, sender_ws, all_shard_specs, self.dtype_spec)
+        self.router = WeightRouter(
+            rank,
+            sender_ws,
+            all_shard_specs,
+            self.dtype_spec,
+            single_round=(self.transfer_mode == "cpu_direct"),
+        )
         
         logger.error(f"Rank: {rank} group initialized")
         

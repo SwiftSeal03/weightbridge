@@ -13,7 +13,7 @@ from fastapi import FastAPI, APIRouter
 from fastapi.responses import JSONResponse
 
 from wbridge.backend.router import WeightRouter, WBEndpoint
-from wbridge.utils.data import ShardSpec, shards_numel
+from wbridge.utils.data import ShardSpec
 from wbridge.utils.distributed import init_custom_process_group
 
 logger = logging.getLogger(__name__)
@@ -35,11 +35,14 @@ class ReceiverState(str, Enum):
 class WeightReceiver(WBEndpoint):
     """Runs a ZMQ message loop in a daemon thread for controller (ROUTER/DEALER) traffic.
 
-    Gloo (CPU) runs :meth:`_receive_weights` on that worker thread when the HTTP
-    receive signal arrives. NCCL defers process-group creation to the main thread
-    (see :attr:`ReceiverState.PENDING_CONNECT`) and runs :meth:`_receive_weights`
-    on the main thread in :meth:`request_update`. Each completed round calls ``load_weights``
-    to apply unpacked buffers (see :attr:`load_weights`).
+    ``gpu_direct`` (NCCL): connect may defer process-group creation to the main thread
+    (see :attr:`ReceiverState.PENDING_CONNECT`); :meth:`request_update` runs
+    :meth:`_receive_weights` on the main thread after the HTTP receive handshake.
+
+    ``cpu_direct`` (Gloo, CPU wire buffers): the HTTP receive handler acknowledges immediately,
+    then a background thread runs :meth:`_receive_weights_staging_only` so trainers can post
+    ``isend`` while bytes land in CPU staging buffers. :meth:`request_update` waits for that
+    staging to finish, then calls :attr:`load_weights` to copy into GPU ``wksd``.
     """
 
     def __init__(
@@ -50,12 +53,16 @@ class WeightReceiver(WBEndpoint):
         dtype_spec: dict[str, torch.dtype],
         load_weights: Callable[[ShardSpec, dict[str, torch.Tensor]], None],
     ) -> None:
+        self.cuda_device = f"cuda:{torch.cuda.current_device()}"
+
+        self.transfer_mode: str | None = None  # set in :meth:`_handle_connect_request`
         self._controller_ipc_name = controller_ipc_name
         self.rank = rank
         self.shard_spec = shard_spec
         self.dtype_spec = dtype_spec
         self.load_weights = load_weights
-        self.cuda_device = f"cuda:{torch.cuda.current_device()}"
+
+        self._cpu_recv_buffer: dict[str, torch.Tensor] | None = None
 
         self._lock = threading.Lock()
         self._shutdown = threading.Event()
@@ -88,19 +95,21 @@ class WeightReceiver(WBEndpoint):
     def request_update(self) -> bool:
         """Apply pending connect, or finish a receive and return ``True`` when weights were loaded."""
         with self._lock:
-            if self._state == ReceiverState.PENDING_CONNECT:
+            if self._state == ReceiverState.PENDING_CONNECT: # Only in gpu_direct transfer mode
                 assert self._pending_connect_data is not None
                 assert "cuda" in self.device, "Delayed connect should be on CUDA"
-                data = dict(self._pending_connect_data)
-                self._pending_connect_data = None
                 self._send_ack()
-                self.set_up_connection(**data)
+                self.set_up_connection(**self._pending_connect_data)
+                self._pending_connect_data = None
                 self._state = ReceiverState.CONNECTED
                 return False
             if self._state == ReceiverState.AWAITING_SCHEDULER_UPDATE:
-                if self.device != "cpu":
+                if self.transfer_mode == "gpu_direct":
                     self._send_ack()
                     self._receive_weights()
+                elif self.transfer_mode == "cpu_direct":
+                    self.load_weights(self.shard_spec, self._cpu_recv_buffer)
+                    del self._cpu_recv_buffer
                 self._state = ReceiverState.CONNECTED
                 return True
             return False
@@ -126,18 +135,12 @@ class WeightReceiver(WBEndpoint):
 
         data["rank"] += self.rank
         
-        if data["backend"] == "nccl":
-            self.device = self.cuda_device
+        if data["transfer_mode"] == "gpu_direct":
             self._pending_connect_data = dict(data)
             self._state = ReceiverState.PENDING_CONNECT
-            logger.error(f"Receiver: {self.rank} NCCL connect deferred to main thread (PENDING_CONNECT)")
             return
 
         self._send_ack()
-        if self.group is not None:
-            dist.destroy_process_group(self.group)
-            self.group = None
-        self.device = "cpu"
         self.set_up_connection(**data)
         self._state = ReceiverState.CONNECTED
 
@@ -149,14 +152,14 @@ class WeightReceiver(WBEndpoint):
                 json.dumps({"status": "error", "detail": "requires CONNECTED state"})
             )
             return
-        if self.device == "cpu":
+        if self.transfer_mode == "cpu_direct":
             self._send_ack()
             self._receive_weights()
         self._state = ReceiverState.AWAITING_SCHEDULER_UPDATE
 
 
-    def _receive_weights(self) -> None:
-        """Multi-round recv: fresh partial buffer per round, unpack, ``load_weights``, then drop buffer."""
+    def _receive_weights(self, *, apply_load: bool = True) -> None:
+        """Multi-round recv: unpack into buffers; call ``load_weights`` when ``apply_load`` is True."""
         for full_spec, overlap_specs in self.router.local_rounds:
             if full_spec:
                 chunks = {
@@ -174,9 +177,12 @@ class WeightReceiver(WBEndpoint):
                     
                 buf = full_spec.make_named_buffer(self.dtype_spec, self.device)                    
                 full_spec(buf)[overlap_specs] = chunks
-                self.load_weights(full_spec, buf)
-                
-                del buf
+                if apply_load:
+                    self.load_weights(full_spec, buf)
+                    del buf
+                else:
+                    with self._lock:
+                        self._cpu_recv_buffer = buf
 
 
     def _run_loop(self) -> None:

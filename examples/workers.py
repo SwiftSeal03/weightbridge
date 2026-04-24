@@ -11,6 +11,7 @@ LoadSpec inference inside :class:`~wbridge.frontend.adapters.SenderAdapter` /
 
 from __future__ import annotations
 
+import logging
 import os
 import threading
 import time
@@ -37,6 +38,8 @@ from qwen_tiny import (
     rollout_load_spec_path,
 )
 from utils import make_hf_iter_factory
+
+logger = logging.getLogger("wbridge.example.workers")
 
 CheckpointBuilder = Callable[[], dict[str, torch.Tensor]]
 
@@ -66,6 +69,8 @@ class EngineArgs:
     build_checkpoint: CheckpointBuilder
     load_spec_dir: str
     dtype: torch.dtype = torch.float32
+    # ``gpu_direct`` (NCCL) or ``cpu_direct`` (Gloo, CPU wire buffers, overlapped send/recv).
+    transfer_mode: str = "gpu_direct"
 
     rollout_controller_ipc_name: str = ""
     network_interface: str = "eno1"
@@ -111,7 +116,11 @@ class RolloutWorker:
 
     def recv_weights(self) -> None:
         for _ in range(500):
-            if self.adapter.request_update():
+            t0 = time.time()
+            updated = self.adapter.request_update()
+            t1 = time.time()
+            if updated:
+                logger.info("RolloutWorker rank %s recv_weights start wall_s=%.6f return wall_s=%.6f", self.rank, t0, t1)
                 return
             time.sleep(0.05)
         raise TimeoutError("receiver never became ready for weights")
@@ -204,7 +213,7 @@ class TrainerWorker:
         )
         sender_args = SenderArgs(
             world_size=args.num_trainer_workers,
-            transfer_mode="gpu_direct",
+            transfer_mode=args.transfer_mode,
             receiver_urls=[f"http://{args.rollout_host}:{args.rollout_port}"],
             master_addr=args.trainer_host,
             master_port=args.trainer_pg_port,
@@ -213,7 +222,13 @@ class TrainerWorker:
 
     def send_weights(self):
         self.adapter.connect()
+        t0 = time.time()
+        logger.info(
+            "TrainerWorker rank %s send_weights start wall_s=%.6f",self.rank, t0,
+        )
         self.adapter.send_weights()
+        t1 = time.time()
+        logger.info("TrainerWorker rank %s send_weights return wall_s=%.6f elapsed_s=%.6f", self.rank, t1, t1 - t0)
 
 
 class TrainerEngine:

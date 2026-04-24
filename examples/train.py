@@ -1,4 +1,4 @@
-"""Minimal WeightBridge example: Ray node pinning + GPU-direct transfer.
+"""Minimal WeightBridge example: Ray node pinning + weight transfer.
 
 Uses a single-layer Qwen2-style HF checkpoint built on each worker via ``build_checkpoint``.
 Trainer (**actor**) workers hold TP shards
@@ -6,15 +6,19 @@ of HF names in ``wksd``; rollout workers hold merged weights (``qkv_proj``, ``ga
 :class:`~wbridge.frontend.adapters.SenderAdapter` / :class:`~wbridge.frontend.adapters.ReceiverAdapter`
 infer per-rank :class:`~wbridge.utils.data.LoadSpec` JSON under *load_spec_dir*.
 
+Use ``--transfer-mode gpu_direct`` (NCCL, default) or ``--transfer-mode cpu_direct`` (Gloo, CPU wire
+buffers; single router round; overlapped send/recv). ``wksd`` tensors stay on GPU in both modes.
+
 Usage::
 
     ray start --head          # node A (GPUs for trainer + rollout workers)
     ray start --address=...   # node B
-    python examples/train.py
+    python examples/train.py [--transfer-mode gpu_direct|cpu_direct]
 """
 
 from __future__ import annotations
 
+import argparse
 import logging
 import tempfile
 from functools import partial
@@ -39,6 +43,15 @@ def main() -> None:
         format="%(asctime)s %(levelname)s %(filename)s:%(lineno)d - %(message)s",
     )
 
+    parser = argparse.ArgumentParser(description="WeightBridge train/rollout example")
+    parser.add_argument(
+        "--transfer-mode",
+        choices=("gpu_direct", "cpu_direct"),
+        default="gpu_direct",
+        help="gpu_direct: NCCL GPU buffers; cpu_direct: Gloo CPU buffers with overlapped send/recv",
+    )
+    cli = parser.parse_args()
+
     rollout_ip, trainer_ip, rollout_node_id, trainer_node_id = get_ray_nodes()
     # Bump dirname if layout / LoadSpec format changes (stale JSON under old dirs still hurts until deleted).
     load_spec_dir = str(Path(tempfile.gettempdir()) / "wbridge_example_qwen_loadspec_v3")
@@ -60,6 +73,7 @@ def main() -> None:
         build_checkpoint=build_checkpoint,
         load_spec_dir=load_spec_dir,
         dtype=DTYPE,
+        transfer_mode=cli.transfer_mode,
     )
 
     trainer_engine = TrainerEngine(engine_args)

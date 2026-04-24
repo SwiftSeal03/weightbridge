@@ -250,7 +250,7 @@ class BoundShardSpec:
                     if big2small:
                         s_tensor.copy_(b_tensor[slices])
                     else:
-                        b_tensor[slices] = s_tensor
+                        b_tensor[slices].copy_(s_tensor)
                     break
 
     def __getitem__(
