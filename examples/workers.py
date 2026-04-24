@@ -120,7 +120,7 @@ class RolloutWorker:
             updated = self.adapter.request_update()
             t1 = time.time()
             if updated:
-                logger.info("RolloutWorker rank %s recv_weights start wall_s=%.6f return wall_s=%.6f", self.rank, t0, t1)
+                print(f"RolloutWorker rank {self.rank} recv_weights start wall_s={t0} return wall_s={t1}")
                 return
             time.sleep(0.05)
         raise TimeoutError("receiver never became ready for weights")
@@ -223,12 +223,10 @@ class TrainerWorker:
     def send_weights(self):
         self.adapter.connect()
         t0 = time.time()
-        logger.info(
-            "TrainerWorker rank %s send_weights start wall_s=%.6f",self.rank, t0,
-        )
+        print(f"TrainerWorker rank {self.rank} send_weights start wall_s={t0}")
         self.adapter.send_weights()
         t1 = time.time()
-        logger.info("TrainerWorker rank %s send_weights return wall_s=%.6f elapsed_s=%.6f", self.rank, t1, t1 - t0)
+        print(f"TrainerWorker rank {self.rank} send_weights return wall_s={t1} elapsed_s={t1 - t0}")
 
 
 class TrainerEngine:
