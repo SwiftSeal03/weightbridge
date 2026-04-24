@@ -11,7 +11,6 @@ expensive inference across runs.
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
@@ -22,8 +21,6 @@ from megatron.bridge import AutoBridge
 
 from wbridge.backend.sender import SenderArgs
 from wbridge.frontend.adapters import AdapterContext, SenderAdapter
-
-logger = logging.getLogger(__name__)
 
 
 @contextmanager

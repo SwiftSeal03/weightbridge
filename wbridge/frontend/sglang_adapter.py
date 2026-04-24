@@ -8,7 +8,6 @@ Builds ``hf_iter_factory`` from SGLang's ``ModelRunner`` loader, exposes ``model
 
 from __future__ import annotations
 
-import logging
 from collections.abc import Iterator
 from pathlib import Path
 
@@ -16,8 +15,6 @@ import torch
 from sglang.srt.model_executor.model_runner import ModelRunner
 
 from wbridge.frontend.adapters import AdapterContext, ReceiverAdapter
-
-logger = logging.getLogger(__name__)
 
 
 class WBSGLangAdapter(ReceiverAdapter):

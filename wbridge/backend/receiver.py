@@ -23,9 +23,8 @@ import zmq
 from fastapi import FastAPI, APIRouter
 from fastapi.responses import JSONResponse
 
-from wbridge.backend.router import WeightRouter, WBEndpoint
+from wbridge.backend.router import WBEndpoint
 from wbridge.utils.data import ShardSpec
-from wbridge.utils.distributed import init_custom_process_group
 
 logger = logging.getLogger(__name__)
 
@@ -294,7 +293,7 @@ class WeightReceiverController:
         transfer modes, the thread acks immediately after :meth:`WeightReceiver.set_up_connection`
         in :meth:`WeightReceiver._handle_connect_request`.
         """
-        for idx, identity in enumerate(self._receiver_identities):
+        for identity in self._receiver_identities:
             connect_msg_bytes = json.dumps({"type": CONNECT_REQUEST, **request}).encode("utf-8")
             self._router_socket.send_multipart([identity, connect_msg_bytes])
 

@@ -16,11 +16,7 @@ import torch
 import torch.distributed as dist
 
 from wbridge.utils.data import ShardSpec
-from wbridge.backend.router import WeightRouter, WBEndpoint
-from wbridge.utils.distributed import init_custom_process_group
-
-import logging
-logger = logging.getLogger(__name__)
+from wbridge.backend.router import WBEndpoint
 
 
 @dataclass
@@ -95,7 +91,6 @@ class WeightSender(WBEndpoint):
         if self.group is not None:
             dist.destroy_process_group(self.group)
 
-        rollout_num_workers = []
         resps = [requests.get(f"{url}/wbridge/receiver_world") for url in self.receiver_urls]
         assert all(resp.status_code == 200 for resp in resps), "Failed to get receiver world size"
         rollout_num_workers = [resp.json()["world_size"] for resp in resps]
