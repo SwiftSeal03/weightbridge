@@ -103,7 +103,7 @@ class ShardSpec:
         return bool(self.entries)
     
     def __iter__(self) -> Iterator[tuple[str, Shards]]:
-        return iter(self.entries.items())
+        return iter(sorted(self.entries.items()))
     
     def __len__(self) -> int:
         return len(self.entries)
