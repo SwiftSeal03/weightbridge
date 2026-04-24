@@ -1,3 +1,14 @@
+"""Local receiver side of Weightbridge: per-worker :class:`WeightReceiver` and HTTP :class:`WeightReceiverController`.
+
+The **controller** exposes FastAPI routes that the training scheduler (or a driver) uses to
+connect workers and to signal a weight receive round. The controller forwards JSON control
+messages over a ZMQ ROUTER to per-worker DEALER sockets.
+
+Each **WeightReceiver** runs a ZMQ message loop in a daemon thread, updating state and
+either staging CPU buffers or, with the main thread, completing NCCL recv and
+``load_weights``—see :class:`WeightReceiver` and :meth:`WeightReceiver.request_update`.
+"""
+
 import json
 import logging
 import tempfile
@@ -24,12 +35,12 @@ RECEIVE_REQUEST = "receive_request"
 
 
 class ReceiverState(str, Enum):
-    """Receiver lifecycle for controller vs scheduler handoff."""
+    """Receiver lifecycle: ZMQ thread vs. main-thread ``request_update`` coordination."""
 
-    DISCONNECTED = "disconnected"
-    PENDING_CONNECT = "pending_connect"
-    CONNECTED = "connected"
-    AWAITING_SCHEDULER_UPDATE = "awaiting_scheduler_update"
+    DISCONNECTED = "disconnected"  # No process group; not yet connected
+    PENDING_CONNECT = "pending_connect"  # gpu_direct: connect deferred to main thread
+    CONNECTED = "connected"  # Ready for receive or idle after a completed round
+    AWAITING_SCHEDULER_UPDATE = "awaiting_scheduler_update"  # Staging/recv done; main thread loads
 
 
 class WeightReceiver(WBEndpoint):
@@ -108,8 +119,10 @@ class WeightReceiver(WBEndpoint):
                     self._send_ack()
                     self._receive_weights()
                 elif self.transfer_mode == "cpu_direct":
+                    assert self._cpu_recv_buffer is not None
                     self.load_weights(self.shard_spec, self._cpu_recv_buffer)
                     del self._cpu_recv_buffer
+                    self._cpu_recv_buffer = None
                 self._state = ReceiverState.CONNECTED
                 return True
             return False
@@ -158,7 +171,7 @@ class WeightReceiver(WBEndpoint):
         self._state = ReceiverState.AWAITING_SCHEDULER_UPDATE
 
 
-    def _receive_weights(self, *, apply_load: bool = True) -> None:
+    def _receive_weights(self) -> None:
         """Multi-round recv: unpack into buffers; call ``load_weights`` when ``apply_load`` is True."""
         for full_spec, overlap_specs in self.router.local_rounds:
             if full_spec:
@@ -177,13 +190,11 @@ class WeightReceiver(WBEndpoint):
                     
                 buf = full_spec.make_named_buffer(self.dtype_spec, self.device)                    
                 full_spec(buf)[overlap_specs] = chunks
-                if apply_load:
+                if self.transfer_mode == "gpu_direct":
                     self.load_weights(full_spec, buf)
                     del buf
-                else:
-                    with self._lock:
-                        self._cpu_recv_buffer = buf
-
+                elif self.transfer_mode == "cpu_direct":
+                    self._cpu_recv_buffer = buf
 
     def _run_loop(self) -> None:
         """Thread entry: DEALER to controller only; signals ready; polls until shutdown."""
@@ -211,11 +222,18 @@ class WeightReceiver(WBEndpoint):
 
 
 class WeightReceiverController:
-    """
-    Server for receiving weights from a WeightSender.
+    """HTTP + ZMQ control surface for a pool of :class:`WeightReceiver` workers.
 
-    It forwards control messages and dispatches to underlying WeightReceiver instances.
-    When created, it creates an IPC name file for ROUTER/DEALER communication with receivers.
+    Binds a ZMQ ROUTER at :attr:`ipc_name`; one DEALER per worker identity ``worker-<rank>``
+    must connect. Routes:
+
+    * ``GET /wbridge/receiver_world`` — world size the scheduler set via :meth:`set_worker_num`
+    * ``POST /wbridge/connect`` — forward process-group args to all workers; collect per-worker acks
+    * ``POST /wbridge/receive`` — tell workers to prepare for a P2P receive round; acks when ready
+
+    Actual tensor traffic uses the distributed process group created at connect; the scheduler
+    is expected to call the worker’s :meth:`WeightReceiver.request_update` after the HTTP
+    receive handshake to finish the round (load into model).
     """
 
     def __init__(self, app: FastAPI):
@@ -253,6 +271,7 @@ class WeightReceiverController:
         self._receiver_identities = [b"worker-%d" % rank for rank in range(worker_num)]
 
     def _gather_responses(self) -> List[dict]:
+        """Block until :attr:`_worker_num` JSON replies arrive on the ROUTER (one per worker)."""
         responses = []
         for _ in range(self._worker_num):
             msg_bytes = self._router_socket.recv_multipart()[1]
@@ -264,11 +283,16 @@ class WeightReceiverController:
         return JSONResponse(content={"status": "success", "world_size": self._worker_num})
 
     async def connect(self, request: dict[str, Any]):
-        """Forward connection info to each worker, wait for acks, then return.
+        """Forward process-group and transfer settings to every worker; success if all ack.
 
-        Each worker is assigned rank ``request.base_rank + worker_index``.
-        Workers acknowledge immediately (before blocking on group formation),
-        so this endpoint returns as soon as all workers have the info.
+        The same ``request`` dict is sent to every identity; each worker does
+        ``data["rank"] += self.rank`` so global ranks are ``request["rank"] + local_index``.
+
+        For ``gpu_direct``, the ZMQ thread does not ack until the main thread runs
+        :meth:`WeightReceiver.request_update` in :attr:`ReceiverState.PENDING_CONNECT` (which
+        calls :meth:`WeightReceiver.set_up_connection` and then :meth:`_send_ack`). For other
+        transfer modes, the thread acks immediately after :meth:`WeightReceiver.set_up_connection`
+        in :meth:`WeightReceiver._handle_connect_request`.
         """
         for idx, identity in enumerate(self._receiver_identities):
             connect_msg_bytes = json.dumps({"type": CONNECT_REQUEST, **request}).encode("utf-8")

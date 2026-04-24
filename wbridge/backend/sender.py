@@ -1,3 +1,13 @@
+"""Sender side of Weightbridge: :class:`WeightSender` coordinates HTTP with a :class:`WeightReceiverController`.
+
+A sender rank joins a merged process group with receiver workers, posts ``/wbridge/connect`` and
+``/wbridge/receive`` on the receiver HTTP APIs (from rank 0), then exchanges tensor chunks in
+P2P rounds defined by a shared :class:`~wbridge.backend.router.WeightRouter`. :meth:`WeightSender.send`
+packs local shards via :attr:`WeightSender.save_weights` and issues ``isend``; behavior matches
+:meth:`WeightReceiver._receive_weights` on the peer side. See :class:`SenderArgs` for transport
+options.
+"""
+
 from collections.abc import Callable
 from dataclasses import dataclass
 
@@ -34,7 +44,13 @@ class SenderArgs:
 
 
 class WeightSender(WBEndpoint):
-    """Sends weight rounds to receivers. ``save_weights`` fills each round's buffers (inverse of the receiver's ``load_weights``)."""
+    """Packs and P2P-sends sharded weights to :class:`WeightReceiver` peers.
+
+    Rank 0 must call :meth:`connect` before :meth:`send`; that establishes the process group
+    (and rank-0 only drives the receiver HTTP endpoints). Each round, :attr:`save_weights` fills
+    the logical chunk buffers that :attr:`load_weights` on the receiver will consume (same
+    :class:`~wbridge.utils.data.ShardSpec` layout).
+    """
 
     def __init__(
         self,
@@ -65,11 +81,14 @@ class WeightSender(WBEndpoint):
     
 
     def connect(self) -> None:
-        """Join receivers over NCCL after a short-lived Gloo group for sender coordination.
+        """Rendezvous senders, query receiver world sizes, then form the merged P2P process group.
 
-        The Gloo process group uses ``tcp://{master_addr}:{master_port}`` from
-        :meth:`__init__` so all sender ranks rendezvous before rank 0 drives
-        HTTP receiver_world/connect and broadcasts rendezvous info for the main group.
+        Uses :attr:`init_method` (``tcp://{master_addr}:{master_port}``) from :class:`SenderArgs`
+        so all sender ranks align before rank 0 calls each ``receiver_urls`` host’s
+        ``/wbridge/receiver_world`` and ``/wbridge/connect`` with a contiguous ``rank`` base
+        for receiver workers. :meth:`set_up_connection` is then called on every sender rank with
+        the same ``init_method``, total ``world_size`` (senders + all receiver workers), and
+        transfer mode.
         """
         self._drain_pending_comm()
 
