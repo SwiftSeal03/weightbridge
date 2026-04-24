@@ -97,9 +97,9 @@ class WeightReceiver(WBEndpoint):
         with self._lock:
             if self._state == ReceiverState.PENDING_CONNECT: # Only in gpu_direct transfer mode
                 assert self._pending_connect_data is not None
-                assert "cuda" in self.device, "Delayed connect should be on CUDA"
                 self._send_ack()
                 self.set_up_connection(**self._pending_connect_data)
+                assert self.transfer_mode == "gpu_direct", "Delayed connect should be in gpu_direct transfer mode"
                 self._pending_connect_data = None
                 self._state = ReceiverState.CONNECTED
                 return False
