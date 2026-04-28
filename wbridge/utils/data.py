@@ -1,29 +1,16 @@
 from __future__ import annotations
 
-import json
 import copy
 import math
-from typing import Iterator, TypeAlias
+from typing import Iterable, Iterator, TypeAlias
 import torch
 
 Shard: TypeAlias = list[tuple[int, int, int]]
 Shards: TypeAlias = list[Shard]
 # One HF↔worker region pair: source box and destination box (same flattened numel).
 ShardMapping: TypeAlias = tuple[Shard, Shard]
-
-def _normalize_shards(
-    shard: Shard | Shards,
-) -> Shards:
-    """Normalize a shard spec to the multi-shard form ``[[dim, ...], ...]``.
-
-    Accepts both single-shard ``[(l, r, w), ...]`` and multi-shard
-    ``[[(l, r, w), ...], ...]`` inputs.
-    """
-    if not shard:
-        return []
-    if isinstance(shard[0][0], (int, float)):
-        return [shard]
-    return shard
+# JSON snapshot for :meth:`LoadSpec.from_jsonable`.
+LoadSpecJsonTree: TypeAlias = dict[str, dict[str, list[tuple[list[list[int]], list[list[int]]]]]]
 
 
 def shard_shape(shard: Shard) -> tuple[int, ...]:
@@ -36,11 +23,11 @@ def shard_numel(shard: Shard) -> int:
 
 def shards_numel(shards: Shards) -> int:
     return sum(shard_numel(shard) for shard in shards)
-        
-        
+
+
 def shards_nbytes(shards: Shards, dtype: torch.dtype) -> int:
     return shards_numel(shards) * dtype.itemsize
-        
+
 
 def _sanity_check(name: str, shards: Shards) -> None:
     numel = None
@@ -70,13 +57,11 @@ class ShardSpec:
     Format::
 
         {
-            "name": [[(l, r, w), ...], ...],  # always multi-shard form after init
+            "name": [[(l, r, w), ...], ...],  # each value is :class:`Shards`
             ...
         }
 
-    At construction, each ``shard`` value is normalized to the multi-shard
-    form ``[[dim, ...], ...]`` (see :func:`_normalize_shards`). Callers may
-    pass either single-shard ``[(l, r, w), ...]`` or multi-shard input.
+    Each entry value must be full multi-shard form (a :class:`Shards` list).
     ``dtype`` may be :class:`torch.dtype` or a string (for JSON / legacy).
 
     Tensor values are passed separately as ``dict[str, torch.Tensor]`` to
@@ -84,10 +69,8 @@ class ShardSpec:
     """
 
     def __init__(self, entries: dict[str, Shards]):
-        self.entries = {
-            name: _normalize_shards(shards) for name, shards in entries.items()
-        }
-        
+        self.entries = dict(entries)
+
         for name, shards in self:
             _sanity_check(name, shards)
 
@@ -98,68 +81,67 @@ class ShardSpec:
         ``f[overlaps] = chunks`` (see :class:`BoundShardSpec`).
         """
         return BoundShardSpec(self, tensors)
-    
+
     def __bool__(self) -> bool:
         return bool(self.entries)
-    
+
     def __iter__(self) -> Iterator[tuple[str, Shards]]:
         return iter(sorted(self.entries.items()))
-    
+
     def __len__(self) -> int:
         return len(self.entries)
-    
+
     def __contains__(self, key: str) -> bool:
         return key in self.entries
-    
+
     def __delitem__(self, key: str) -> None:
         del self.entries[key]
-    
+
     def __getitem__(self, key: str) -> Shards:
         return self.entries[key]
-    
+
     def __setitem__(self, key: str, value: Shards) -> None:
-        shards = _normalize_shards(value)
-        _sanity_check(key, shards)
-        self.entries[key] = shards
-        
+        _sanity_check(key, value)
+        self.entries[key] = value
+
     def nbytes(self, dtype_spec: dict[str, torch.dtype]) -> int:
         return sum(shards_nbytes(shards, dtype_spec[name]) for name, shards in self)
-    
+
     def iter_with_intv(self, tensors: dict[str, torch.Tensor]) -> Iterator[tuple[int, int, str, torch.dtype]]:
         offset = 0
         for name, shards in self:
             length = shards_nbytes(shards, tensors[name].dtype)
             yield offset, offset + length, name, tensors[name].dtype
             offset += length
-            
+
     def clone(self) -> "ShardSpec":
         return ShardSpec(copy.deepcopy(self.entries))
-    
+
     def subset(self, names: set[str]) -> "ShardSpec":
         names &= self.entries.keys()
         return ShardSpec({name: self[name] for name in names})
-    
+
     def make_named_buffer(self, dtype_spec: dict[str, torch.dtype], device: str) -> dict[str, torch.Tensor]:
         """Make a dictionary of tensors for each name in the shard spec."""
         return {
             name: torch.empty(shards_numel(shards), dtype=dtype_spec[name], device=device)
             for name, shards in self
         }
-        
+
     def make_byte_chunk(self, dtype_spec: dict[str, torch.dtype], device: str) -> torch.Tensor:
         """Return a uint8 P2P buffer covering this spec (all tensor names, layout order in :meth:`iter_with_intv`)."""
         return torch.zeros(self.nbytes(dtype_spec), dtype=torch.uint8, device=device)
-        
+
     @staticmethod
     def compute_overlap(sender: "ShardSpec", receiver: "ShardSpec") -> "ShardSpec":
         """Return a new :class:`ShardSpec` whose entries describe the shard regions
         where *sender* and *receiver* overlap (spec only, no tensor data).
 
-        Sender and receiver specs must be :class:`ShardSpec` (shards
-        normalized at construction). Every sender shard is paired against every
+        Sender and receiver specs must already store entries as multi-box :class:`Shards`.
+        Every sender shard is paired against every
         receiver shard and all non-empty overlaps are collected.
         """
-        result: dict[str, dict] = {}
+        result: dict[str, Shards] = {}
         for name, s_shards in sender:
             if name not in receiver:
                 continue
@@ -176,7 +158,7 @@ class ShardSpec:
                         (max(ls, lr), min(rs, rr), w)
                         for ls, rs, lr, rr, w in alignment
                     ]
-                    
+
                     if all(lo < hi for lo, hi, _ in overlap_dims):
                         overlap_shards.append(overlap_dims)
 
@@ -211,7 +193,7 @@ class BoundShardSpec:
                 f"spec and tensor numel mismatch for {name}, {shards_numel(shards)} vs {tensor.numel()}"
             self._tensors[name] = tensor.flatten()
             assert tensor.device == self.device, f"Tensor {name} is not on the same device as other tensors"
-            
+
         # Drop tensors not listed in shard_spec
         for name in list(self._tensors):
             if name not in self._shard_spec:
@@ -227,16 +209,16 @@ class BoundShardSpec:
         Copy data from one flattened buffer to another.
         The direction of the copy is determined by the `l2s` parameter.
         "small" should represent a subset of the data in "large".
-        """        
+        """
         for name, _ in small._shard_spec:
             assert name in large._shard_spec, f"Missing tensor {name} for large entry"
-            
+
             for s_shard, s_tensor in shards_iterator(small._shard_spec[name], small._tensors[name]):
                 for b_shard, b_tensor in shards_iterator(large._shard_spec[name], large._tensors[name]):
                     assert b_tensor.dtype == s_tensor.dtype, \
                         f"Tensor dtype mismatch for {name}: {b_tensor.dtype} vs {s_tensor.dtype}"
                     alignment = _check_shard_compatibility(b_shard, s_shard)
-                    
+
                     if not alignment or not all(
                         bl <= sl and sr <= br
                         for bl, br, sl, sr, _ in alignment
@@ -258,7 +240,10 @@ class BoundShardSpec:
     ) -> dict[int, torch.Tensor]:
         # Wire layout uses dtypes from the *full* bound tensors (per-name), not the tensor objects themselves.
         dtype_by_name = {n: t.dtype for n, t in self._tensors.items()}
-        dst_tensors = {rank: dst_spec.make_byte_chunk(dtype_by_name, self.device) for rank, dst_spec in dst_specs.items()}
+        dst_tensors = {
+            rank: dst_spec.make_byte_chunk(dtype_by_name, str(self.device))
+            for rank, dst_spec in dst_specs.items()
+        }
         for rank, dst_spec in dst_specs.items():
             dst_tensor = dst_tensors[rank]
             state_dict = {
@@ -452,7 +437,7 @@ class LoadSpec:
         if not hasattr(self, "_src_shard_spec_cache"):
             self._src_spec = self._compute_src_shard_spec()
         return self._src_spec
-    
+
     def _compute_src_shard_spec(self) -> ShardSpec:
         def _unique_shards_for_src(entry: dict[str, list[ShardMapping]]) -> Shards:
             seen: set[tuple[tuple[int, int, int], ...]] = set()
@@ -472,24 +457,32 @@ class LoadSpec:
             for dname, mappings in entry.items():
                 for s_shard, d_shard in mappings:
                     yield sname, dname, s_shard, d_shard
-        
+
     @staticmethod
-    def from_jsonable(jsonable: dict[str, dict[str, list[list[list[int]]]]]) -> "LoadSpec":
+    def from_jsonable(jsonable: LoadSpecJsonTree) -> "LoadSpec":
         """Rebuild a :class:`LoadSpec` from :func:`json.load` output (nested tuples become lists)."""
+
+        def _shard_from_json(rows: list[list[int]]) -> Shard:
+            shard: Shard = []
+            for row in rows:
+                assert len(row) == 3
+                shard.append((int(row[0]), int(row[1]), int(row[2])))
+            return shard
+
         return LoadSpec({
             sname: {
                 dname: [
-                    (
-                        [tuple(t) for t in s_shard],
-                        [tuple(t) for t in d_shard]
-                    ) for s_shard, d_shard in mappings
-                ] for dname, mappings in entry.items()
-            } for sname, entry in jsonable.items()
+                    (_shard_from_json(s_shard), _shard_from_json(d_shard))
+                    for s_shard, d_shard in mappings
+                ]
+                for dname, mappings in entry.items()
+            }
+            for sname, entry in jsonable.items()
         })
-        
+
     def load_from_full(
-        self, 
-        src_iter: Iterator[tuple[str, torch.Tensor]],
+        self,
+        src_iter: Iterable[tuple[str, torch.Tensor]],
         dst_tensors: dict[str, torch.Tensor],
     ) -> None:
         for sname, src_tensor in src_iter:
@@ -502,7 +495,7 @@ class LoadSpec:
                     src_slices = tuple(slice(l, r) for l, r, _ in s_shard)
                     dst_slices = tuple(slice(l, r) for l, r, _ in d_shard)
                     dst_tensor[dst_slices].copy_(src_tensor[src_slices])
-                    
+
     def copy_fromto_params(
         self,
         src_shard_spec: ShardSpec,
@@ -513,9 +506,9 @@ class LoadSpec:
     ) -> None:
         """
         Copy data between communication buffer and parameter tensors for compute.
-        
+
         Only a subset of names indicated by `shard_spec` are copied.
-        
+
         NOTE: Only mapping whose source fully contained in shard_spec are copied. Partial overlaps are not supported.
         """
         for sname, dname, s_shard, d_shard in self:

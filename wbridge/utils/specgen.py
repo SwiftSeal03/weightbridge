@@ -61,7 +61,7 @@ def _sd_subset_iterator(
         yield name, hfsd[name]
 
 
-def zero_wk_tensors(wk_keys: list[str], wksd: dict[str, torch.Tensor]) -> None:
+def zero_wk_tensors(wk_keys: Iterable[str], wksd: dict[str, torch.Tensor]) -> None:
     for wk in wk_keys:
         wksd[wk].zero_()
 
@@ -80,7 +80,7 @@ def _match_hf_to_worker_names(
         hfsd[hf].fill_(1.0)
     for wk in wk_keys:
         wksd[wk].zero_()
-        
+
     lw(_sd_subset_iterator(hfsd, hf_keys))
     wk_candidates = {wk for wk in wk_keys if torch.count_nonzero(wksd[wk]) > 0}
     zero_wk_tensors(wk_candidates, wksd)
@@ -103,10 +103,10 @@ def _match_hf_to_worker_names(
         w_right = {wk for wk in wk_candidates if torch.count_nonzero(wksd[wk]) > 0}
         zero_wk_tensors(w_right, wksd)
 
-        recurse(left, w_left)
-        recurse(right, w_right)
+        recurse(left, sorted(w_left))
+        recurse(right, sorted(w_right))
 
-    recurse(hf_keys, wk_candidates)
+    recurse(hf_keys, sorted(wk_candidates))
     return dict(mapping)
 
 
@@ -128,9 +128,9 @@ def _extract_shard_mapping(
 
     # Get mask of worker tensors that are affected by the HF tensor
     wk_tensor.zero_()
-    lw(iter([(hf_name, hf_tensor)]))    
+    lw(iter([(hf_name, hf_tensor)]))
     wk_mask = wk_tensor != 0
-    
+
     # Create auxiliary index tensors
     hf_numel = hf_tensor.numel()
     idx_bits = max(ele_bits, (hf_numel - 1).bit_length() + 1)
@@ -150,30 +150,35 @@ def _extract_shard_mapping(
         lw(iter([(hf_name, hf_int_tensor.view(wk_dtype))]))
         wk_indices[..., k] = wk_int_tensor
     wk_indices = wk_indices.view(idx_dtype).squeeze(-1)
-    
+
     # NOTE for high-dimensional tensors, we still use the simple way
     if n_dim > 2:
         def coords_to_shard(coords: torch.Tensor) -> Shard:
-            return [
-                (coords[d].min().item(), coords[d].max().item() + 1, w)
-                for d, w in enumerate(coords.shape)
-            ]
+            shard: Shard = []
+            for d, w in enumerate(coords.shape):
+                shard.append((
+                    int(coords[d].min().item()),
+                    int(coords[d].max().item()) + 1,
+                    int(w),
+                ))
+            return shard
         wk_coords = torch.nonzero(wk_mask).transpose(0, 1)
         wk_shard = coords_to_shard(wk_coords)
-        hf_coords = torch.unravel_index(wk_indices, hf_tensor.shape) 
-        hf_shard = coords_to_shard(hf_coords)
+        ur = torch.unravel_index(wk_indices, hf_tensor.shape)
+        hf_flat = torch.stack(list(ur), dim=0) if isinstance(ur, tuple) else ur
+        hf_shard = coords_to_shard(hf_flat)
         return [(hf_shard, wk_shard)]
-    
+
     # Special handling for 1D tensor
     if n_dim == 1:
         # Wether each element's source succeeds it's left neighbor's source
         succ_left = wk_indices == F.pad(wk_indices, (1, 0), value=-2)[:-1] + 1
-        
+
         # NOTE: Here we assume no segment has a length of 1
         # -1 indicates beginning of 1D shard, 0 indicates middle of 1D shard, 1 indicates end of 1D shard
         delta_succ_left = succ_left ^ F.pad(succ_left, (0, 1), value=0)[1:]
         wk_shard_ends = delta_succ_left.nonzero().view(-1, 2).tolist()
-                            
+
         shard_mappings = []
         hf_ids = wk_indices[tuple(wk_shard_ends)].tolist()
         for i, (l, r) in enumerate(wk_shard_ends):
@@ -182,7 +187,7 @@ def _extract_shard_mapping(
                 [(l, r + 1, wk_tensor.shape[0])]
             ))
         return shard_mappings
-    
+
     # Special handling for 2D tensor
     if n_dim == 2:
         # Wether each element's source succeeds it's up/left neighbor's source
@@ -192,7 +197,7 @@ def _extract_shard_mapping(
         succ_up = wk_rows_ids == F.pad(wk_rows_ids, (0, 0, 1, 0), value=-2)[:-1] + 1
         succ_left = wk_cols_ids == F.pad(wk_cols_ids, (1, 0, 0, 0), value=-2)[:, :-1] + 1
         succ_up_left = succ_up & succ_left
-        
+
         # NOTE: Here we assume no segment has a width or height of 1
         # delta values of 1 indicates 2 corners of a 2D shard
         padded = F.pad(succ_up_left, (0, 1, 0, 1), value=0)
@@ -227,10 +232,14 @@ def _extract_shard_mapping(
             values[k] = False
             shard_mappings.append((
                 [(hf_x0, hf_x1 + 1, hf_h), (hf_y0, hf_y1 + 1, hf_w)],
-                [(x0, x1 + 1, wk_tensor.shape[0]), (y0, y1 + 1, wk_tensor.shape[1])]
+                [(x0, x1 + 1, wk_tensor.shape[0]), (y0, y1 + 1, wk_tensor.shape[1])],
             ))
         return shard_mappings
-            
+
+    raise NotImplementedError(
+        f"_extract_shard_mapping: unsupported worker tensor ndim={n_dim} "
+        "(expected 1 or 2, or ndim > 2 with simple coords)"
+    )
 
 
 def _infer_shard_spec_from_hfsd(
@@ -247,7 +256,7 @@ def _infer_shard_spec_from_hfsd(
 
     start_time = end_time
     entries = {
-        hf_name: { 
+        hf_name: {
             wk_name: _extract_shard_mapping(hf_name, wk_name, hfsd, wksd, lw)
             for wk_name in wk_names
         } for hf_name, wk_names in name_map.items()
@@ -304,6 +313,5 @@ __all__ = [
     "LoadWeightsFn",
     "WeightsIterable",
     "infer_load_spec",
-    "sharded_hf_weights_iter",
     "verify_load_spec",
 ]

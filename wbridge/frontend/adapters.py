@@ -170,7 +170,7 @@ class ReceiverAdapter(BaseAdapter):
             self.dtype_spec,
             load_weights=self._load_weights,
         )
-        
+
     def _load_weights(self, sub: ShardSpec, buf: dict[str, torch.Tensor]) -> None:
         self.load_spec.copy_fromto_params(sub, buf, self.wksd, src_to_dst=True)
 

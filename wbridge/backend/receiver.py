@@ -83,11 +83,11 @@ class WeightReceiver(WBEndpoint):
         self._pending_connect_data: Optional[dict[str, Any]] = None
 
         self._zmq_context = zmq.Context()
-        
+
         self._controller_socket = self._zmq_context.socket(zmq.DEALER)
         self._controller_socket.setsockopt_string(zmq.IDENTITY, f"worker-{self.rank}")
         self._controller_socket.connect(self._controller_ipc_name)
-        
+
         self._thread = threading.Thread(target=self._run_loop, daemon=True)
         self._thread.start()
 
@@ -100,7 +100,7 @@ class WeightReceiver(WBEndpoint):
         self._shutdown.set()
         self._thread.join(timeout=10.0)
         self._zmq_context.term()
-    
+
 
     def request_update(self) -> bool:
         """Apply pending connect, or finish a receive and return ``True`` when weights were loaded."""
@@ -125,12 +125,12 @@ class WeightReceiver(WBEndpoint):
                 self._state = ReceiverState.CONNECTED
                 return True
             return False
-        
-    
+
+
     def _send_ack(self) -> None:
         """Send an ack message to the controller."""
         self._controller_socket.send_string(json.dumps({"status": "ack"}))
-        
+
     def _handle_connect_request(self, controller_socket: zmq.Socket, data: dict[str, Any]) -> None:
         """
         Handle connect request from controller. This sets up the process group and the device,
@@ -146,7 +146,7 @@ class WeightReceiver(WBEndpoint):
             return
 
         data["rank"] += self.rank
-        
+
         if data["transfer_mode"] == "gpu_direct":
             self._pending_connect_data = dict(data)
             self._state = ReceiverState.PENDING_CONNECT
@@ -172,28 +172,33 @@ class WeightReceiver(WBEndpoint):
 
     def _receive_weights(self) -> None:
         """Multi-round recv: unpack into buffers; call ``load_weights`` when ``apply_load`` is True."""
-        for full_spec, overlap_specs in self.router.local_rounds:
-            if full_spec:
-                chunks = {
-                    peer_rank: overlap_spec.make_byte_chunk(self.dtype_spec, self.device)
-                    for peer_rank, overlap_spec in overlap_specs.items()
-                }
-                ops = [
-                    dist.P2POp(dist.irecv, chunk, peer_rank, self.group)
-                    for peer_rank, chunk in chunks.items()
-                ]
-            dist.barrier(group=self.group)
-            if full_spec:
-                for h in dist.batch_isend_irecv(ops):
-                    h.wait()
-                    
-                buf = full_spec.make_named_buffer(self.dtype_spec, self.device)                    
-                full_spec(buf)[overlap_specs] = chunks
-                if self.transfer_mode == "gpu_direct":
-                    self.load_weights(full_spec, buf)
-                    del buf
-                elif self.transfer_mode == "cpu_direct":
-                    self._cpu_recv_buffer = buf
+        router = self.router
+        device = self.device
+        group = self.group
+        assert router is not None and device is not None and group is not None
+        for full_spec, overlap_specs in router.local_rounds:
+            if not full_spec:
+                dist.barrier(group=group)
+                continue
+            chunks = {
+                peer_rank: overlap_spec.make_byte_chunk(self.dtype_spec, device)
+                for peer_rank, overlap_spec in overlap_specs.items()
+            }
+            ops = [
+                dist.P2POp(dist.irecv, chunk, peer_rank, group)
+                for peer_rank, chunk in chunks.items()
+            ]
+            dist.barrier(group=group)
+            for h in dist.batch_isend_irecv(ops):
+                h.wait()
+
+            buf = full_spec.make_named_buffer(self.dtype_spec, device)
+            full_spec(buf)[overlap_specs] = chunks
+            if self.transfer_mode == "gpu_direct":
+                self.load_weights(full_spec, buf)
+                del buf
+            elif self.transfer_mode == "cpu_direct":
+                self._cpu_recv_buffer = buf
 
     def _run_loop(self) -> None:
         """Thread entry: DEALER to controller only; signals ready; polls until shutdown."""
@@ -271,6 +276,8 @@ class WeightReceiverController:
 
     def _gather_responses(self) -> List[dict]:
         """Block until :attr:`_worker_num` JSON replies arrive on the ROUTER (one per worker)."""
+        if self._worker_num is None or self._receiver_identities is None:
+            raise RuntimeError("ReceiverController.set_worker_num must be called before gather_responses.")
         responses = []
         for _ in range(self._worker_num):
             msg_bytes = self._router_socket.recv_multipart()[1]
@@ -293,7 +300,11 @@ class WeightReceiverController:
         transfer modes, the thread acks immediately after :meth:`WeightReceiver.set_up_connection`
         in :meth:`WeightReceiver._handle_connect_request`.
         """
-        for identity in self._receiver_identities:
+        identities = self._receiver_identities
+        if identities is None:
+            raise RuntimeError("set_worker_num before /wbridge/connect.")
+
+        for identity in identities:
             connect_msg_bytes = json.dumps({"type": CONNECT_REQUEST, **request}).encode("utf-8")
             self._router_socket.send_multipart([identity, connect_msg_bytes])
 
@@ -304,7 +315,11 @@ class WeightReceiverController:
         """Signal workers to enter ``AWAITING_SCHEDULER_UPDATE`` (HTTP ack only).
         Actual recv runs on scheduler ``update`` call.
         """
-        for identity in self._receiver_identities:
+        identities = self._receiver_identities
+        if identities is None:
+            raise RuntimeError("set_worker_num before /wbridge/receive.")
+
+        for identity in identities:
             receive_msg_bytes = json.dumps({"type": RECEIVE_REQUEST}).encode("utf-8")
             self._router_socket.send_multipart([identity, receive_msg_bytes])
 

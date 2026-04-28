@@ -12,7 +12,7 @@ from wbridge.utils.data import ShardSpec, _check_shard_compatibility
 def _make_shard_spec(shard):
     """Single-entry :class:`~wbridge.utils.data.ShardSpec` (one tensor name)."""
     return ShardSpec({
-        "weight": {"shard": shard},
+        "weight": [shard],
     })
 
 
@@ -338,7 +338,7 @@ class TestPackFor:
         sender = _make_shard_spec(shard)
         receiver = _make_shard_spec(shard)
         overlap = ShardSpec.compute_overlap(sender, receiver)
-        t = _tensor_for_shard(shard, dtype)
+        t = _tensor_for_shard(shard).reshape(-1)
         packed = sender({"weight": t})[{0: overlap}][0]
         t_out = torch.zeros_like(t)
         receiver({"weight": t_out})[{0: overlap}] = {0: packed}

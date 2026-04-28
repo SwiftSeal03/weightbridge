@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import logging
 from dataclasses import field
+from typing import TypeAlias
 
 import torch
 import torch.distributed as dist
@@ -16,7 +17,7 @@ RECEIVER_ROUND_CAP_BYTES = 2 * 1024**3
 
 logger = logging.getLogger(__name__)
 
-type CommRoundPlan = tuple[ShardSpec, dict[int, ShardSpec]]
+CommRoundPlan: TypeAlias = tuple[ShardSpec, dict[int, ShardSpec]]
 
 class WeightRouter:
     """Computes transmission plan for weight transfer between senders and receivers."""
@@ -41,7 +42,7 @@ class WeightRouter:
         self.single_round = single_round
         self.global_rounds = self.compute_global_rounds()
         self.local_rounds = self.compute_local_rounds()
-        
+
     def compute_global_rounds(self) -> list[set[str]]:
         """Schedule rounds in **name-priority** order (sorted tensor names, then sorted pairs per name).
 
@@ -57,7 +58,7 @@ class WeightRouter:
             for si in range(self.sender_ws)
             for ri in range(self.receiver_ws)
         }
-        
+
         remaining_names = set(self.dtype_spec)
 
         rounds: list[set[str]] = []
@@ -66,12 +67,12 @@ class WeightRouter:
             send_caps = [RECEIVER_ROUND_CAP_BYTES * self.receiver_ws // self.sender_ws] * self.sender_ws
             recv_caps = [RECEIVER_ROUND_CAP_BYTES] * self.receiver_ws
             round_plan: set[str] = set()
-            
+
             for name in sorted(remaining_names):
                 dtype = self.dtype_spec[name]
                 send_caps_old = send_caps.copy()
                 recv_caps_old = recv_caps.copy()
-                
+
                 for (si, ri), overlap in all_overlaps.items():
                     if name not in overlap:
                         continue
@@ -79,14 +80,14 @@ class WeightRouter:
                     nbytes = shards_nbytes(shards, dtype)
                     send_caps[si] -= nbytes
                     recv_caps[ri] -= nbytes
-                
+
                 if any(c < 0 for c in send_caps + recv_caps):
                     send_caps = send_caps_old
                     recv_caps = recv_caps_old
                     continue
-                
+
                 round_plan.add(name)
-            
+
             if not round_plan:
                 raise RuntimeError(
                     "routing deadlock: no tensor fits per-round caps (try smaller per-tensor overlap or raise caps)"
@@ -95,7 +96,7 @@ class WeightRouter:
             rounds.append(round_plan)
 
         return rounds
-    
+
     def compute_local_rounds(self) -> list[CommRoundPlan]:
         """
         Plan for *rank*: round *i* is :class:`CommRoundPlan` — ``peer_specs[peer]`` is the wire overlap
@@ -122,7 +123,7 @@ class WeightRouter:
             }
             out.append((full_spec.subset(round_plan), round_overlaps))
         return out
-    
+
 
 class WBEndpoint:
     """Endpoint for weight bridge communication."""
@@ -131,13 +132,13 @@ class WBEndpoint:
     dtype_spec: dict[str, torch.dtype]
     router: WeightRouter | None = None
     group: dist.ProcessGroup | None = None
-    
+
     def set_up_connection(self, **pg_args) -> None:
         """Set up the connection to the other endpoint."""
         if self.group is not None:
             dist.destroy_process_group(self.group)
             self.group = None
-        
+
         sender_ws = pg_args.pop("sender_world_size")
         self.transfer_mode = pg_args.pop("transfer_mode")
         if self.transfer_mode == "gpu_direct":
@@ -148,11 +149,11 @@ class WBEndpoint:
             self.device = "cpu"
         else:
             raise ValueError(f"Invalid transfer mode: {self.transfer_mode}")
-        
+
         rank = pg_args["rank"]
         ws = pg_args["world_size"]
         self.group = init_custom_process_group(**pg_args)
-        
+
         all_shard_specs = [None] * ws
         dist.all_gather_object(all_shard_specs, self.shard_spec, group=self.group)
 
@@ -173,6 +174,5 @@ class WBEndpoint:
             self.dtype_spec,
             single_round=(self.transfer_mode == "cpu_direct"),
         )
-        
+
         logger.error(f"Rank: {rank} group initialized")
-        

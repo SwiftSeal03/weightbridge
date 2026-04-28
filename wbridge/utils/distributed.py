@@ -4,13 +4,13 @@ import socket
 import os
 
 import torch
+from torch.distributed import rendezvous
 from torch.distributed.distributed_c10d import (
     Backend,
     PrefixStore,
     _new_process_group_helper,
     _world,
     default_pg_timeout,
-    rendezvous,
 )
 
 
@@ -19,20 +19,20 @@ def get_local_ip() -> str:
     with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as s:
         s.connect(("8.8.8.8", 80))
         return s.getsockname()[0]
-    
-    
+
+
 def get_full_group_port() -> int:
     return 60000 + int(os.environ.get("CUDA_VISIBLE_DEVICES", "0")[0]) * 100
 
 
 def init_custom_process_group(
-    backend: str | Backend = None,
+    backend: Backend | str | None = None,
     init_method: str | None = None,
     timeout: timedelta | None = None,
     world_size: int = -1,
     rank: int = -1,
     store=None,
-    group_name: str = None,
+    group_name: str | None = None,
     pg_options: Any | None = None,
 ):
     """Create a named process group without touching the default group.
@@ -59,10 +59,14 @@ def init_custom_process_group(
         timeout = default_pg_timeout
 
     if store is None:
-        rendezvous_iterator = rendezvous(init_method, rank, world_size, timeout=timeout)
+        rendezvous_uri = init_method
+        assert rendezvous_uri is not None
+        rendezvous_iterator = rendezvous(rendezvous_uri, rank, world_size, timeout=timeout)
         store, rank, world_size = next(rendezvous_iterator)
         store.set_timeout(timeout)
-        store = PrefixStore(group_name, store)
+        gn = group_name
+        assert gn is not None
+        store = PrefixStore(gn, store)
 
     pg_options_param_name = (
         "backend_options" if str(torch.__version__) >= "2.6" else "pg_options"

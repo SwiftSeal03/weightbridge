@@ -12,7 +12,7 @@ from collections.abc import Iterator
 from pathlib import Path
 
 import torch
-from sglang.srt.model_executor.model_runner import ModelRunner
+from sglang.srt.model_executor.model_runner import ModelRunner  # pyright: ignore[reportMissingImports]
 
 from wbridge.frontend.adapters import AdapterContext, ReceiverAdapter
 
@@ -21,7 +21,7 @@ class WBSGLangAdapter(ReceiverAdapter):
     """Receive weights via :class:`~wbridge.frontend.adapters.ReceiverAdapter` into SGLang's
     ``model.state_dict()``.
     """
-    
+
 
     def __init__(
         self,

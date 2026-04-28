@@ -11,7 +11,7 @@ expensive inference across runs.
 
 from __future__ import annotations
 
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
@@ -30,7 +30,7 @@ def patch_megatron_model(model):
     ``megatron.bridge`` expects this attribute during conversion; it is removed again after the
     context unless it was already present.
     """
-    from megatron.core.utils import unwrap_model
+    from megatron.core.utils import unwrap_model  # pyright: ignore[reportMissingImports]
 
     unwrapped_model = unwrap_model(model)[0]
     model_config = unwrapped_model.config
@@ -54,7 +54,7 @@ def _iter_hf_checkpoint_cpu_tensors(hf_path: str) -> Iterator[tuple[str, Any]]:
     root = Path(hf_path)
     st_files = sorted(root.glob("*.safetensors"))
     if st_files:
-        from safetensors.torch import safe_open
+        from safetensors import safe_open
 
         for fp in st_files:
             with safe_open(str(fp), framework="pt", device="cpu") as sf:
@@ -83,7 +83,7 @@ def _iter_hf_checkpoint_cpu_tensors(hf_path: str) -> Iterator[tuple[str, Any]]:
 
 def _megatron_model_chunks(model: list[Any]) -> list[Any]:
     """Return the logical model chunk(s) Megatron-Bridge expects from a slime ``model`` list."""
-    from megatron.core.utils import unwrap_model
+    from megatron.core.utils import unwrap_model  # pyright: ignore[reportMissingImports]
 
     inner = unwrap_model(model[0])
     if isinstance(inner, (list, tuple)):
@@ -148,7 +148,7 @@ class WBMegatronAdapter(SenderAdapter):
         return _iter_hf_checkpoint_cpu_tensors(self.hf_checkpoint)
 
     @torch.inference_mode()
-    def _load_weights(self, weights: Iterator[tuple[str, torch.Tensor]]) -> None:
+    def _load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> None:
         """Mirror HF \u2192 Megatron loading (including grouped HF params and shared-embedding broadcast).
 
         ``torch.inference_mode`` is required because specgen probing does in-place writes on

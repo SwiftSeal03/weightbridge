@@ -285,7 +285,7 @@ def test_verify_load_spec_1to1(device: torch.device) -> None:
         "a.weight": torch.zeros(H, H, device=device),
         "b.weight": torch.zeros(H, H, device=device),
     }
-    
+
     hfsd_verify = {k: v.clone() for k, v in hfsd.items()}
 
     def lw(weights: Iterable[tuple[str, torch.Tensor]]) -> None:

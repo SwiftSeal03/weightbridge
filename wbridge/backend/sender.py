@@ -56,17 +56,17 @@ class WeightSender(WBEndpoint):
         save_weights: Callable[[ShardSpec, dict[str, torch.Tensor]], None],
     ) -> None:
         self.cuda_device = f"cuda:{torch.cuda.current_device()}"
-        
+
         self.transfer_mode = args.transfer_mode
         self.receiver_urls = args.receiver_urls
         self.world_size = args.world_size
         self.init_method = f"tcp://{args.master_addr}:{args.master_port}"
-        
+
         self.rank = rank
         self.shard_spec = shard_spec
         self.dtype_spec = {}
         self.save_weights = save_weights
-        
+
         self.connected = False
         self._pending_comm_handles: list = []
 
@@ -74,7 +74,7 @@ class WeightSender(WBEndpoint):
         for h in self._pending_comm_handles:
             h.wait()
         self._pending_comm_handles.clear()
-    
+
 
     def connect(self) -> None:
         """Rendezvous senders, query receiver world sizes, then form the merged P2P process group.
@@ -115,11 +115,11 @@ class WeightSender(WBEndpoint):
                 resp = requests.post(f"{url}/wbridge/connect", json=connect_args)
                 resp.raise_for_status()
                 base_rank += num_workers
-        
+
         self.set_up_connection(**pg_init_args)
         self.connected = True
-        
-        
+
+
     def send(self) -> None:
         """Send weights in router rounds. :attr:`save_weights` fills each round's 1D buffers (per name).
 
@@ -131,31 +131,41 @@ class WeightSender(WBEndpoint):
         next :meth:`connect` or :meth:`send`, and :meth:`send` returns before those handles complete so
         trainers can overlap communication with receiver staging.
         """
-        if not self.connected or self.shard_spec is None or self.router is None or self.group is None:
+        if (
+            not self.connected
+            or self.shard_spec is None
+            or self.router is None
+            or self.group is None
+            or self.device is None
+        ):
             raise RuntimeError("WeightSender.send requires connect() first")
         self._drain_pending_comm()
+
+        router = self.router
+        group = self.group
 
         if self.rank == 0:
             for url in self.receiver_urls:
                 resp = requests.post(f"{url}/wbridge/receive")
                 resp.raise_for_status()
 
-        for full_spec, overlap_specs in self.router.local_rounds:
-            if full_spec:
-                buf = full_spec.make_named_buffer(self.dtype_spec, self.device)
-                self.save_weights(full_spec, buf)
-                chunks = full_spec(buf)[overlap_specs]
+        for full_spec, overlap_specs in router.local_rounds:
+            if not full_spec:
+                dist.barrier(group=group)
+                continue
+            buf = full_spec.make_named_buffer(self.dtype_spec, self.device)
+            self.save_weights(full_spec, buf)
+            chunks = full_spec(buf)[overlap_specs]
 
-                ops = [
-                    dist.P2POp(dist.isend, chunk, peer_rank, self.group)
-                    for peer_rank, chunk in chunks.items()
-                ]
-            dist.barrier(group=self.group)
-            if full_spec:
-                handles = list(dist.batch_isend_irecv(ops))
-                if self.transfer_mode == "cpu_direct":
-                    self._pending_comm_handles.extend(handles)
-                elif self.transfer_mode == "gpu_direct":
-                    for h in handles:
-                        h.wait()
-                    del buf
+            ops = [
+                dist.P2POp(dist.isend, chunk, peer_rank, group)
+                for peer_rank, chunk in chunks.items()
+            ]
+            dist.barrier(group=group)
+            handles = list(dist.batch_isend_irecv(ops))
+            if self.transfer_mode == "cpu_direct":
+                self._pending_comm_handles.extend(handles)
+            elif self.transfer_mode == "gpu_direct":
+                for h in handles:
+                    h.wait()
+                del buf
