@@ -256,7 +256,7 @@ class WeightReceiverController:
             path="/wbridge/connect", endpoint=self.connect, methods=["POST"]
         )
         self.router.add_api_route(
-            path="/wbridge/receive", endpoint=self.receive_weights, methods=["POST"]
+            path="/wbridge/receive", endpoint=self.prepare_weight_receive, methods=["POST"]
         )
         app.include_router(self.router)
 
@@ -311,7 +311,7 @@ class WeightReceiverController:
         success = all(resp["status"] == "ack" for resp in self._gather_responses())
         return JSONResponse(content={"status": "success" if success else "error"})
 
-    async def receive_weights(self):
+    async def prepare_weight_receive(self):
         """Signal Rollout Workers to enter ``AWAITING_SCHEDULER_UPDATE`` (HTTP ack only).
         Actual recv/load work is completed by ``request_update()``.
         """

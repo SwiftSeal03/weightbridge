@@ -26,11 +26,11 @@ import torch
 __all__ = [
     "DEFAULT_QWEN_TINY_CONFIG",
     "QwenTinyConfig",
-    "actor_load_spec_path",
-    "build_actor_wksd",
+    "trainer_load_spec_path",
+    "build_trainer_wksd",
     "build_qwen_tiny_hf_checkpoint",
     "build_rollout_wksd",
-    "make_actor_load_weights",
+    "make_trainer_load_weights",
     "make_rollout_load_weights",
     "rollout_load_spec_path",
 ]
@@ -107,7 +107,7 @@ def _scatter_rows(
     dst_shard[dr : dr + (b - a)].copy_(src[sr : sr + (b - a)].to(device=device, dtype=dtype))
 
 
-def _actor_scatter_megatron_qkv(
+def _trainer_scatter_megatron_qkv(
     dst: torch.Tensor,
     cfg: QwenTinyConfig,
     tp_rank: int,
@@ -181,7 +181,7 @@ def _actor_shapes(cfg: QwenTinyConfig, tp: int) -> dict[str, tuple[int, ...]]:
     }
 
 
-def build_actor_wksd(
+def build_trainer_wksd(
     cfg: QwenTinyConfig,
     *,
     device: str,
@@ -193,7 +193,7 @@ def build_actor_wksd(
     return {k: torch.empty(s, dtype=dtype, device=device) for k, s in _actor_shapes(cfg, tp_size).items()}
 
 
-def actor_load_weights(
+def trainer_load_weights(
     weights: Iterable[tuple[str, torch.Tensor]],
     wksd: dict[str, torch.Tensor],
     cfg: QwenTinyConfig,
@@ -216,7 +216,7 @@ def actor_load_weights(
         wksd["embedding.word_embeddings.weight"].copy_(w["model.embed_tokens.weight"][sl].to(device=device, dtype=dtype))
 
     if any(k in w for k in ("self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight")):
-        _actor_scatter_megatron_qkv(
+        _trainer_scatter_megatron_qkv(
             wksd["self_attention.linear_qkv.weight"], cfg, tp_rank, tp_size, w, device=device, dtype=dtype
         )
 
@@ -240,7 +240,7 @@ def actor_load_weights(
         wksd["mlp.linear_fc1.layer_norm_weight"].copy_(w["post_attention_layernorm.weight"].to(device=device, dtype=dtype))
 
 
-def make_actor_load_weights(
+def make_trainer_load_weights(
     wksd: dict[str, torch.Tensor],
     cfg: QwenTinyConfig,
     *,
@@ -252,7 +252,7 @@ def make_actor_load_weights(
     dev = torch.device(device)
 
     def lw(it: Iterable[tuple[str, torch.Tensor]]) -> None:
-        actor_load_weights(it, wksd, cfg, device=dev, dtype=dtype, tp_rank=tp_rank, tp_size=tp_size)
+        trainer_load_weights(it, wksd, cfg, device=dev, dtype=dtype, tp_rank=tp_rank, tp_size=tp_size)
 
     return lw
 
@@ -356,7 +356,7 @@ def make_rollout_load_weights(
     return lw
 
 
-def actor_load_spec_path(load_spec_dir: str, rank: int) -> str:
+def trainer_load_spec_path(load_spec_dir: str, rank: int) -> str:
     return str(Path(load_spec_dir) / f"actor_tp_rank{rank}.json")
 
 

@@ -30,10 +30,10 @@ from wbridge.frontend.adapters import AdapterContext, ReceiverAdapter, SenderAda
 
 from qwen_tiny import (
     QwenTinyConfig,
-    actor_load_spec_path,
-    build_actor_wksd,
+    trainer_load_spec_path,
+    build_trainer_wksd,
     build_rollout_wksd,
-    make_actor_load_weights,
+    make_trainer_load_weights,
     make_rollout_load_weights,
     rollout_load_spec_path,
 )
@@ -188,14 +188,14 @@ class TrainerWorker:
         cfg = args.model_config
         hf_cpu = args.build_checkpoint()
         hf_iter_factory = make_hf_iter_factory(hf_cpu)
-        self.state_dict = build_actor_wksd(
+        self.state_dict = build_trainer_wksd(
             cfg,
             device="cuda",
             dtype=args.dtype,
             tp_rank=rank,
             tp_size=args.num_trainer_workers,
         )
-        load_weights = make_actor_load_weights(
+        load_weights = make_trainer_load_weights(
             self.state_dict,
             cfg,
             device="cuda",
@@ -208,7 +208,7 @@ class TrainerWorker:
             hf_iter_factory=hf_iter_factory,
             wksd=self.state_dict,
             load_weights=load_weights,
-            load_spec_path=actor_load_spec_path(args.load_spec_dir, rank),
+            load_spec_path=trainer_load_spec_path(args.load_spec_dir, rank),
             rank=rank,
         )
         sender_args = SenderArgs(
