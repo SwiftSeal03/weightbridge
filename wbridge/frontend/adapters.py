@@ -34,7 +34,7 @@ LoadWeightsFn = Callable[[Iterable[tuple[str, torch.Tensor]]], None]
 
 @dataclass
 class AdapterContext:
-    """Framework-specific inputs every adapter needs to build / verify a LoadSpec.
+    """Framework-specific Metadata Plane inputs every adapter needs to build / verify a LoadSpec.
 
     Attributes:
         hf_iter_factory: Zero-arg callable returning a fresh ``(name, cpu_tensor)`` iterator over
@@ -127,7 +127,7 @@ class BaseAdapter:
 
 
 class SenderAdapter(BaseAdapter):
-    """Frontend-side sender: owns a :class:`~wbridge.backend.sender.WeightSender`.
+    """Trainer Worker adapter: owns a :class:`~wbridge.backend.sender.WeightSender`.
 
     The :class:`~wbridge.backend.sender.WeightSender` is constructed in :meth:`__init__` from the
     transport args. Call :meth:`connect` once to join the sender process group, then
@@ -154,7 +154,7 @@ class SenderAdapter(BaseAdapter):
 
 
 class ReceiverAdapter(BaseAdapter):
-    """Frontend-side receiver: owns a :class:`~wbridge.backend.receiver.WeightReceiver`.
+    """Rollout Worker adapter: owns a :class:`~wbridge.backend.receiver.WeightReceiver`.
 
     The receiver is created eagerly in :meth:`__init__` so it can handshake with the controller
     before any transfer begins.
@@ -175,7 +175,7 @@ class ReceiverAdapter(BaseAdapter):
         self.load_spec.copy_fromto_params(sub, buf, self.wksd, src_to_dst=True)
 
     def request_update(self) -> bool:
-        """Apply a pending weight update into ``ctx.wksd`` if one is ready.
+        """Apply a pending Rollout Worker weight update into ``ctx.wksd`` if one is ready.
 
         Returns ``True`` if an update was consumed, ``False`` if nothing was ready.
         """

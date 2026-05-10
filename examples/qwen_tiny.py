@@ -3,10 +3,10 @@ One decoder-block Qwen2-style toy (no ``model.layers.N`` in HF keys).
 
 **HF checkpoint** — split ``q_proj`` / ``k_proj`` / ``v_proj``, ``gate_proj`` / ``up_proj``, etc.
 
-**Actor (trainer)** — Megatron ``linear_qkv`` packing (GQA): per group, Q heads then K then V
+**Trainer Worker / actor** — Megatron ``linear_qkv`` packing (GQA): per group, Q heads then K then V
 (see ``slime/.../megatron_to_hf/qwen2.py``). TP splits output rows of each parameter.
 
-**Rollout** — SGLang-style stacked tensors (same idea as ``Qwen2ForCausalLM.load_weights`` in
+**Rollout Worker** — SGLang-style stacked tensors (same idea as ``Qwen2ForCausalLM.load_weights`` in
 ``sglang/srt/models/qwen2.py``): ``qkv_proj`` holds ``[Q_shard; K_shard; V_shard]`` on dim 0;
 ``gate_up_proj`` holds ``[gate; up]`` with column-parallel-style row sharding. TP matches
 ``QKVParallelLinear`` / ``MergedColumnParallelLinear`` / ``RowParallelLinear`` when ``num_heads``
@@ -295,7 +295,7 @@ def rollout_load_weights(
     tp_rank: int,
     tp_size: int,
 ) -> None:
-    """Map HF shards into SGLang-like per-rank ``wksd`` (stacked qkv / gate_up, TP on outputs or inputs)."""
+    """Map HF shards into Rollout Worker ``wksd`` (stacked qkv / gate_up, TP on outputs or inputs)."""
     _assert_tp(cfg, tp_size)
     w = dict(weights)
     iq, h = cfg.intermediate_size, cfg.hidden_size

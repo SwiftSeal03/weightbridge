@@ -1,4 +1,4 @@
-"""Megatron-Bridge frontend for WeightBridge.
+"""Megatron-Bridge Trainer Worker frontend for WeightBridge.
 
 Builds the HF tensor iterator, CUDA ``wksd`` (mapped from Megatron-Bridge conversion tasks), and
 ``load_weights`` closure that mirrors HF \u2192 Megatron loading, then reuses
@@ -108,7 +108,7 @@ def _wksd_from_conversion_tasks(tasks: list[Any]) -> dict[str, torch.Tensor]:
 
 
 class WBMegatronAdapter(SenderAdapter):
-    """Tie a loaded Megatron ``model`` to HF weights and send shards via
+    """Tie a loaded Megatron Trainer Worker ``model`` to HF weights and send shards via
     :class:`~wbridge.frontend.adapters.SenderAdapter`.
 
     ``connect()`` and ``send_weights()`` are inherited directly from

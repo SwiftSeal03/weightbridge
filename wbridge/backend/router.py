@@ -20,7 +20,7 @@ logger = logging.getLogger(__name__)
 CommRoundPlan: TypeAlias = tuple[ShardSpec, dict[int, ShardSpec]]
 
 class WeightRouter:
-    """Computes transmission plan for weight transfer between senders and receivers."""
+    """Computes Data Plane P2P routing between Trainer Workers and Rollout Workers."""
 
     def __init__(
         self,
@@ -126,7 +126,7 @@ class WeightRouter:
 
 
 class WBEndpoint:
-    """Endpoint for weight bridge communication."""
+    """Shared P2P endpoint base for Trainer Worker senders and Rollout Worker receivers."""
     cuda_device: str
     shard_spec: ShardSpec
     dtype_spec: dict[str, torch.dtype]
@@ -134,7 +134,7 @@ class WBEndpoint:
     group: dist.ProcessGroup | None = None
 
     def set_up_connection(self, **pg_args) -> None:
-        """Set up the connection to the other endpoint."""
+        """Set up the merged Trainer/Rollout P2P process group and routing plan."""
         if self.group is not None:
             dist.destroy_process_group(self.group)
             self.group = None

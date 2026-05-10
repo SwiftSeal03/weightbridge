@@ -1,12 +1,12 @@
-"""Local receiver side of Weightbridge: per-worker :class:`WeightReceiver` and HTTP :class:`WeightReceiverController`.
+"""Rollout Worker side of WeightBridge: per-worker :class:`WeightReceiver` and HTTP :class:`WeightReceiverController`.
 
-The **controller** exposes FastAPI routes that the training scheduler (or a driver) uses to
+The **controller** exposes FastAPI routes that the Trainer Engine uses to
 connect workers and to signal a weight receive round. The controller forwards JSON control
 messages over a ZMQ ROUTER to per-worker DEALER sockets.
 
 Each **WeightReceiver** runs a ZMQ message loop in a daemon thread, updating state and
 either staging CPU buffers or, with the main thread, completing NCCL recv and
-``load_weights``—see :class:`WeightReceiver` and :meth:`WeightReceiver.request_update`.
+``load_weights``; see :class:`WeightReceiver` and :meth:`WeightReceiver.request_update`.
 """
 
 import json
@@ -50,7 +50,7 @@ class WeightReceiver(WBEndpoint):
     :meth:`_receive_weights` on the main thread after the HTTP receive handshake.
 
     ``cpu_direct`` (Gloo, CPU wire buffers): the HTTP receive handler acknowledges immediately,
-    then a background thread runs :meth:`_receive_weights_staging_only` so trainers can post
+    then the message-loop thread runs :meth:`_receive_weights` so Trainer Workers can post
     ``isend`` while bytes land in CPU staging buffers. :meth:`request_update` waits for that
     staging to finish, then calls :attr:`load_weights` to copy into GPU ``wksd``.
     """
@@ -226,18 +226,18 @@ class WeightReceiver(WBEndpoint):
 
 
 class WeightReceiverController:
-    """HTTP + ZMQ control surface for a pool of :class:`WeightReceiver` workers.
+    """HTTP + ZMQ Control Plane surface for a pool of Rollout Worker :class:`WeightReceiver` instances.
 
     Binds a ZMQ ROUTER at :attr:`ipc_name`; one DEALER per worker identity ``worker-<rank>``
     must connect. Routes:
 
-    * ``GET /wbridge/receiver_world`` — world size the scheduler set via :meth:`set_worker_num`
+    * ``GET /wbridge/receiver_world`` — Rollout Worker world size set via :meth:`set_worker_num`
     * ``POST /wbridge/connect`` — forward process-group args to all workers; collect per-worker acks
     * ``POST /wbridge/receive`` — tell workers to prepare for a P2P receive round; acks when ready
 
-    Actual tensor traffic uses the distributed process group created at connect; the scheduler
-    is expected to call the worker’s :meth:`WeightReceiver.request_update` after the HTTP
-    receive handshake to finish the round (load into model).
+    Actual tensor traffic uses the distributed process group created at connect; the Rollout Worker
+    is expected to call :meth:`WeightReceiver.request_update` after the HTTP
+    receive handshake to finish the round and load weights into the model.
     """
 
     def __init__(self, app: FastAPI):
@@ -285,7 +285,7 @@ class WeightReceiverController:
         return responses
 
     async def get_receiver_world(self):
-        """Return the world size of the receiver group."""
+        """Return the Rollout Worker world size."""
         return JSONResponse(content={"status": "success", "world_size": self._worker_num})
 
     async def connect(self, request: dict[str, Any]):
@@ -312,8 +312,8 @@ class WeightReceiverController:
         return JSONResponse(content={"status": "success" if success else "error"})
 
     async def receive_weights(self):
-        """Signal workers to enter ``AWAITING_SCHEDULER_UPDATE`` (HTTP ack only).
-        Actual recv runs on scheduler ``update`` call.
+        """Signal Rollout Workers to enter ``AWAITING_SCHEDULER_UPDATE`` (HTTP ack only).
+        Actual recv/load work is completed by ``request_update()``.
         """
         identities = self._receiver_identities
         if identities is None:

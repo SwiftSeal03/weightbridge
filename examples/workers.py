@@ -1,9 +1,9 @@
-"""Reusable Ray actor definitions for WeightBridge sender / receiver pipelines.
+"""Reusable Ray actor definitions for WeightBridge Trainer Worker / Rollout Worker pipelines.
 
 Configuration is passed as a single :class:`EngineArgs` instance. HF weights are not serialized in
 ``EngineArgs``; each worker calls ``build_checkpoint()`` locally so checkpoints are identical across
-nodes without shipping CPU tensors through Ray. Trainer (**actor**) workers use a TP shard of HF
-names in ``wksd``; **rollout** workers use merged names (``qkv_proj``, ``gate_up_proj``, ...).
+nodes without shipping CPU tensors through Ray. Trainer Workers use a TP shard of HF
+names in ``wksd``; Rollout Workers use merged names (``qkv_proj``, ``gate_up_proj``, ...).
 HF shard layout on the wire is defined by :attr:`~wbridge.utils.data.LoadSpec.src_shard_spec` after
 LoadSpec inference inside :class:`~wbridge.frontend.adapters.SenderAdapter` /
 :class:`~wbridge.frontend.adapters.ReceiverAdapter`.
@@ -78,7 +78,7 @@ class EngineArgs:
 
 @ray.remote(num_gpus=1, num_cpus=1)
 class RolloutWorker:
-    """One per receiver GPU. Receives weights via NCCL and verifies against a pre-recv backup."""
+    """One per Rollout Worker GPU. Receives weights and verifies against a pre-update backup."""
 
     def init(self, rank: int, args: EngineArgs):
         _apply_network_interface_for_process_group(args.network_interface)
@@ -143,7 +143,7 @@ class RolloutWorker:
 
 @ray.remote(num_cpus=1)
 class RolloutEngine:
-    """Hosts the receiver-side HTTP server and spawns :class:`RolloutWorker` actors."""
+    """Hosts the Rollout Engine HTTP server and spawns :class:`RolloutWorker` actors."""
 
     def init(self, args: EngineArgs):
         app = FastAPI()
@@ -179,7 +179,7 @@ class RolloutEngine:
 
 @ray.remote(num_gpus=1, num_cpus=1)
 class TrainerWorker:
-    """One per sender GPU. Sends shards via :class:`~wbridge.frontend.adapters.SenderAdapter`."""
+    """One per Trainer Worker GPU. Sends shards via :class:`~wbridge.frontend.adapters.SenderAdapter`."""
 
     def init(self, rank: int, args: EngineArgs):
         _apply_network_interface_for_process_group(args.network_interface)

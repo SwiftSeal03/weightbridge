@@ -1,4 +1,4 @@
-"""Backend: weight transport (sender/receiver) and HTTP control."""
+"""Backend Data Plane transport and Control Plane HTTP/ZMQ coordination."""
 
 from wbridge.backend.receiver import WeightReceiver, WeightReceiverController
 from wbridge.backend.sender import SenderArgs, WeightSender

@@ -1,7 +1,7 @@
-"""Sender side of Weightbridge: :class:`WeightSender` coordinates HTTP with a :class:`WeightReceiverController`.
+"""Trainer Worker side of WeightBridge: :class:`WeightSender` coordinates HTTP with a :class:`WeightReceiverController`.
 
-A sender rank joins a merged process group with receiver workers, posts ``/wbridge/connect`` and
-``/wbridge/receive`` on the receiver HTTP APIs (from rank 0), then exchanges tensor chunks in
+A Trainer Worker rank joins a merged process group with Rollout Workers, posts ``/wbridge/connect`` and
+``/wbridge/receive`` on the Rollout Engine HTTP APIs (from rank 0), then exchanges tensor chunks in
 P2P rounds defined by a shared :class:`~wbridge.backend.router.WeightRouter`. :meth:`WeightSender.send`
 packs local shards via :attr:`WeightSender.save_weights` and issues ``isend``; behavior matches
 :meth:`WeightReceiver._receive_weights` on the peer side. See :class:`SenderArgs` for transport
@@ -24,11 +24,11 @@ class SenderArgs:
     """Transport args forwarded to :class:`WeightSender`.
 
     Attributes:
-        world_size: Number of sender ranks participating in the process group.
+        world_size: Number of Trainer Worker ranks participating in the process group.
         transfer_mode: ``"gpu_direct"`` (NCCL, CUDA wire buffers) or ``"cpu_direct"``
             (Gloo, CPU wire buffers; :meth:`~WeightSender.send` may return before ``isend`` completes).
-        receiver_urls: HTTP base URLs of the receiver controllers, one per receiver engine.
-        master_addr: Host/IP of the sender-side rank-0 process used for rendezvous.
+        receiver_urls: HTTP base URLs of the Rollout Engine controllers, one per rollout engine.
+        master_addr: Host/IP of the Trainer Worker rank-0 process used for rendezvous.
         master_port: TCP port for the rendezvous group.
     """
 
@@ -40,10 +40,10 @@ class SenderArgs:
 
 
 class WeightSender(WBEndpoint):
-    """Packs and P2P-sends sharded weights to :class:`WeightReceiver` peers.
+    """Packs and P2P-sends sharded weights from Trainer Workers to :class:`WeightReceiver` peers.
 
     Rank 0 must call :meth:`connect` before :meth:`send`; that establishes the process group
-    (and rank-0 only drives the receiver HTTP endpoints). Each round, :attr:`save_weights` fills
+    (and rank-0 only drives the Rollout Engine HTTP endpoints). Each round, :attr:`save_weights` fills
     the logical chunk buffers that :attr:`load_weights` on the receiver will consume (same
     :class:`~wbridge.utils.data.ShardSpec` layout).
     """
@@ -80,10 +80,10 @@ class WeightSender(WBEndpoint):
         """Rendezvous senders, query receiver world sizes, then form the merged P2P process group.
 
         Uses :attr:`init_method` (``tcp://{master_addr}:{master_port}``) from :class:`SenderArgs`
-        so all sender ranks align before rank 0 calls each ``receiver_urls`` host’s
+        so all Trainer Worker ranks align before rank 0 calls each ``receiver_urls`` host’s
         ``/wbridge/receiver_world`` and ``/wbridge/connect`` with a contiguous ``rank`` base
-        for receiver workers. :meth:`set_up_connection` is then called on every sender rank with
-        the same ``init_method``, total ``world_size`` (senders + all receiver workers), and
+        for Rollout Workers. :meth:`set_up_connection` is then called on every Trainer Worker rank with
+        the same ``init_method``, total ``world_size`` (trainers + all Rollout Workers), and
         transfer mode.
         """
         self._drain_pending_comm()
@@ -129,7 +129,7 @@ class WeightSender(WBEndpoint):
 
         With ``transfer_mode == "cpu_direct"``, posted ``isend`` handles are drained at the start of the
         next :meth:`connect` or :meth:`send`, and :meth:`send` returns before those handles complete so
-        trainers can overlap communication with receiver staging.
+        Trainer Workers can return before the Rollout Worker finishes CPU staging.
         """
         if (
             not self.connected

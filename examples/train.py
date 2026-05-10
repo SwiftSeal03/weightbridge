@@ -1,13 +1,13 @@
 """Minimal WeightBridge example: Ray node pinning + weight transfer.
 
 Uses a single-layer Qwen2-style HF checkpoint built on each worker via ``build_checkpoint``.
-Trainer (**actor**) workers hold TP shards
-of HF names in ``wksd``; rollout workers hold merged weights (``qkv_proj``, ``gate_up_proj``, ...).
+Trainer Workers hold TP shards
+of HF names in ``wksd``; Rollout Workers hold merged weights (``qkv_proj``, ``gate_up_proj``, ...).
 :class:`~wbridge.frontend.adapters.SenderAdapter` / :class:`~wbridge.frontend.adapters.ReceiverAdapter`
 infer per-rank :class:`~wbridge.utils.data.LoadSpec` JSON under *load_spec_dir*.
 
 Use ``--transfer-mode gpu_direct`` (NCCL, default) or ``--transfer-mode cpu_direct`` (Gloo, CPU wire
-buffers; single router round; overlapped send/recv). ``wksd`` tensors stay on GPU in both modes.
+buffers; single router round; sender return can be decoupled from receive completion). ``wksd`` tensors stay on GPU in both modes.
 
 Usage::
 

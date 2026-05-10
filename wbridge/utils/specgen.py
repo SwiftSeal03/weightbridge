@@ -1,6 +1,6 @@
 """
-Infer a :class:`~wbridge.utils.data.ShardSpec` by probing HF ``(name, tensor)``
-streams through ``lw`` (same contract as SGLang ``model.load_weights``).
+Infer a :class:`~wbridge.utils.data.LoadSpec` by probing HF ``(name, tensor)``
+streams through a ``load_weights``-style callable (same contract as SGLang ``model.load_weights``).
 
 Stage 1 maps each HF name to worker keys; stage 2 derives axis-aligned HF shard
 boxes per (HF name, worker key). :func:`sharded_hf_weights_iter` masks HF tensors

@@ -1,4 +1,4 @@
-"""SGLang frontend for WeightBridge.
+"""SGLang Rollout Worker frontend for WeightBridge.
 
 Builds ``hf_iter_factory`` from SGLang's ``ModelRunner`` loader, exposes ``model.state_dict()`` as
 ``wksd``, and uses ``model.load_weights`` for spec inference. LoadSpec lifecycle and
@@ -18,7 +18,7 @@ from wbridge.frontend.adapters import AdapterContext, ReceiverAdapter
 
 
 class WBSGLangAdapter(ReceiverAdapter):
-    """Receive weights via :class:`~wbridge.frontend.adapters.ReceiverAdapter` into SGLang's
+    """Receive weights into a Rollout Worker through :class:`~wbridge.frontend.adapters.ReceiverAdapter` and SGLang's
     ``model.state_dict()``.
     """
 
