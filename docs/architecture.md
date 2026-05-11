@@ -9,9 +9,17 @@ WeightBridge Library is organized across three planes:
 ```mermaid
 flowchart LR
     subgraph TrainerEngine["Trainer Engine"]
-        T0["Trainer Worker rank 0<br/>SenderAdapter"]
-        T1["Trainer Worker rank N<br/>SenderAdapter"]
-        WS["WeightSender"]
+        subgraph TW0["Trainer Worker rank 0"]
+            T0["SenderAdapter"]
+            WS0["WeightSender"]
+            T0 --> WS0
+        end
+
+        subgraph TWN["Trainer Worker rank N"]
+            TN["SenderAdapter"]
+            WSN["WeightSender"]
+            TN --> WSN
+        end
     end
 
     subgraph ControlPlane["Control Plane"]
@@ -20,21 +28,29 @@ flowchart LR
     end
 
     subgraph RolloutEngine["Rollout Engine"]
-        R0["Rollout Worker rank 0<br/>ReceiverAdapter"]
-        R1["Rollout Worker rank M<br/>ReceiverAdapter"]
-        WR["WeightReceiver"]
+        subgraph RW0["Rollout Worker rank 0"]
+            R0["ReceiverAdapter"]
+            WR0["WeightReceiver"]
+            R0 --> WR0
+        end
+
+        subgraph RWM["Rollout Worker rank M"]
+            RM["ReceiverAdapter"]
+            WRM["WeightReceiver"]
+            RM --> WRM
+        end
     end
 
-    T0 --> WS
-    T1 --> WS
-    WS -- "HTTP /wbridge/connect<br/>/wbridge/receive" --> HTTP
+    WS0 -- "HTTP /wbridge/connect<br/>/wbridge/receive" --> HTTP
     HTTP -- "worker messages" --> ZMQ
-    ZMQ --> WR
-    WR --> R0
-    WR --> R1
-    WS -- "torch.distributed P2P<br/>NCCL or Gloo" --> WR
+    ZMQ --> WR0
+    ZMQ --> WRM
+    WS0 -- "torch.distributed P2P<br/>NCCL or Gloo" --> WR0
+    WS0 -- "torch.distributed P2P<br/>NCCL or Gloo" --> WRM
+    WSN -- "torch.distributed P2P<br/>NCCL or Gloo" --> WR0
+    WSN -- "torch.distributed P2P<br/>NCCL or Gloo" --> WRM
     R0 -- "request_update()" --> R0
-    R1 -- "request_update()" --> R1
+    RM -- "request_update()" --> RM
 ```
 
 ## Data Plane
