@@ -44,11 +44,41 @@ logger = logging.getLogger("wbridge.example.workers")
 CheckpointBuilder = Callable[[], dict[str, torch.Tensor]]
 
 
-def _apply_network_interface_for_process_group(iface: str) -> None:
-    if not iface:
-        return
-    os.environ.setdefault("NCCL_SOCKET_IFNAME", iface)
-    os.environ.setdefault("GLOO_SOCKET_IFNAME", iface)
+def _network_env_vars(provider: str, iface: str) -> dict[str, str]:
+    env_vars = {}
+    if iface:
+        env_vars["NCCL_SOCKET_IFNAME"] = iface
+        env_vars["GLOO_SOCKET_IFNAME"] = iface
+
+    if provider == "tcp":
+        return env_vars
+    if provider != "efa":
+        raise ValueError(f"Unsupported network provider: {provider}")
+
+    ld_paths = ["/opt/amazon/ofi-nccl/lib", "/opt/amazon/efa/lib"]
+    existing_ld = os.environ.get("LD_LIBRARY_PATH")
+    if existing_ld:
+        ld_paths.append(existing_ld)
+    env_vars.update(
+        {
+            "LD_LIBRARY_PATH": ":".join(ld_paths),
+            "FI_PROVIDER": "efa",
+            "FI_EFA_USE_DEVICE_RDMA": "0",
+            "NCCL_DEBUG": "INFO",
+            "NCCL_DEBUG_SUBSYS": "INIT,NET",
+            "NCCL_NET_GDR_LEVEL": "SYS",
+            "NCCL_NET_GDR_READ": "1",
+        }
+    )
+    return env_vars
+
+
+def _apply_network_env_for_process_group(provider: str, iface: str) -> None:
+    for key, value in _network_env_vars(provider, iface).items():
+        if key == "LD_LIBRARY_PATH":
+            os.environ[key] = value
+        else:
+            os.environ.setdefault(key, value)
 
 
 @dataclass
@@ -73,6 +103,7 @@ class EngineArgs:
     transfer_mode: str = "gpu_direct"
 
     rollout_controller_ipc_name: str = ""
+    network_provider: str = "tcp"
     network_interface: str = "eno1"
 
 
@@ -81,7 +112,7 @@ class RolloutWorker:
     """One per Rollout Worker GPU. Receives weights and verifies against a pre-update backup."""
 
     def init(self, rank: int, args: EngineArgs):
-        _apply_network_interface_for_process_group(args.network_interface)
+        _apply_network_env_for_process_group(args.network_provider, args.network_interface)
         self.rank = rank
         self.args = args
         cfg = args.model_config
@@ -158,8 +189,13 @@ class RolloutEngine:
         print(f"RolloutEngine started on {args.rollout_host}:{args.rollout_port}")
 
         n = args.num_rollout_workers
+        runtime_env = {"env_vars": _network_env_vars(args.network_provider, args.network_interface)}
         self._workers = [
-            RolloutWorker.options(scheduling_strategy=args.rollout_scheduling_strategy).remote() for _ in range(n)
+            RolloutWorker.options(
+                scheduling_strategy=args.rollout_scheduling_strategy,
+                runtime_env=runtime_env,
+            ).remote()
+            for _ in range(n)
         ]
         ray.get([w.init.remote(rank, args) for rank, w in enumerate(self._workers)])
 
@@ -182,7 +218,7 @@ class TrainerWorker:
     """One per Trainer Worker GPU. Sends shards via :class:`~wbridge.frontend.adapters.SenderAdapter`."""
 
     def init(self, rank: int, args: EngineArgs):
-        _apply_network_interface_for_process_group(args.network_interface)
+        _apply_network_env_for_process_group(args.network_provider, args.network_interface)
         self.args = args
         self.rank = rank
         cfg = args.model_config
@@ -234,8 +270,13 @@ class TrainerEngine:
 
     def __init__(self, args: EngineArgs):
         n = args.num_trainer_workers
+        runtime_env = {"env_vars": _network_env_vars(args.network_provider, args.network_interface)}
         self._workers = [
-            TrainerWorker.options(scheduling_strategy=args.trainer_scheduling_strategy).remote() for _ in range(n)
+            TrainerWorker.options(
+                scheduling_strategy=args.trainer_scheduling_strategy,
+                runtime_env=runtime_env,
+            ).remote()
+            for _ in range(n)
         ]
         ray.get([w.init.remote(rank, args) for rank, w in enumerate(self._workers)])
         print(f"TrainerEngine started on {args.trainer_host}:{args.trainer_pg_port}")
