@@ -81,6 +81,7 @@ class WeightReceiver(WBEndpoint):
         self._state = ReceiverState.DISCONNECTED
         self.device: Optional[str] = None
         self._pending_connect_data: Optional[dict[str, Any]] = None
+        self._receive_ready_ack_sent = False
 
         self._zmq_context = zmq.Context()
 
@@ -102,8 +103,8 @@ class WeightReceiver(WBEndpoint):
         self._zmq_context.term()
 
 
-    def request_update(self) -> bool:
-        """Apply pending connect, or finish a receive and return ``True`` when weights were loaded."""
+    def is_update_ready(self) -> bool:
+        """Return whether a pending update is ready for ``request_update`` to consume."""
         with self._lock:
             if self._state == ReceiverState.PENDING_CONNECT: # Only in gpu_direct transfer mode
                 assert self._pending_connect_data is not None
@@ -114,8 +115,21 @@ class WeightReceiver(WBEndpoint):
                 self._state = ReceiverState.CONNECTED
                 return False
             if self._state == ReceiverState.AWAITING_SCHEDULER_UPDATE:
-                if self.transfer_mode == "gpu_direct":
+                if self.transfer_mode == "gpu_direct" and not self._receive_ready_ack_sent:
                     self._send_ack()
+                    self._receive_ready_ack_sent = True
+                return True
+            return False
+
+
+    def request_update(self) -> bool:
+        """Finish a ready receive and return ``True`` when weights were loaded."""
+        if not self.is_update_ready():
+            return False
+
+        with self._lock:
+            if self._state == ReceiverState.AWAITING_SCHEDULER_UPDATE:
+                if self.transfer_mode == "gpu_direct":
                     self._receive_weights()
                 elif self.transfer_mode == "cpu_direct":
                     assert self._cpu_recv_buffer is not None
@@ -123,6 +137,7 @@ class WeightReceiver(WBEndpoint):
                     del self._cpu_recv_buffer
                     self._cpu_recv_buffer = None
                 self._state = ReceiverState.CONNECTED
+                self._receive_ready_ack_sent = False
                 return True
             return False
 
@@ -168,6 +183,7 @@ class WeightReceiver(WBEndpoint):
             self._send_ack()
             self._receive_weights()
         self._state = ReceiverState.AWAITING_SCHEDULER_UPDATE
+        self._receive_ready_ack_sent = self.transfer_mode == "cpu_direct"
 
 
     def _receive_weights(self) -> None:

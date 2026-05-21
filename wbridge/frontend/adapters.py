@@ -174,6 +174,10 @@ class ReceiverAdapter(BaseAdapter):
     def _load_weights(self, sub: ShardSpec, buf: dict[str, torch.Tensor]) -> None:
         self.load_spec.copy_fromto_params(sub, buf, self.wksd, src_to_dst=True)
 
+    def is_update_ready(self) -> bool:
+        """Return whether a Rollout Worker weight update is ready to consume."""
+        return self.receiver.is_update_ready()
+
     def request_update(self) -> bool:
         """Apply a pending Rollout Worker weight update into ``ctx.wksd`` if one is ready.
 

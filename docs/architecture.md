@@ -23,7 +23,7 @@ flowchart LR
     end
 
     subgraph ControlPlane["Control Plane"]
-        HTTP["FastAPI<br/>WeightReceiverController"]
+        HTTP["Existing rollout HTTP app<br/>WeightReceiverController routes"]
         ZMQ["ZMQ ROUTER/DEALER<br/>controller to workers"]
     end
 
@@ -49,8 +49,8 @@ flowchart LR
     WS0 -- "torch.distributed P2P<br/>NCCL or Gloo" --> WRM
     WSN -- "torch.distributed P2P<br/>NCCL or Gloo" --> WR0
     WSN -- "torch.distributed P2P<br/>NCCL or Gloo" --> WRM
-    R0 -- "request_update()" --> R0
-    RM -- "request_update()" --> RM
+    R0 -- "is_update_ready()<br/>request_update()" --> R0
+    RM -- "is_update_ready()<br/>request_update()" --> RM
 ```
 
 ## Data Plane
@@ -83,11 +83,11 @@ WeightBridge infers a `LoadSpec` by symbolically probing an existing framework `
 
 The Control Plane gives the Trainer Engine and Rollout Engine a common update protocol.
 
-- `WeightReceiverController` exposes HTTP routes used by sender rank 0.
+- `WeightReceiverController` registers HTTP routes used by sender rank 0, preferably on the Rollout Engine's existing app.
 - The controller talks to local Rollout Workers through ZMQ.
 - `ReceiverAdapter` initializes receiver-side metadata and owns a `WeightReceiver`.
 - `SenderAdapter` initializes sender-side metadata and owns a `WeightSender`.
 - Trainer Workers call `connect()` once, then `send_weights()` for each update.
-- Rollout Workers call `request_update()` from their scheduler or event loop.
+- Rollout Workers poll `is_update_ready()` from their scheduler or event loop, then call `request_update()` only when an update is ready.
 
-In Sync mode, rollout loading is part of the weight update barrier. In Async mode, sending can return after weights are offloaded, and Rollout Workers load the update when it becomes ready through `request_update()`.
+In Sync mode, rollout loading is part of the weight update barrier. In Async mode, sending can return after weights are offloaded, and Rollout Workers load the update when it becomes ready through `is_update_ready()` and `request_update()`.

@@ -148,7 +148,7 @@ class RolloutWorker:
     def recv_weights(self) -> None:
         for _ in range(500):
             t0 = time.time()
-            updated = self.adapter.request_update()
+            updated = self.adapter.is_update_ready() and self.adapter.request_update()
             t1 = time.time()
             if updated:
                 print(f"RolloutWorker rank {self.rank} recv_weights start wall_s={t0} return wall_s={t1}")
